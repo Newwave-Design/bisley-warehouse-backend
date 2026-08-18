@@ -48,23 +48,29 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 
 // Startup
 async function start() {
+  // Debug logging
+  console.log('🚀 Warehouse Management System Starting...');
+  console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🔌 Port: ${PORT}`);
+  console.log(`🔐 JWT_SECRET configured: ${process.env.JWT_SECRET ? 'Yes' : 'No'}`);
+  console.log(`📦 DATABASE_URL: ${process.env.DATABASE_URL ? 'Set' : 'MISSING'}`);
+  console.log(`🗄️ Node version: ${process.version}`);
+  console.log('');
   try {
-    console.log('🏭 Warehouse Management System');
-    console.log('Environment:', process.env.NODE_ENV);
-    
     // Initialize database pool
-    initializePool();
-    console.log('✓ Database pool initialized');
-
-    // Test connection
-    const result = await import('./db/index.js').then(m => m.query('SELECT NOW()'));
-    console.log('✓ Database connection verified');
+    try {
+      initializePool();
+      console.log('✓ Database pool initialized');
+    } catch (dbError) {
+      console.warn('⚠️  Database initialization warning:', (dbError as Error).message);
+    }
 
     // Start server
     app.listen(PORT, () => {
       console.log(`✓ Server running on port ${PORT}`);
       console.log(`  Health: http://localhost:${PORT}/health`);
       console.log(`  API: http://localhost:${PORT}/api`);
+      console.log('');
     });
   } catch (error) {
     console.error('❌ Startup failed:', error);

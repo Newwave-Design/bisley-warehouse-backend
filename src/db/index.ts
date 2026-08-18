@@ -7,6 +7,10 @@ let pool: pg.Pool | null = null;
 export function initializePool() {
   if (pool) return pool;
 
+  if (!process.env.DATABASE_URL) {
+    console.warn('⚠️  DATABASE_URL not set - database connections will fail');
+  }
+
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     max: 20,
