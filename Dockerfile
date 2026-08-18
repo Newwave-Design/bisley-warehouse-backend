@@ -1,42 +1,29 @@
-# Build stage
-FROM node:24-alpine AS builder
+# Warehouse Backend - Railway Deployment
+FROM node:20-alpine
 
 WORKDIR /app
 
+# Install system dependencies
+RUN apk add --no-cache curl dumb-init
+
 # Copy package files
-COPY package.json package-lock.json ./
+COPY package*.json ./
 
-# Install dependencies
-RUN npm ci
+# Install dependencies (use npm install, not ci, for Railway)
+RUN npm install
 
-# Copy source code
+# Copy source files
 COPY tsconfig.json ./
 COPY src/ ./src/
 
-# TypeScript compilation not needed - using tsx for runtime
-
-# Production stage
-FROM node:24-alpine
-
-WORKDIR /app
-
-# Install dumb-init for proper signal handling
-RUN apk add --no-cache dumb-init
-
-# Copy from builder
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json ./package.json
-COPY --from=builder /app/tsconfig.json ./tsconfig.json
-COPY --from=builder /app/src ./src
-
-# Install curl for health check
-RUN apk add --no-cache curl
+# Expose port
+EXPOSE 3000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:${PORT:-3001}/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:${PORT:-3000}/health || exit 1
 
-# Use dumb-init to handle signals properly
+# Use dumb-init to handle signals
 ENTRYPOINT ["dumb-init", "--"]
 
 # Start the application
