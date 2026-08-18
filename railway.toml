@@ -1,0 +1,33 @@
+# Railway.app Configuration for Warehouse Backend
+# Deploy with: railway up
+
+[build]
+# Build plan: Docker
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Runtime: Node.js
+numReplicas = 1
+# Service starts on this port
+startCommand = "npm start"
+
+# Health check
+healthchecks = [
+  {
+    path = "/health"
+    interval = 30
+    timeout = 10
+  }
+]
+
+# Environment variables can be set in Railway dashboard
+# Required:
+# - DATABASE_URL: PostgreSQL connection string (Railway Postgres plugin)
+# - JWT_SECRET: Generate with: openssl rand -base64 32
+#
+# Optional:
+# - NODE_ENV: production (default)
+# - PORT: 3001 (default)
+# - MEDUSA_API_URL: for Phase 2 integration
+# - MEDUSA_API_KEY: for Phase 2 integration
