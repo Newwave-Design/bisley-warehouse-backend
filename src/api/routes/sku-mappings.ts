@@ -452,4 +452,69 @@ router.post('/auto-match', authMiddleware, async (req: AuthRequest, res: Respons
   }
 });
 
+/**
+ * POST /api/sku-mappings/import
+ * Bulk import NW stocking items from parsed spreadsheet data
+ * Body: { items: [{ nw_code, description, family, colour, quantity_ordered, unit_cost? }] }
+ */
+router.post('/import', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { items } = req.body;
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'items array required' });
+    }
+
+    let mappingsCreated = 0;
+    let stockingItemsCreated = 0;
+    let skipped = 0;
+
+    // Group by nw_code to upsert unique mappings first
+    const uniqueCodes = new Map<string, any>();
+    for (const item of items) {
+      if (!uniqueCodes.has(item.nw_code)) {
+        uniqueCodes.set(item.nw_code, item);
+      }
+    }
+
+    for (const [nwCode, item] of uniqueCodes) {
+      const result = await query(
+        `INSERT INTO sku_mappings (nw_code, product_name, family, colour, status, confidence, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'UNMAPPED', 0, NOW(), NOW())
+         ON CONFLICT (nw_code) DO NOTHING`,
+        [nwCode, item.description, item.family, item.colour]
+      );
+      if (result.rowCount && result.rowCount > 0) mappingsCreated++;
+    }
+
+    for (const item of items) {
+      const mappingResult = await query(
+        `SELECT id FROM sku_mappings WHERE nw_code = $1`,
+        [item.nw_code]
+      );
+      const mappingId = mappingResult.rows[0]?.id ?? null;
+
+      const result = await query(
+        `INSERT INTO nw_stocking_items (nw_code, description, family, colour, quantity_ordered, unit_cost, mapping_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+         ON CONFLICT DO NOTHING`,
+        [item.nw_code, item.description, item.family, item.colour, item.quantity_ordered, item.unit_cost ?? 0, mappingId]
+      );
+      if (result.rowCount && result.rowCount > 0) stockingItemsCreated++;
+      else skipped++;
+    }
+
+    res.json({
+      success: true,
+      mappingsCreated,
+      stockingItemsCreated,
+      skipped,
+      total: items.length,
+    });
+  } catch (error) {
+    console.error('Import error:', error);
+    res.status(500).json({ error: 'Failed to import items' });
+  }
+});
+
 export default router;
