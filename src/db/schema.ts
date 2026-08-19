@@ -181,6 +181,54 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 -- ================================================================================
+-- CHECKIN SESSIONS (Phase 3: Receiving sessions when stock arrives)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS checkin_sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id UUID REFERENCES supplier_orders(id) ON DELETE SET NULL,
+  status TEXT CHECK (status IN ('OPEN', 'COMPARING', 'COMPLETE')) DEFAULT 'OPEN',
+  started_by VARCHAR,
+  notes TEXT,
+  completed_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ================================================================================
+-- CHECKIN ITEMS (Phase 3: Items scanned during a check-in session)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS checkin_items (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id UUID NOT NULL REFERENCES checkin_sessions(id) ON DELETE CASCADE,
+  nw_code VARCHAR NOT NULL,
+  colour VARCHAR,
+  medusa_sku VARCHAR,
+  quantity_scanned INT NOT NULL DEFAULT 1,
+  notes TEXT,
+  scanned_at TIMESTAMP DEFAULT NOW(),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ================================================================================
+-- CHECKIN DISCREPANCIES (Phase 3: Auto-flagged mismatches vs order)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS checkin_discrepancies (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id UUID NOT NULL REFERENCES checkin_sessions(id) ON DELETE CASCADE,
+  order_id UUID REFERENCES supplier_orders(id) ON DELETE SET NULL,
+  nw_code VARCHAR NOT NULL,
+  colour VARCHAR,
+  medusa_sku VARCHAR,
+  quantity_ordered INT NOT NULL DEFAULT 0,
+  quantity_received INT NOT NULL DEFAULT 0,
+  discrepancy_type TEXT CHECK (discrepancy_type IN ('SHORT', 'OVERAGE', 'MISSING', 'UNEXPECTED')) NOT NULL,
+  status TEXT CHECK (status IN ('FLAGGED', 'ACCEPTED', 'RESOLVED')) DEFAULT 'FLAGGED',
+  resolution_notes TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ================================================================================
 -- SUPPLIER ORDERS (Phase 2: Purchase orders sent to NW/Genero)
 -- ================================================================================
 CREATE TABLE IF NOT EXISTS supplier_orders (
@@ -309,6 +357,10 @@ CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_line_items(order_id
 CREATE INDEX IF NOT EXISTS idx_order_items_nw_code ON order_line_items(nw_code);
 CREATE INDEX IF NOT EXISTS idx_thresholds_nw_code ON inventory_thresholds(nw_code);
 CREATE INDEX IF NOT EXISTS idx_dispatch_notes_order ON genero_dispatch_notes(order_id);
+CREATE INDEX IF NOT EXISTS idx_checkin_sessions_order ON checkin_sessions(order_id);
+CREATE INDEX IF NOT EXISTS idx_checkin_sessions_status ON checkin_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_checkin_items_session ON checkin_items(session_id);
+CREATE INDEX IF NOT EXISTS idx_checkin_discrepancies_session ON checkin_discrepancies(session_id);
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
