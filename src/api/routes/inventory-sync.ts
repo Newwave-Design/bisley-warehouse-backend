@@ -22,18 +22,18 @@ router.get('/sync', authMiddleware, async (req: Request, res: Response) => {
     // For now, return mock data matching dashboard expectations
     
     const mockData = [
-      { sku: 'H2910NL', product: '4-Leg Chair', colour: 'Black', medusaQty: 45, wmsQty: 42 },
-      { sku: 'H2910NL', product: '4-Leg Chair', colour: 'Grey', medusaQty: 32, wmsQty: 32 },
-      { sku: 'H2910NL', product: '4-Leg Chair', colour: 'Blue', medusaQty: 18, wmsQty: 25 },
-      { sku: 'H2910NL', product: '4-Leg Chair', colour: 'Red', medusaQty: 0, wmsQty: 8 },
-      { sku: 'E2U2816', product: '8-Drawer Cabinet', colour: 'White', medusaQty: 12, wmsQty: 12 },
-      { sku: 'E2U2816', product: '8-Drawer Cabinet', colour: 'Blue', medusaQty: 8, wmsQty: 5 },
-      { sku: 'E2U2816', product: '8-Drawer Cabinet', colour: 'Grey', medusaQty: 15, wmsQty: 18 },
-      { sku: 'K2N51', product: 'Mobile Pedestal', colour: 'Black', medusaQty: 28, wmsQty: 28 },
-      { sku: 'K2N51', product: 'Mobile Pedestal', colour: 'Green', medusaQty: 14, wmsQty: 10 },
-      { sku: 'M3K88', product: 'Storage Shelf', colour: 'Black', medusaQty: 22, wmsQty: 25 },
-      { sku: 'M3K88', product: 'Storage Shelf', colour: 'White', medusaQty: 16, wmsQty: 16 },
-      { sku: 'N4P99', product: 'Filing Cabinet', colour: 'Grey', medusaQty: 9, wmsQty: 12 },
+      { sku: 'H2910NL', product: '4-Leg Chair', colour: 'Black', medusaQty: 45, wmsQty: 42, thumbnail: 'https://via.placeholder.com/80/000000/FFFFFF?text=H2910NL' },
+      { sku: 'H2910NL', product: '4-Leg Chair', colour: 'Grey', medusaQty: 32, wmsQty: 32, thumbnail: 'https://via.placeholder.com/80/808080/FFFFFF?text=H2910NL' },
+      { sku: 'H2910NL', product: '4-Leg Chair', colour: 'Blue', medusaQty: 18, wmsQty: 25, thumbnail: 'https://via.placeholder.com/80/0000FF/FFFFFF?text=H2910NL' },
+      { sku: 'H2910NL', product: '4-Leg Chair', colour: 'Red', medusaQty: 0, wmsQty: 8, thumbnail: 'https://via.placeholder.com/80/FF0000/FFFFFF?text=H2910NL' },
+      { sku: 'E2U2816', product: '8-Drawer Cabinet', colour: 'White', medusaQty: 12, wmsQty: 12, thumbnail: 'https://via.placeholder.com/80/FFFFFF/000000?text=E2U2816' },
+      { sku: 'E2U2816', product: '8-Drawer Cabinet', colour: 'Blue', medusaQty: 8, wmsQty: 5, thumbnail: 'https://via.placeholder.com/80/0000FF/FFFFFF?text=E2U2816' },
+      { sku: 'E2U2816', product: '8-Drawer Cabinet', colour: 'Grey', medusaQty: 15, wmsQty: 18, thumbnail: 'https://via.placeholder.com/80/808080/FFFFFF?text=E2U2816' },
+      { sku: 'K2N51', product: 'Mobile Pedestal', colour: 'Black', medusaQty: 28, wmsQty: 28, thumbnail: 'https://via.placeholder.com/80/000000/FFFFFF?text=K2N51' },
+      { sku: 'K2N51', product: 'Mobile Pedestal', colour: 'Green', medusaQty: 14, wmsQty: 10, thumbnail: 'https://via.placeholder.com/80/00AA00/FFFFFF?text=K2N51' },
+      { sku: 'M3K88', product: 'Storage Shelf', colour: 'Black', medusaQty: 22, wmsQty: 25, thumbnail: 'https://via.placeholder.com/80/000000/FFFFFF?text=M3K88' },
+      { sku: 'M3K88', product: 'Storage Shelf', colour: 'White', medusaQty: 16, wmsQty: 16, thumbnail: 'https://via.placeholder.com/80/FFFFFF/000000?text=M3K88' },
+      { sku: 'N4P99', product: 'Filing Cabinet', colour: 'Grey', medusaQty: 9, wmsQty: 12, thumbnail: 'https://via.placeholder.com/80/808080/FFFFFF?text=N4P99' },
     ];
 
     return res.json({
