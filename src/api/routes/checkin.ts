@@ -1,6 +1,7 @@
 /**
  * Check-in API Routes — Phase 3: Receiving
  *
+ * GET    /api/checkin/lookup?q=           — Look up barcode or NW code → product info
  * GET    /api/checkin/sessions              — List sessions
  * POST   /api/checkin/sessions              — Start new session
  * GET    /api/checkin/sessions/:id          — Session detail + items
@@ -17,7 +18,45 @@ import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
 
-// List sessions
+// Barcode / NW code lookup — resolves a scan input to product info
+router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const q = (req.query.q as string || '').trim().toUpperCase();
+    if (!q) return res.status(400).json({ error: 'q parameter required' });
+
+    // 1. Check barcode_mappings (EAN / Supercode barcode → product)
+    const barcode = await query(
+      `SELECT product_sku as nw_code, colour_name as colour, product_name, colour_code
+       FROM barcode_mappings WHERE barcode = $1 AND is_active = true LIMIT 1`,
+      [q]
+    );
+    if (barcode.rows[0]) {
+      return res.json({ source: 'barcode', ...barcode.rows[0] });
+    }
+
+    // 2. Check sku_mappings by NW code
+    const mapping = await query(
+      `SELECT nw_code, product_name, family, colour, medusa_sku FROM sku_mappings WHERE UPPER(nw_code) = $1 LIMIT 1`,
+      [q]
+    );
+    if (mapping.rows[0]) {
+      return res.json({ source: 'nw_code', ...mapping.rows[0] });
+    }
+
+    // 3. Try NW stocking items (may have multiple colours — return all)
+    const stockingItems = await query(
+      `SELECT DISTINCT nw_code, family, colour FROM nw_stocking_items WHERE UPPER(nw_code) = $1 ORDER BY colour`,
+      [q]
+    );
+    if (stockingItems.rows.length > 0) {
+      return res.json({ source: 'stocking', nw_code: q, colours: stockingItems.rows.map(r => r.colour) });
+    }
+
+    return res.status(404).json({ error: 'Not found', query: q });
+  } catch (err) {
+    res.status(500).json({ error: 'Lookup failed' });
+  }
+});
 router.get('/sessions', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(`

@@ -207,4 +207,31 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
   }
 });
 
+// Bulk-generate bay locations (e.g. rows A-C, bins 1-10 = 30 bays)
+router.post('/locations/generate', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { rows = ['A', 'B', 'C'], bins_per_row = 10 } = req.body;
+    let created = 0, skipped = 0;
+
+    for (const row of rows) {
+      for (let bin = 1; bin <= bins_per_row; bin++) {
+        const bay_code = String(row).toUpperCase();
+        const bin_code = String(bin).padStart(2, '0');
+        const location_code = `${bay_code}-${bin_code}`;
+        const result = await query(
+          `INSERT INTO warehouse_locations (bay_code, bin_code, location_code, description, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, NOW(), NOW()) ON CONFLICT (location_code) DO NOTHING`,
+          [bay_code, bin_code, location_code, `Row ${bay_code}, Bin ${bin_code}`]
+        );
+        if (result.rowCount && result.rowCount > 0) created++;
+        else skipped++;
+      }
+    }
+
+    res.json({ success: true, created, skipped, total: rows.length * bins_per_row });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to generate bays' });
+  }
+});
+
 export default router;
