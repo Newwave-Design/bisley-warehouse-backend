@@ -7,9 +7,11 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { initializePool, closePool } from './db/index.js';
+import { runMigrations } from './db/migrate.js';
 import scanningRoutes from './api/routes/scanning.js';
 import pickListRoutes from './api/routes/pick-lists.js';
 import inventorySyncRoutes from './api/routes/inventory-sync.js';
+import skuMappingsRoutes from './api/routes/sku-mappings.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -38,6 +40,7 @@ app.get('/health', (req, res) => {
 app.use('/api/scanning', scanningRoutes);
 app.use('/api/pick-lists', pickListRoutes);
 app.use('/api/inventory', inventorySyncRoutes);
+app.use('/api/sku-mappings', skuMappingsRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -69,6 +72,14 @@ async function start() {
       console.log('✓ Database pool initialized');
     } catch (dbError) {
       console.warn('⚠️  Database initialization warning:', (dbError as Error).message);
+    }
+
+    // Run migrations automatically on startup
+    try {
+      await runMigrations();
+      console.log('✓ Database migrations complete');
+    } catch (migrateError) {
+      console.warn('⚠️  Migration warning:', (migrateError as Error).message);
     }
 
     // Start server
