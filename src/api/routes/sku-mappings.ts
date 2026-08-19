@@ -457,7 +457,7 @@ router.post('/auto-match', authMiddleware, async (req: AuthRequest, res: Respons
  * Bulk import NW stocking items from parsed spreadsheet data
  * Body: { items: [{ nw_code, description, family, colour, quantity_ordered, unit_cost? }] }
  */
-router.post('/import', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/import', async (req: Request, res: Response) => {
   try {
     const { items } = req.body;
 
