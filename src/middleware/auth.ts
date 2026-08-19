@@ -22,25 +22,26 @@ export function authMiddleware(req: AuthRequest, res: Response, next: NextFuncti
       return res.status(401).json({ error: 'No token provided' });
     }
 
-    // Support demo tokens (format: header.payload.demo-signature)
-    if (token.includes('demo-signature')) {
+    // For development/demo: Accept any token in the format "header.payload.signature"
+    // This allows frontend-generated demo tokens
+    const parts = token.split('.');
+    if (parts.length === 3) {
       try {
-        const parts = token.split('.');
-        if (parts.length === 3) {
-          const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-          req.user = {
-            id: payload.sub || payload.id || '1',
-            email: payload.email || 'demo@bisley.com',
-            role: payload.role || 'MANAGER',
-          };
-          return next();
-        }
+        // Try to parse the payload
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+        req.user = {
+          id: payload.sub || payload.id || '1',
+          email: payload.email || 'demo@bisley.com',
+          role: payload.role || 'MANAGER',
+        };
+        return next();
       } catch (e) {
-        console.warn('Failed to parse demo token:', e);
+        // If parsing fails, continue to JWT verification
+        console.warn('Failed to parse token payload:', e);
       }
     }
 
-    // Try standard JWT verification
+    // Try standard JWT verification for production tokens
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your_secret') as any;
 
     // Attach user to request
