@@ -62,18 +62,10 @@ async function getMedusaItemInfo(sku: string): Promise<{ itemId: string; locatio
   return level ? { itemId: item.id, locationId: level.location_id } : null;
 }
 
-// Pre-sync comparison
+// Pre-sync comparison — Medusa is the source of truth; WMS defaults to 0 if not stocked
 router.get('/pre-sync', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const wmsResult = await query(`
-      SELECT product_sku as sku, colour_code as colour, SUM(quantity) as wms_qty
-      FROM warehouse_inventory GROUP BY product_sku, colour_code ORDER BY product_sku
-    `);
-
-    if (wmsResult.rows.length === 0) {
-      return res.json({ items: [], total: 0, diffs: 0, message: 'No WMS inventory yet. Stock items via Bay Assignment first.' });
-    }
-
+    // Fetch Medusa inventory first — always the full picture
     let medusaMap: Map<string, number>;
     try {
       medusaMap = await fetchMedusaInventory();
@@ -81,11 +73,23 @@ router.get('/pre-sync', authMiddleware, async (req: AuthRequest, res: Response) 
       return res.status(503).json({ error: 'Could not reach Medusa API', detail: (err as Error).message });
     }
 
-    const items = wmsResult.rows.map(row => {
-      const medusaQty = medusaMap.get(row.sku) ?? 0;
-      const wmsQty = parseInt(row.wms_qty);
-      return { sku: row.sku, colour: row.colour, wms_qty: wmsQty, medusa_qty: medusaQty, diff: wmsQty - medusaQty, in_medusa: medusaMap.has(row.sku) };
-    });
+    if (medusaMap.size === 0) {
+      return res.json({ items: [], total: 0, diffs: 0, in_sync: 0, message: 'No inventory found in Medusa.' });
+    }
+
+    // Build WMS totals per SKU (may be empty if nothing stocked yet)
+    const wmsResult = await query(`
+      SELECT product_sku as sku, SUM(quantity) as wms_qty
+      FROM warehouse_inventory GROUP BY product_sku
+    `);
+    const wmsMap = new Map<string, number>();
+    wmsResult.rows.forEach(r => wmsMap.set(r.sku, parseInt(r.wms_qty)));
+
+    // Build items from Medusa as the authoritative list
+    const items = Array.from(medusaMap.entries()).map(([sku, medusaQty]) => {
+      const wmsQty = wmsMap.get(sku) ?? 0;
+      return { sku, colour: null, wms_qty: wmsQty, medusa_qty: medusaQty, diff: wmsQty - medusaQty, in_medusa: true };
+    }).sort((a, b) => a.sku.localeCompare(b.sku));
 
     res.json({ items, total: items.length, diffs: items.filter(i => i.diff !== 0).length, in_sync: items.filter(i => i.diff === 0).length });
   } catch (err) {
@@ -162,4 +166,41 @@ router.get('/all', authMiddleware, async (req: AuthRequest, res: Response) => {
   }
 });
 
-export default router;
+// Seed WMS from Medusa — use Medusa quantities as the WMS baseline
+// Creates a default location "MEDUSA-IMPORT" if none exists, then upserts inventory
+router.post('/seed-from-medusa', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const medusaMap = await fetchMedusaInventory();
+
+    // Ensure a default import location exists
+    await query(`
+      INSERT INTO warehouse_locations (bay_code, bin_code, location_code, description, created_at, updated_at)
+      VALUES ('IMPORT', '01', 'IMPORT-01', 'Medusa import baseline', NOW(), NOW())
+      ON CONFLICT (location_code) DO NOTHING
+    `);
+    const locResult = await query(`SELECT id FROM warehouse_locations WHERE location_code = 'IMPORT-01'`);
+    const locationId = locResult.rows[0]?.id;
+
+    if (!locationId) return res.status(500).json({ error: 'Failed to create import location' });
+
+    let imported = 0;
+    for (const [sku, qty] of medusaMap) {
+      if (qty <= 0) continue;
+      await query(`
+        INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, created_at, updated_at)
+        VALUES ($1, $2, '', $3, NOW(), NOW())
+        ON CONFLICT (location_id, product_sku, colour_code)
+        DO UPDATE SET quantity = $3, updated_at = NOW()
+      `, [locationId, sku, qty]);
+      imported++;
+    }
+
+    res.json({ success: true, imported, location: 'IMPORT-01' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to seed from Medusa', detail: (err as Error).message });
+  }
+});
+
+export default router;
+
