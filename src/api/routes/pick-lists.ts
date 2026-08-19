@@ -20,10 +20,7 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { status = 'PENDING,IN_PROGRESS', limit = '50', offset = '0' } = req.query;
 
-    const statuses = (status as string).split(',').map(s => s.trim());
-    const statusCount = statuses.length;
-    const limitParam = statusCount + 1;
-    const offsetParam = statusCount + 2;
+    const statuses = (status as string).toUpperCase().split(',').map(s => s.trim());
 
     const result = await query(
       `SELECT 
@@ -36,11 +33,11 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          SUM(CASE WHEN pli.status = 'PICKED' THEN 1 ELSE 0 END) as items_picked
        FROM pick_lists pl
        LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
-       WHERE pl.status = ANY($${statusCount}::text[])
+       WHERE pl.status = ANY($1::text[])
        GROUP BY pl.id
        ORDER BY pl.created_at ASC
-       LIMIT $${limitParam} OFFSET $${offsetParam}`,
-      [...statuses, parseInt(limit as string), parseInt(offset as string)]
+       LIMIT $2 OFFSET $3`,
+      [statuses, parseInt(limit as string), parseInt(offset as string)]
     );
 
     return res.json({
