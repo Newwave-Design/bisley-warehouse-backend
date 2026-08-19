@@ -9,6 +9,7 @@ import cors from 'cors';
 import { initializePool, closePool } from './db/index.js';
 import scanningRoutes from './api/routes/scanning.js';
 import pickListRoutes from './api/routes/pick-lists.js';
+import inventorySyncRoutes from './api/routes/inventory-sync.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -19,6 +20,10 @@ app.use(cors({
   origin: [
     'http://localhost:3000',
     'http://localhost:3001',
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:5175',
+    'http://localhost:5176',
     'https://bisley-shop.medusajs.app',
   ],
   credentials: true,
@@ -32,6 +37,7 @@ app.get('/health', (req, res) => {
 // API Routes
 app.use('/api/scanning', scanningRoutes);
 app.use('/api/pick-lists', pickListRoutes);
+app.use('/api/inventory', inventorySyncRoutes);
 
 // 404 handler
 app.use((req, res) => {
