@@ -30,6 +30,7 @@ app.use(cors({
     'http://localhost:5175',
     'http://localhost:5176',
     'https://bisley-shop.medusajs.app',
+    'https://bisley-warehouse-dashboard-production.up.railway.app',
   ],
   credentials: true,
 }));
