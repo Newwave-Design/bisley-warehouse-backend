@@ -180,7 +180,8 @@ router.get('/all', authMiddleware, async (req: AuthRequest, res: Response) => {
 // Creates a default location "MEDUSA-IMPORT" if none exists, then upserts inventory
 router.post('/seed-from-medusa', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const medusaMap = await fetchMedusaInventory();
+    // Always fetch fresh from Medusa when seeding
+    const medusaMap = await fetchMedusaInventory(true);
 
     // Ensure a default import location exists
     await query(`
@@ -209,6 +210,20 @@ router.post('/seed-from-medusa', authMiddleware, async (req: AuthRequest, res: R
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to seed from Medusa', detail: (err as Error).message });
+  }
+});
+
+// Clear WMS inventory — wipe the IMPORT-01 baseline to start fresh
+router.delete('/wms-inventory', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(`
+      DELETE FROM warehouse_inventory wi
+      USING warehouse_locations wl
+      WHERE wi.location_id = wl.id AND wl.location_code = 'IMPORT-01'
+    `);
+    res.json({ success: true, deleted: result.rowCount });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to clear WMS inventory' });
   }
 });
 
