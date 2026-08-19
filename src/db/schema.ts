@@ -181,10 +181,52 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 -- ================================================================================
+-- SKU MAPPINGS (Phase 1: NW codes to Medusa SKUs and Genero codes)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS sku_mappings (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  nw_code VARCHAR UNIQUE NOT NULL,
+  medusa_sku VARCHAR,
+  genero_code VARCHAR,
+  product_name VARCHAR,
+  family VARCHAR,
+  colour VARCHAR,
+  status TEXT CHECK (status IN ('UNMAPPED', 'ASSUMED', 'VALIDATED', 'REJECTED')) DEFAULT 'UNMAPPED',
+  notes TEXT,
+  mapped_by VARCHAR,
+  mapped_at TIMESTAMP,
+  confidence FLOAT DEFAULT 0,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ================================================================================
+-- NW STOCKING ITEMS (Phase 1: Inventory items from NW stocking programme)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS nw_stocking_items (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  nw_code VARCHAR NOT NULL,
+  description VARCHAR,
+  family VARCHAR,
+  colour VARCHAR,
+  quantity_ordered INT,
+  unit_cost DECIMAL(10,2),
+  mapping_id UUID REFERENCES sku_mappings(id) ON DELETE SET NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ================================================================================
 -- INDEXES (Performance optimization)
 -- ================================================================================
 CREATE INDEX IF NOT EXISTS idx_barcode_sku ON barcode_mappings(product_sku);
 CREATE INDEX IF NOT EXISTS idx_barcode_active ON barcode_mappings(is_active);
+CREATE INDEX IF NOT EXISTS idx_sku_mappings_nw_code ON sku_mappings(nw_code);
+CREATE INDEX IF NOT EXISTS idx_sku_mappings_status ON sku_mappings(status);
+CREATE INDEX IF NOT EXISTS idx_sku_mappings_family ON sku_mappings(family);
+CREATE INDEX IF NOT EXISTS idx_nw_stocking_nw_code ON nw_stocking_items(nw_code);
+CREATE INDEX IF NOT EXISTS idx_nw_stocking_mapping_id ON nw_stocking_items(mapping_id);
+CREATE INDEX IF NOT EXISTS idx_nw_stocking_family ON nw_stocking_items(family);
 CREATE INDEX IF NOT EXISTS idx_inventory_location ON warehouse_inventory(location_id);
 CREATE INDEX IF NOT EXISTS idx_inventory_sku ON warehouse_inventory(product_sku);
 CREATE INDEX IF NOT EXISTS idx_movements_location ON warehouse_movements(location_id);

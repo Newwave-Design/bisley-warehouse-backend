@@ -3,7 +3,7 @@
  * Populates initial warehouse locations, users, and test data
  */
 
-import pg from 'pg';
+import * as pg from 'pg';
 import { v4 as uuidv4 } from 'uuid';
 
 const { Client } = pg;
