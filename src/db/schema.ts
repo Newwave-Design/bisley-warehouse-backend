@@ -181,6 +181,27 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 -- ================================================================================
+-- REQUIRES LOCATION QUEUE (Phase 5: Items checked in, awaiting bay assignment)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS requires_location_queue (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id UUID REFERENCES checkin_sessions(id) ON DELETE SET NULL,
+  order_id UUID REFERENCES supplier_orders(id) ON DELETE SET NULL,
+  nw_code VARCHAR NOT NULL,
+  colour VARCHAR,
+  medusa_sku VARCHAR,
+  quantity INT NOT NULL DEFAULT 0,
+  location_id UUID REFERENCES warehouse_locations(id) ON DELETE SET NULL,
+  status TEXT CHECK (status IN ('PENDING', 'ASSIGNED', 'STOCKED')) DEFAULT 'PENDING',
+  assigned_by VARCHAR,
+  assigned_at TIMESTAMP,
+  stocked_at TIMESTAMP,
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ================================================================================
 -- CHECKIN SESSIONS (Phase 3: Receiving sessions when stock arrives)
 -- ================================================================================
 CREATE TABLE IF NOT EXISTS checkin_sessions (
@@ -361,6 +382,8 @@ CREATE INDEX IF NOT EXISTS idx_checkin_sessions_order ON checkin_sessions(order_
 CREATE INDEX IF NOT EXISTS idx_checkin_sessions_status ON checkin_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_checkin_items_session ON checkin_items(session_id);
 CREATE INDEX IF NOT EXISTS idx_checkin_discrepancies_session ON checkin_discrepancies(session_id);
+CREATE INDEX IF NOT EXISTS idx_requires_location_session ON requires_location_queue(session_id);
+CREATE INDEX IF NOT EXISTS idx_requires_location_status ON requires_location_queue(status);
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);

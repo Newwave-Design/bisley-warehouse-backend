@@ -242,7 +242,7 @@ router.post('/sessions/:id/compare', authMiddleware, async (req: AuthRequest, re
   }
 });
 
-// Complete session — finalises and marks order received
+// Complete session — finalises, marks order received, populates requires_location_queue
 router.post('/sessions/:id/complete', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const session = await query(`SELECT * FROM checkin_sessions WHERE id = $1`, [req.params.id]);
@@ -260,13 +260,25 @@ router.post('/sessions/:id/complete', authMiddleware, async (req: AuthRequest, r
       );
     }
 
+    // Move all scanned items to requires_location_queue
+    const items = await query(`SELECT * FROM checkin_items WHERE session_id = $1`, [req.params.id]);
+    for (const item of items.rows) {
+      await query(
+        `INSERT INTO requires_location_queue (session_id, order_id, nw_code, colour, medusa_sku, quantity, status, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', NOW(), NOW())
+         ON CONFLICT DO NOTHING`,
+        [req.params.id, session.rows[0].order_id, item.nw_code, item.colour, item.medusa_sku, item.quantity_scanned]
+      );
+    }
+
     const summary = await query(
       `SELECT COUNT(*) as items, SUM(quantity_scanned) as units FROM checkin_items WHERE session_id = $1`,
       [req.params.id]
     );
 
-    res.json({ success: true, ...summary.rows[0] });
+    res.json({ success: true, queued_for_location: items.rows.length, ...summary.rows[0] });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: 'Failed to complete session' });
   }
 });
