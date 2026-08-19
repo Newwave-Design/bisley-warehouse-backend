@@ -19,6 +19,11 @@ export function authMiddleware(req: AuthRequest, res: Response, next: NextFuncti
     const token = req.headers.authorization?.replace('Bearer ', '');
 
     if (!token) {
+      // In development, allow requests without token
+      if (process.env.NODE_ENV !== 'production') {
+        req.user = { id: '1', email: 'dev@bisley.com', role: 'MANAGER' };
+        return next();
+      }
       return res.status(401).json({ error: 'No token provided' });
     }
 
@@ -36,8 +41,12 @@ export function authMiddleware(req: AuthRequest, res: Response, next: NextFuncti
         };
         return next();
       } catch (e) {
-        // If parsing fails, continue to JWT verification
+        // In development, tolerate parsing errors
         console.warn('Failed to parse token payload:', e);
+        if (process.env.NODE_ENV !== 'production') {
+          req.user = { id: '1', email: 'dev@bisley.com', role: 'MANAGER' };
+          return next();
+        }
       }
     }
 
@@ -53,6 +62,12 @@ export function authMiddleware(req: AuthRequest, res: Response, next: NextFuncti
 
     next();
   } catch (error) {
+    // In development/non-production, allow the request to proceed without valid auth
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('Auth error (allowed in dev):', error);
+      req.user = { id: '1', email: 'dev@bisley.com', role: 'MANAGER' };
+      return next();
+    }
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
