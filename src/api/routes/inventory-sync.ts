@@ -30,7 +30,14 @@ async function getMedusaToken(): Promise<string> {
   return data.token;
 }
 
-async function fetchMedusaInventory(): Promise<Map<string, number>> {
+// 10-minute in-memory cache for Medusa inventory (avoids 60s Medusa API round-trips)
+let _inventoryCache: Map<string, number> | null = null;
+let _inventoryCacheExpiry = 0;
+
+async function fetchMedusaInventory(forceRefresh = false): Promise<Map<string, number>> {
+  if (!forceRefresh && _inventoryCache && Date.now() < _inventoryCacheExpiry) {
+    return _inventoryCache;
+  }
   const token = await getMedusaToken();
   const qtyMap = new Map<string, number>();
   let offset = 0;
@@ -47,6 +54,8 @@ async function fetchMedusaInventory(): Promise<Map<string, number>> {
     offset += 100;
     if (offset >= (data.count ?? 0)) break;
   }
+  _inventoryCache = qtyMap;
+  _inventoryCacheExpiry = Date.now() + 10 * 60 * 1000; // 10 min TTL
   return qtyMap;
 }
 
@@ -65,10 +74,11 @@ async function getMedusaItemInfo(sku: string): Promise<{ itemId: string; locatio
 // Pre-sync comparison — Medusa is the source of truth; WMS defaults to 0 if not stocked
 router.get('/pre-sync', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    // Fetch Medusa inventory first — always the full picture
+    const forceRefresh = req.query.refresh === 'true';
+    // Fetch Medusa inventory first — uses 10-min cache; pass ?refresh=true to force reload
     let medusaMap: Map<string, number>;
     try {
-      medusaMap = await fetchMedusaInventory();
+      medusaMap = await fetchMedusaInventory(forceRefresh);
     } catch (err) {
       return res.status(503).json({ error: 'Could not reach Medusa API', detail: (err as Error).message });
     }
