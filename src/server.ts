@@ -12,6 +12,7 @@ import scanningRoutes from './api/routes/scanning.js';
 import pickListRoutes from './api/routes/pick-lists.js';
 import inventorySyncRoutes from './api/routes/inventory-sync.js';
 import skuMappingsRoutes from './api/routes/sku-mappings.js';
+import ordersRoutes from './api/routes/orders.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -41,6 +42,7 @@ app.use('/api/scanning', scanningRoutes);
 app.use('/api/pick-lists', pickListRoutes);
 app.use('/api/inventory', inventorySyncRoutes);
 app.use('/api/sku-mappings', skuMappingsRoutes);
+app.use('/api/orders', ordersRoutes);
 
 // 404 handler
 app.use((req, res) => {

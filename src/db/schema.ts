@@ -181,6 +181,75 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 -- ================================================================================
+-- SUPPLIER ORDERS (Phase 2: Purchase orders sent to NW/Genero)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS supplier_orders (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_number VARCHAR(50) NOT NULL UNIQUE,
+  status TEXT CHECK (status IN ('DRAFT', 'SUBMITTED', 'ACKNOWLEDGED', 'DISPATCHED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'CANCELLED')) DEFAULT 'DRAFT',
+  supplier VARCHAR(100) DEFAULT 'New Wave',
+  notes TEXT,
+  expected_delivery DATE,
+  submitted_at TIMESTAMP,
+  dispatched_at TIMESTAMP,
+  received_at TIMESTAMP,
+  genero_dispatch_ref VARCHAR(100),
+  created_by VARCHAR(100),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ================================================================================
+-- ORDER LINE ITEMS (Phase 2: Individual products within a supplier order)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS order_line_items (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id UUID NOT NULL REFERENCES supplier_orders(id) ON DELETE CASCADE,
+  nw_code VARCHAR NOT NULL,
+  medusa_sku VARCHAR,
+  product_name VARCHAR,
+  family VARCHAR,
+  colour VARCHAR,
+  quantity_ordered INT NOT NULL DEFAULT 0,
+  quantity_received INT NOT NULL DEFAULT 0,
+  unit_cost DECIMAL(10,2),
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ================================================================================
+-- INVENTORY THRESHOLDS (Phase 2: Reorder trigger levels per NW code + colour)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS inventory_thresholds (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  nw_code VARCHAR NOT NULL,
+  colour VARCHAR,
+  min_quantity INT NOT NULL DEFAULT 0,
+  reorder_quantity INT NOT NULL DEFAULT 0,
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(nw_code, colour)
+);
+
+-- ================================================================================
+-- GENERO DISPATCH NOTES (Phase 2: Incoming dispatch notifications from Genero)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS genero_dispatch_notes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  dispatch_ref VARCHAR(100) NOT NULL UNIQUE,
+  order_id UUID REFERENCES supplier_orders(id) ON DELETE SET NULL,
+  dispatch_date DATE,
+  expected_delivery DATE,
+  carrier VARCHAR(100),
+  tracking_number VARCHAR(100),
+  raw_payload JSONB,
+  processed BOOLEAN DEFAULT false,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ================================================================================
 -- SKU MAPPINGS (Phase 1: NW codes to Medusa SKUs and Genero codes)
 -- ================================================================================
 CREATE TABLE IF NOT EXISTS sku_mappings (
@@ -236,7 +305,10 @@ CREATE INDEX IF NOT EXISTS idx_pick_lists_status ON pick_lists(status);
 CREATE INDEX IF NOT EXISTS idx_pick_lists_medusa_id ON pick_lists(medusa_order_id);
 CREATE INDEX IF NOT EXISTS idx_pick_items_status ON pick_list_items(status);
 CREATE INDEX IF NOT EXISTS idx_supplier_orders_status ON supplier_orders(status);
-CREATE INDEX IF NOT EXISTS idx_supplier_orders_palette ON supplier_orders(colour_palette);
+CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_line_items(order_id);
+CREATE INDEX IF NOT EXISTS idx_order_items_nw_code ON order_line_items(nw_code);
+CREATE INDEX IF NOT EXISTS idx_thresholds_nw_code ON inventory_thresholds(nw_code);
+CREATE INDEX IF NOT EXISTS idx_dispatch_notes_order ON genero_dispatch_notes(order_id);
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
