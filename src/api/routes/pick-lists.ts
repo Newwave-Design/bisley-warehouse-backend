@@ -256,6 +256,24 @@ router.patch('/:pickListId/items/:itemId/pick', authMiddleware, async (req: Requ
  * PATCH /api/pick-lists/:pickListId/complete
  * Mark pick list as completed
  */
+router.patch('/:pickListId/start', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    const result = await query(
+      `UPDATE pick_lists SET status = 'IN_PROGRESS', updated_at = NOW()
+       WHERE id = $1 AND status = 'PENDING' RETURNING *`,
+      [pickListId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Pick list not found or already started' });
+    }
+    return res.json({ pickList: result.rows[0] });
+  } catch (error) {
+    console.error('Pick list start error:', error);
+    return res.status(500).json({ error: 'Failed to start pick list' });
+  }
+});
+
 router.patch('/:pickListId/complete', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { pickListId } = req.params;
