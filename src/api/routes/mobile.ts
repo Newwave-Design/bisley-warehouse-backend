@@ -265,4 +265,114 @@ router.post('/undo', authMiddleware, async (req: AuthRequest, res: Response) => 
   }
 });
 
+/** GET /api/mobile/pick-lists — pending pick lists for mobile picker */
+router.get('/pick-lists', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(`
+      SELECT
+        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at,
+        COUNT(pli.id)::int                                                     AS total_items,
+        COUNT(*) FILTER (WHERE pli.status = 'PICKED')::int                    AS items_picked,
+        COUNT(*) FILTER (WHERE pli.status = 'PENDING')::int                   AS items_pending
+      FROM pick_lists pl
+      LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
+      WHERE pl.status IN ('PENDING', 'IN_PROGRESS')
+      GROUP BY pl.id
+      ORDER BY pl.created_at ASC
+    `);
+    res.json({ pick_lists: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load pick lists' });
+  }
+});
+
+/** GET /api/mobile/pick-lists/:id — pick list detail with product thumbnails */
+router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const pl = await query(`SELECT * FROM pick_lists WHERE id = $1`, [req.params.id]);
+    if (!pl.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+
+    const items = await query(`
+      SELECT
+        pli.id, pli.line_number, pli.product_sku, pli.colour_code,
+        pli.quantity_required, pli.quantity_picked, pli.status,
+        pli.picked_from_location_id, pli.notes,
+        l.location_code,
+        -- Enrich from wms_products for display
+        wp.product_title, wp.colour_name, wp.variant_thumbnail,
+        -- Show where this SKU is in the warehouse
+        (SELECT json_agg(json_build_object('location_code', wl.location_code, 'qty', wi.quantity) ORDER BY wi.quantity DESC)
+         FROM warehouse_inventory wi
+         JOIN warehouse_locations wl ON wl.id = wi.location_id
+         WHERE wi.product_sku = pli.product_sku
+           AND (wi.colour_code = pli.colour_code OR pli.colour_code IS NULL)
+           AND wi.quantity > 0) AS stock_locations
+      FROM pick_list_items pli
+      LEFT JOIN warehouse_locations l ON l.id = pli.picked_from_location_id
+      LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
+      WHERE pli.pick_list_id = $1
+      ORDER BY pli.line_number
+    `, [req.params.id]);
+
+    res.json({ ...pl.rows[0], items: items.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load pick list detail' });
+  }
+});
+
+/** POST /api/mobile/pick-lists/:id/items/:itemId/pick — scan to pick an item */
+router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { location_code, scanned_barcode } = req.body;
+    const { id: pickListId, itemId } = req.params;
+
+    const item = await query(
+      `SELECT * FROM pick_list_items WHERE id = $1 AND pick_list_id = $2`,
+      [itemId, pickListId]
+    );
+    if (!item.rows[0]) return res.status(404).json({ error: 'Item not found' });
+    if (item.rows[0].status === 'PICKED') return res.status(400).json({ error: 'Already picked' });
+
+    // Verify the scanned barcode matches the expected SKU
+    if (scanned_barcode) {
+      const bm = await query(
+        `SELECT product_sku FROM barcode_mappings WHERE barcode = $1 AND is_active = true LIMIT 1`,
+        [scanned_barcode]
+      );
+      if (bm.rows[0] && bm.rows[0].product_sku !== item.rows[0].product_sku) {
+        return res.status(400).json({ error: `Wrong item scanned — expected ${item.rows[0].product_sku}` });
+      }
+    }
+
+    // Resolve location_id
+    let locationId: string | null = null;
+    if (location_code) {
+      const loc = await query(`SELECT id FROM warehouse_locations WHERE location_code = $1`, [location_code.toUpperCase()]);
+      locationId = loc.rows[0]?.id ?? null;
+    }
+
+    await query(`
+      UPDATE pick_list_items
+      SET status = 'PICKED', quantity_picked = quantity_required,
+          picked_from_location_id = COALESCE($1, picked_from_location_id), updated_at = NOW()
+      WHERE id = $2
+    `, [locationId, itemId]);
+
+    // Check if all items are picked → auto-complete the pick list
+    const remaining = await query(
+      `SELECT COUNT(*) FROM pick_list_items WHERE pick_list_id = $1 AND status != 'PICKED'`,
+      [pickListId]
+    );
+    if (parseInt(remaining.rows[0].count) === 0) {
+      await query(`UPDATE pick_lists SET status = 'PICKED', updated_at = NOW() WHERE id = $1`, [pickListId]);
+    } else {
+      await query(`UPDATE pick_lists SET status = 'IN_PROGRESS', updated_at = NOW() WHERE id = $1`, [pickListId]);
+    }
+
+    res.json({ success: true, all_picked: parseInt(remaining.rows[0].count) === 0 });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message ?? 'Pick failed' });
+  }
+});
+
 export default router;

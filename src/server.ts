@@ -21,6 +21,7 @@ import dashboardRoutes from './api/routes/dashboard.js';
 import generoRoutes from './api/routes/genero.js';
 import reportsRoutes from './api/routes/reports.js';
 import mobileRoutes from './api/routes/mobile.js';
+import webhooksRoutes from './api/routes/webhooks.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -60,6 +61,7 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/genero', generoRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/mobile', mobileRoutes);
+app.use('/api/webhooks', webhooksRoutes);
 
 // 404 handler
 app.use((req, res) => {
