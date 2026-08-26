@@ -22,6 +22,7 @@ import generoRoutes from './api/routes/genero.js';
 import reportsRoutes from './api/routes/reports.js';
 import mobileRoutes from './api/routes/mobile.js';
 import webhooksRoutes from './api/routes/webhooks.js';
+import reorderRulesRoutes, { pendingRouter as pendingReordersRouter, runReorderCheck } from './api/routes/reorder-rules.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -62,6 +63,8 @@ app.use('/api/genero', generoRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/mobile', mobileRoutes);
 app.use('/api/webhooks', webhooksRoutes);
+app.use('/api/reorder-rules', reorderRulesRoutes);
+app.use('/api/pending-reorders', pendingReordersRouter);
 
 // 404 handler
 app.use((req, res) => {
@@ -124,6 +127,9 @@ async function start() {
             const token = `${Buffer.from(JSON.stringify({ alg: 'HS256' })).toString('base64')}.${Buffer.from(JSON.stringify({ sub: 'scheduler', email: 'scheduler@wms', role: 'MANAGER' })).toString('base64')}.sig`;
             await fetch(`http://localhost:${PORT}/api/genero/poll`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
             console.log(`[scheduler] Genero poll ran at ${new Date().toISOString()}`);
+            // Also run reorder check after each Genero poll
+            const triggered = await runReorderCheck();
+            if (triggered.length > 0) console.log(`[scheduler] Reorder check triggered ${triggered.length} pending reorders: ${triggered.slice(0,5).join(', ')}`);
           }
         } catch (err) { console.warn('[scheduler] Genero poll error:', err); }
       }, TWO_HOURS);

@@ -532,4 +532,49 @@ CREATE TABLE IF NOT EXISTS genero_order_lines (
 CREATE INDEX IF NOT EXISTS idx_genero_lines_order ON genero_order_lines(supplier_order_id);
 CREATE INDEX IF NOT EXISTS idx_genero_lines_bisley_order ON genero_order_lines(bisley_order);
 CREATE INDEX IF NOT EXISTS idx_genero_lines_status ON genero_order_lines(genero_status);
+
+-- ================================================================================
+-- REORDER RULES (Automatic replenishment rules per SKU)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS reorder_rules (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  sku VARCHAR(100) NOT NULL UNIQUE,
+  product_name VARCHAR(255),
+  family VARCHAR(100),
+  reorder_point INTEGER NOT NULL DEFAULT 1,
+  reorder_qty INTEGER NOT NULL DEFAULT 2,
+  lead_time_weeks INTEGER NOT NULL DEFAULT 8,
+  monthly_demand DECIMAL(8,2),
+  is_active BOOLEAN DEFAULT true,
+  notes TEXT,
+  last_triggered_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- ================================================================================
+-- PENDING REORDERS (Triggered suggestions awaiting approval)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS pending_reorders (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  reorder_rule_id UUID REFERENCES reorder_rules(id) ON DELETE SET NULL,
+  sku VARCHAR(100) NOT NULL,
+  product_name VARCHAR(255),
+  qty_to_order INTEGER NOT NULL,
+  current_stock INTEGER DEFAULT 0,
+  reorder_point INTEGER NOT NULL,
+  status TEXT CHECK (status IN ('PENDING','APPROVED','DELAYED','CANCELLED')) DEFAULT 'PENDING',
+  triggered_at TIMESTAMP DEFAULT NOW(),
+  delayed_until DATE,
+  delay_reason TEXT,
+  approved_at TIMESTAMP,
+  approved_by VARCHAR(100),
+  supplier_order_id UUID REFERENCES supplier_orders(id) ON DELETE SET NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_pending_reorders_status ON pending_reorders(status);
+CREATE INDEX IF NOT EXISTS idx_pending_reorders_sku ON pending_reorders(sku);
+CREATE INDEX IF NOT EXISTS idx_reorder_rules_sku ON reorder_rules(sku);
+CREATE INDEX IF NOT EXISTS idx_reorder_rules_active ON reorder_rules(is_active);
 `;
