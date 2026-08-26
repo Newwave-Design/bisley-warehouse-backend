@@ -48,9 +48,11 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
         s.medusa_sku, s.genero_code, s.status, s.confidence,
         s.mapped_by, s.mapped_at, s.notes,
         COUNT(*) OVER() as total_count,
-        COALESCE(SUM(n.quantity_ordered), 0) as total_quantity
+        COALESCE(SUM(n.quantity_ordered), 0) as total_quantity,
+        w.variant_thumbnail, w.product_title as wms_title
       FROM sku_mappings s
       LEFT JOIN nw_stocking_items n ON s.id = n.mapping_id
+      LEFT JOIN wms_products w ON w.variant_sku = s.medusa_sku
       WHERE 1=1
     `;
 
@@ -90,7 +92,7 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
 
     sql += ` GROUP BY s.id, s.nw_code, s.product_name, s.family, s.colour,
              s.medusa_sku, s.genero_code, s.status, s.confidence,
-             s.mapped_by, s.mapped_at, s.notes`;
+             s.mapped_by, s.mapped_at, s.notes, w.variant_thumbnail, w.product_title`;
 
     sql += ` ORDER BY s.created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
     params.push(parseInt(limit as string, 10));
@@ -115,6 +117,8 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
         mapped_by: row.mapped_by,
         mapped_at: row.mapped_at,
         notes: row.notes,
+        thumbnail: row.variant_thumbnail ?? null,
+        wms_title: row.wms_title ?? null,
       })),
       total,
       limit: parseInt(limit as string, 10),
@@ -514,6 +518,42 @@ router.post('/import', authMiddleware, async (req: AuthRequest, res: Response) =
   } catch (error) {
     console.error('Import error:', error);
     res.status(500).json({ error: 'Failed to import items' });
+  }
+});
+
+/** POST /api/sku-mappings/validate-assumed — bulk validate all ASSUMED mappings */
+router.post('/validate-assumed', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = (req as any).user?.email || 'system';
+    const result = await query(
+      `UPDATE sku_mappings
+       SET status = 'VALIDATED', mapped_by = $1, mapped_at = NOW(), updated_at = NOW()
+       WHERE status = 'ASSUMED'
+       RETURNING id`,
+      [userId]
+    );
+    res.json({ validated: result.rowCount ?? 0 });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to validate assumed mappings' });
+  }
+});
+
+/** GET /api/sku-mappings/stats — counts by status */
+router.get('/stats', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(`
+      SELECT
+        COUNT(*)::int                                          AS total,
+        COUNT(*) FILTER (WHERE status = 'VALIDATED')::int     AS validated,
+        COUNT(*) FILTER (WHERE status = 'ASSUMED')::int       AS assumed,
+        COUNT(*) FILTER (WHERE status = 'UNMAPPED')::int      AS unmapped,
+        COUNT(*) FILTER (WHERE status = 'REJECTED')::int      AS rejected
+      FROM sku_mappings
+    `);
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch stats' });
   }
 });
 
