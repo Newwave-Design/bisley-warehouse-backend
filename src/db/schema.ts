@@ -48,15 +48,31 @@ CREATE TABLE IF NOT EXISTS wms_products (
   medusa_product_id VARCHAR(100) NOT NULL,
   medusa_variant_id VARCHAR(100) NOT NULL,
   product_title VARCHAR(255) NOT NULL,
+  product_subtitle VARCHAR(500),
   product_handle VARCHAR(255),
   product_status VARCHAR(50) DEFAULT 'draft',
   product_thumbnail VARCHAR(500),
+  product_description TEXT,
+  product_material VARCHAR(255),
+  gallery_images JSONB DEFAULT '[]'::jsonb,
+  metadata JSONB DEFAULT '{}'::jsonb,
+  weight_grams INTEGER,
+  height_mm INTEGER,
+  width_mm INTEGER,
+  depth_mm INTEGER,
   variant_sku VARCHAR(100) NOT NULL,
   variant_title VARCHAR(255),
   colour_code VARCHAR(30),
   colour_name VARCHAR(100),
   variant_thumbnail VARCHAR(500),
   manage_inventory BOOLEAN DEFAULT false,
+  allow_backorder BOOLEAN DEFAULT false,
+  price_gbp DECIMAL(10,2),
+  variant_barcode VARCHAR(100),
+  variant_weight_grams INTEGER,
+  variant_height_mm INTEGER,
+  variant_width_mm INTEGER,
+  variant_depth_mm INTEGER,
   is_kit BOOLEAN DEFAULT false,
   kit_components JSONB DEFAULT '[]'::jsonb,
   inventory_qty INTEGER DEFAULT 0,
@@ -65,6 +81,23 @@ CREATE TABLE IF NOT EXISTS wms_products (
   updated_at TIMESTAMP DEFAULT NOW(),
   CONSTRAINT unique_medusa_variant_id UNIQUE(medusa_variant_id)
 );
+-- Extend existing installations with new columns (safe to re-run)
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS product_subtitle VARCHAR(500);
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS product_description TEXT;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS product_material VARCHAR(255);
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS gallery_images JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS weight_grams INTEGER;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS height_mm INTEGER;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS width_mm INTEGER;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS depth_mm INTEGER;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS allow_backorder BOOLEAN DEFAULT false;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS price_gbp DECIMAL(10,2);
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS variant_barcode VARCHAR(100);
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS variant_weight_grams INTEGER;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS variant_height_mm INTEGER;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS variant_width_mm INTEGER;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS variant_depth_mm INTEGER;
 
 -- ================================================================================
 -- WAREHOUSE INVENTORY (Current stock levels by location)
