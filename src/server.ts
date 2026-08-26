@@ -19,6 +19,7 @@ import productsRoutes from './api/routes/products.js';
 import settingsRoutes from './api/routes/settings.js';
 import dashboardRoutes from './api/routes/dashboard.js';
 import generoRoutes from './api/routes/genero.js';
+import reportsRoutes from './api/routes/reports.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -56,6 +57,7 @@ app.use('/api/products', productsRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/genero', generoRoutes);
+app.use('/api/reports', reportsRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -104,6 +106,25 @@ async function start() {
       console.log(`  API: http://localhost:${PORT}/api`);
       console.log('');
     });
+
+    // Scheduled Genero poll — every 2 hours in production if API URL is configured
+    if (process.env.NODE_ENV === 'production' && process.env.GENERO_API_URL) {
+      const TWO_HOURS = 2 * 60 * 60 * 1000;
+      setInterval(async () => {
+        const h = new Date().getHours();
+        if (h < 7 || h > 19) return; // only poll during business hours (7am–7pm)
+        try {
+          const { query: dbQuery } = await import('./db/index.js');
+          const open = await dbQuery(`SELECT COUNT(*) FROM genero_order_lines WHERE genero_status NOT IN ('Received','Cancelled','Complete','Delivered') OR genero_status IS NULL`);
+          if (parseInt(open.rows[0].count) > 0) {
+            const token = `${Buffer.from(JSON.stringify({ alg: 'HS256' })).toString('base64')}.${Buffer.from(JSON.stringify({ sub: 'scheduler', email: 'scheduler@wms', role: 'MANAGER' })).toString('base64')}.sig`;
+            await fetch(`http://localhost:${PORT}/api/genero/poll`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
+            console.log(`[scheduler] Genero poll ran at ${new Date().toISOString()}`);
+          }
+        } catch (err) { console.warn('[scheduler] Genero poll error:', err); }
+      }, TWO_HOURS);
+      console.log('✓ Genero auto-poll scheduled (every 2h, business hours)');
+    }
   } catch (error) {
     console.error('❌ Startup failed:', error);
     process.exit(1);
