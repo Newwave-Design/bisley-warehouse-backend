@@ -14,6 +14,7 @@
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { logError, logWarning, logInfo } from '../../lib/logger.js';
 
 const router = express.Router();
 
@@ -131,6 +132,7 @@ router.post('/submit/:orderId', authMiddleware, async (req: AuthRequest, res: Re
           VALUES ($1,$2,$3,$4,$5,$6,NOW())
           ON CONFLICT (order_line_item_id) DO UPDATE SET poll_error = $6, updated_at = NOW()
         `, [orderId, line.id, GENERO_ACCOUNT, sku, line.quantity_ordered, err.message?.slice(0, 500)]);
+        await logError('GENERO_SUBMIT', err.message ?? 'Submit failed', { sku, order_number: order.order_number, order_id: orderId });
       }
     }
 
@@ -187,6 +189,15 @@ router.post('/poll', authMiddleware, async (req: AuthRequest, res: Response) => 
         const deliveryChanged = response.Est_delivery !== line.est_delivery?.toISOString?.()?.split('T')[0];
 
         if (statusChanged || deliveryChanged || !line.bisley_order) {
+          // Log status transitions as INFO events for the comms trail
+          if (statusChanged && response.status) {
+            await logInfo('GENERO_POLL', `Status: ${line.genero_status ?? 'unknown'} → ${response.status}`,
+              { sku: line.sku, bisley_order: response.bisley_order ?? line.bisley_order, order_number: line.order_number });
+          }
+          if (deliveryChanged && response.Est_delivery) {
+            await logInfo('GENERO_POLL', `Delivery date updated: ${response.Est_delivery}`,
+              { sku: line.sku, bisley_order: line.bisley_order, prev: line.est_delivery, new: response.Est_delivery });
+          }
           await query(`
             UPDATE genero_order_lines SET
               bisley_order   = COALESCE($1, bisley_order),
@@ -203,6 +214,7 @@ router.post('/poll', authMiddleware, async (req: AuthRequest, res: Response) => 
         }
       } catch (err: any) {
         errors.push(`${line.sku}: ${err.message?.slice(0, 100)}`);
+        await logError('GENERO_POLL', err.message ?? 'Poll failed', { sku: line.sku, bisley_order: line.bisley_order, order_number: line.order_number });
         await query(`UPDATE genero_order_lines SET poll_error = $1, last_polled_at = NOW() WHERE id = $2`,
           [err.message?.slice(0, 500), line.id]);
       }

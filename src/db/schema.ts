@@ -577,4 +577,24 @@ CREATE INDEX IF NOT EXISTS idx_pending_reorders_status ON pending_reorders(statu
 CREATE INDEX IF NOT EXISTS idx_pending_reorders_sku ON pending_reorders(sku);
 CREATE INDEX IF NOT EXISTS idx_reorder_rules_sku ON reorder_rules(sku);
 CREATE INDEX IF NOT EXISTS idx_reorder_rules_active ON reorder_rules(is_active);
+
+-- ================================================================================
+-- WMS ERROR LOG (Centralised error tracking for all external integrations)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS wms_error_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  source VARCHAR(50) NOT NULL,
+  severity VARCHAR(10) NOT NULL DEFAULT 'ERROR',
+  message TEXT NOT NULL,
+  context JSONB,
+  stack TEXT,
+  resolved BOOLEAN DEFAULT false,
+  resolved_at TIMESTAMP,
+  resolved_by VARCHAR(100),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_error_log_source ON wms_error_log(source);
+CREATE INDEX IF NOT EXISTS idx_error_log_severity ON wms_error_log(severity);
+CREATE INDEX IF NOT EXISTS idx_error_log_resolved ON wms_error_log(resolved);
+CREATE INDEX IF NOT EXISTS idx_error_log_created ON wms_error_log(created_at DESC);
 `;

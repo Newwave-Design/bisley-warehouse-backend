@@ -23,6 +23,7 @@ import reportsRoutes from './api/routes/reports.js';
 import mobileRoutes from './api/routes/mobile.js';
 import webhooksRoutes from './api/routes/webhooks.js';
 import reorderRulesRoutes, { pendingRouter as pendingReordersRouter, runReorderCheck } from './api/routes/reorder-rules.js';
+import errorLogRoutes from './api/routes/error-log.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -65,6 +66,7 @@ app.use('/api/mobile', mobileRoutes);
 app.use('/api/webhooks', webhooksRoutes);
 app.use('/api/reorder-rules', reorderRulesRoutes);
 app.use('/api/pending-reorders', pendingReordersRouter);
+app.use('/api/error-log', errorLogRoutes);
 
 // 404 handler
 app.use((req, res) => {
