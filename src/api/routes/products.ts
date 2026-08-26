@@ -23,7 +23,7 @@ const COLOUR_NAMES: Record<string, string> = {
   da8: 'Emerald', be2: 'Fuchsia', bh2: 'Bisley Green', bp5: 'Azure',
   ab1: 'Coral', bq4: 'Seville', ab2: 'Lilac', cj4: 'Berry',
   cj5: 'Marine Green', ab9: 'Chalk', ay8: 'Cardinal Red', bp7: 'Prussian',
-  bq5: 'Dijon', ay7: 'Oxford Blue',
+  bq5: 'Dijon', ay7: 'Ocean Blue',
 };
 
 /** Extract Bisley colour code (e.g. av1, bc6) from the end of a SKU. */

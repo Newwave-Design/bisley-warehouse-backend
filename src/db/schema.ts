@@ -484,11 +484,44 @@ INSERT INTO field_mappings (mapping_direction, source_field, source_label, targe
   ('MEDUSA_TO_WMS', 'inventory_item.available_qty',  'Available Quantity',     'warehouse_inventory.quantity',       'WMS Stock Qty',       'Current available stock level pushed to/from Medusa'),
   ('MEDUSA_TO_WMS', 'inventory_item.required_qty',   'Kit Required Qty',       'kit_component_qty',                  'Kit Component Qty',   'Quantity of this component required per assembled kit unit'),
   ('MEDUSA_TO_WMS', 'product.status',                'Product Status',         'product_status',                     'Product Status',      'published / draft / proposed — display only, not synced'),
-  ('WMS_TO_GENERO', 'sku_mappings.genero_code',      'Genero Product Code',    null,                                 null,                  'Awaiting Genero schema — maps WMS Genero code to Genero product identifier'),
-  ('WMS_TO_GENERO', 'order_line_items.nw_code',      'NW Stocking Code',       null,                                 null,                  'Awaiting Genero schema — NW code used to identify item in Genero order'),
-  ('WMS_TO_GENERO', 'order_line_items.qty_ordered',  'Quantity Ordered',       null,                                 null,                  'Awaiting Genero schema — quantity to send in Genero purchase order'),
-  ('WMS_TO_GENERO', 'supplier_orders.order_number',  'WMS Order Reference',    null,                                 null,                  'Awaiting Genero schema — WMS order ref to correlate with Genero dispatch note')
+  ('WMS_TO_GENERO', 'sku_mappings.medusa_sku',          'Bisley SKU',           'sku',        'sku',          'Bisley product SKU in format PRODUCTCODE-colourcode e.g. AOC4-av4. Required by Genero.'),
+  ('WMS_TO_GENERO', 'order_line_items.product_name',    'Product Name',         'name',       'name',         'Product description sent to Genero with the order line'),
+  ('WMS_TO_GENERO', 'order_line_items.quantity_ordered','Quantity Ordered',     'quantity',   'quantity',     'Integer quantity to order. Required by Genero.'),
+  ('WMS_TO_GENERO', 'supplier_orders.order_number',     'WMS Order Reference',  'order_ref',  'order_ref',    'Our WMS order reference, returned unchanged for correlation'),
+  ('WMS_TO_GENERO', '(env) GENERO_ACCOUNT_NO',          'NW Account Number',    'account',    'account',      'Bisley New Wave account number — configured as GENERO_ACCOUNT_NO env var. Required.'),
+  ('WMS_TO_GENERO', 'genero_order_lines.bisley_order',  'Bisley Order No',      'order_id',   'order_id',     'Genero returns bisley_order on first submit; pass as order_id on subsequent polls'),
+  ('WMS_TO_GENERO', '(returned) status',                'Order Status',         null,         'status',       'Returned by Genero: Open / In Production / Dispatched etc. Update on each poll.'),
+  ('WMS_TO_GENERO', '(returned) Est_delivery',          'Est. Delivery Date',   null,         'Est_delivery', 'Returned by Genero: estimated delivery date. Poll periodically as it updates.')
 ON CONFLICT (mapping_direction, source_field) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS idx_field_mappings_direction ON field_mappings(mapping_direction);
+
+-- ================================================================================
+-- GENERO ORDER LINES (Bisley NW API line-item submissions and their poll status)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS genero_order_lines (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  supplier_order_id UUID REFERENCES supplier_orders(id) ON DELETE CASCADE,
+  order_line_item_id UUID REFERENCES order_line_items(id) ON DELETE SET NULL,
+  -- Fields sent to Genero POST API
+  account VARCHAR(50) NOT NULL,
+  order_ref VARCHAR(100),
+  name VARCHAR(255),
+  sku VARCHAR(100) NOT NULL,
+  quantity INTEGER NOT NULL,
+  -- Fields returned by Genero
+  bisley_order INTEGER,
+  genero_status VARCHAR(50),
+  est_delivery DATE,
+  -- Polling metadata
+  submitted_at TIMESTAMP,
+  last_polled_at TIMESTAMP,
+  poll_error TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  CONSTRAINT unique_genero_line_item UNIQUE(order_line_item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_genero_lines_order ON genero_order_lines(supplier_order_id);
+CREATE INDEX IF NOT EXISTS idx_genero_lines_bisley_order ON genero_order_lines(bisley_order);
+CREATE INDEX IF NOT EXISTS idx_genero_lines_status ON genero_order_lines(genero_status);
 `;
