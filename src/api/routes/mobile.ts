@@ -208,21 +208,49 @@ router.post('/undo', authMiddleware, async (req: AuthRequest, res: Response) => 
       `SELECT * FROM warehouse_movements WHERE id = $1 AND movement_date > NOW() - INTERVAL '1 hour'`,
       [movement_id]
     );
-    if (!mvt.rows[0]) return res.status(404).json({ error: 'Movement not found or older than 1 hour' });
+    if (!mvt.rows[0]) {
+      // Check if it exists but is too old
+      const old = await query(`SELECT movement_date FROM warehouse_movements WHERE id = $1`, [movement_id]);
+      if (old.rows[0]) return res.status(400).json({ error: 'Action is older than 1 hour — cannot undo' });
+      return res.status(404).json({ error: 'Movement not found' });
+    }
+    if (!['RECEIVE', 'ADJUST'].includes(mvt.rows[0].movement_type)) {
+      return res.status(400).json({ error: `Cannot undo a ${mvt.rows[0].movement_type} movement` });
+    }
 
     const m = mvt.rows[0];
     if (m.movement_type === 'RECEIVE') {
-      // Reverse: subtract the quantity
+      // Undo a stock-in: remove the quantity from that bay
       await query(`
         UPDATE warehouse_inventory SET quantity = GREATEST(0, quantity - $1), updated_at = NOW()
         WHERE location_id = $2 AND product_sku = $3 AND (colour_code = $4 OR $4 IS NULL)
       `, [m.quantity, m.location_id, m.product_sku, m.colour_code]);
+
     } else if (m.movement_type === 'ADJUST' && m.quantity < 0) {
-      // Reverse a move-out: add back
+      // Undo the out-leg of a move: add back to source.
+      // Also find and reverse the paired in-leg (same SKU/colour, RECEIVE, same time window).
       await query(`
         UPDATE warehouse_inventory SET quantity = quantity + $1, updated_at = NOW()
         WHERE location_id = $2 AND product_sku = $3 AND (colour_code = $4 OR $4 IS NULL)
       `, [Math.abs(m.quantity), m.location_id, m.product_sku, m.colour_code]);
+
+      // Remove from destination: find the RECEIVE movement created at the same time
+      const paired = await query(`
+        SELECT id, location_id FROM warehouse_movements
+        WHERE product_sku = $1 AND (colour_code = $2 OR $2 IS NULL)
+          AND movement_type = 'RECEIVE' AND quantity = $3
+          AND notes ILIKE '%Moved from%'
+          AND movement_date BETWEEN $4::timestamptz - INTERVAL '5 seconds'
+                                AND $4::timestamptz + INTERVAL '5 seconds'
+        LIMIT 1
+      `, [m.product_sku, m.colour_code, Math.abs(m.quantity), m.movement_date]);
+
+      if (paired.rows[0]) {
+        await query(`
+          UPDATE warehouse_inventory SET quantity = GREATEST(0, quantity - $1), updated_at = NOW()
+          WHERE location_id = $2 AND product_sku = $3 AND (colour_code = $4 OR $4 IS NULL)
+        `, [Math.abs(m.quantity), paired.rows[0].location_id, m.product_sku, m.colour_code]);
+      }
     }
 
     // Log the undo
