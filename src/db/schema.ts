@@ -30,11 +30,40 @@ CREATE TABLE IF NOT EXISTS barcode_mappings (
   colour_code VARCHAR(20),
   colour_name VARCHAR(100),
   product_name VARCHAR(255),
+  thumbnail_url VARCHAR(500),
   medusa_product_id VARCHAR(100),
   medusa_variant_id VARCHAR(100),
   is_active BOOLEAN DEFAULT true,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
+);
+-- Add thumbnail_url to existing installations that predate this column
+ALTER TABLE barcode_mappings ADD COLUMN IF NOT EXISTS thumbnail_url VARCHAR(500);
+
+-- ================================================================================
+-- WMS PRODUCTS (Local Medusa cache — synced via POST /api/products/sync)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS wms_products (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  medusa_product_id VARCHAR(100) NOT NULL,
+  medusa_variant_id VARCHAR(100) NOT NULL,
+  product_title VARCHAR(255) NOT NULL,
+  product_handle VARCHAR(255),
+  product_status VARCHAR(50) DEFAULT 'draft',
+  product_thumbnail VARCHAR(500),
+  variant_sku VARCHAR(100) NOT NULL,
+  variant_title VARCHAR(255),
+  colour_code VARCHAR(30),
+  colour_name VARCHAR(100),
+  variant_thumbnail VARCHAR(500),
+  manage_inventory BOOLEAN DEFAULT false,
+  is_kit BOOLEAN DEFAULT false,
+  kit_components JSONB DEFAULT '[]'::jsonb,
+  inventory_qty INTEGER DEFAULT 0,
+  last_synced_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  CONSTRAINT unique_medusa_variant_id UNIQUE(medusa_variant_id)
 );
 
 -- ================================================================================
@@ -359,6 +388,10 @@ CREATE TABLE IF NOT EXISTS nw_stocking_items (
 -- ================================================================================
 CREATE INDEX IF NOT EXISTS idx_barcode_sku ON barcode_mappings(product_sku);
 CREATE INDEX IF NOT EXISTS idx_barcode_active ON barcode_mappings(is_active);
+CREATE INDEX IF NOT EXISTS idx_wms_products_variant_id ON wms_products(medusa_variant_id);
+CREATE INDEX IF NOT EXISTS idx_wms_products_sku ON wms_products(variant_sku);
+CREATE INDEX IF NOT EXISTS idx_wms_products_product_id ON wms_products(medusa_product_id);
+CREATE INDEX IF NOT EXISTS idx_wms_products_status ON wms_products(product_status);
 CREATE INDEX IF NOT EXISTS idx_sku_mappings_nw_code ON sku_mappings(nw_code);
 CREATE INDEX IF NOT EXISTS idx_sku_mappings_status ON sku_mappings(status);
 CREATE INDEX IF NOT EXISTS idx_sku_mappings_family ON sku_mappings(family);
