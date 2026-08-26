@@ -387,4 +387,42 @@ CREATE INDEX IF NOT EXISTS idx_requires_location_status ON requires_location_que
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
+
+-- ================================================================================
+-- FIELD MAPPINGS (Medusa → WMS and WMS → Genero field configuration)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS field_mappings (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  mapping_direction VARCHAR(20) NOT NULL CHECK (mapping_direction IN ('MEDUSA_TO_WMS', 'WMS_TO_GENERO')),
+  source_field VARCHAR(100) NOT NULL,
+  source_label VARCHAR(200) NOT NULL,
+  target_field VARCHAR(100),
+  target_label VARCHAR(200),
+  transform VARCHAR(500),
+  notes TEXT,
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  CONSTRAINT unique_direction_source UNIQUE(mapping_direction, source_field)
+);
+
+-- Seed default Medusa → WMS field mappings (idempotent)
+INSERT INTO field_mappings (mapping_direction, source_field, source_label, target_field, target_label, notes) VALUES
+  ('MEDUSA_TO_WMS', 'variant.sku',                   'Variant SKU',            'sku_mappings.medusa_sku',            'Medusa SKU',          'Primary identifier for matching variants to WMS records'),
+  ('MEDUSA_TO_WMS', 'product.title',                 'Product Title',          'sku_mappings.product_name',          'Product Name',        'Human-readable product name shown in WMS'),
+  ('MEDUSA_TO_WMS', 'product.handle',                'URL Handle',             'sku_mappings.handle',                'Handle',              'Medusa URL slug — used for deep-linking to storefront'),
+  ('MEDUSA_TO_WMS', 'variant.title',                 'Variant Title',          'sku_mappings.colour',                'Colour Label',        'Option label on the variant e.g. "Bisley Blue"'),
+  ('MEDUSA_TO_WMS', 'variant.thumbnail',             'Thumbnail URL',          'barcode_mappings.image_url',         'Image URL',           'S3/CDN URL for variant swatch image'),
+  ('MEDUSA_TO_WMS', 'variant.manage_inventory',      'Manage Inventory',       'warehouse_inventory.tracked',        'Track Stock',         'When true the WMS tracks physical stock for this variant'),
+  ('MEDUSA_TO_WMS', 'inventory_item.sku',            'Inventory Item SKU',     'warehouse_inventory.product_sku',    'WMS Product SKU',     'SKU used as the primary key in WMS stock tables'),
+  ('MEDUSA_TO_WMS', 'inventory_item.available_qty',  'Available Quantity',     'warehouse_inventory.quantity',       'WMS Stock Qty',       'Current available stock level pushed to/from Medusa'),
+  ('MEDUSA_TO_WMS', 'inventory_item.required_qty',   'Kit Required Qty',       'kit_component_qty',                  'Kit Component Qty',   'Quantity of this component required per assembled kit unit'),
+  ('MEDUSA_TO_WMS', 'product.status',                'Product Status',         'product_status',                     'Product Status',      'published / draft / proposed — display only, not synced'),
+  ('WMS_TO_GENERO', 'sku_mappings.genero_code',      'Genero Product Code',    null,                                 null,                  'Awaiting Genero schema — maps WMS Genero code to Genero product identifier'),
+  ('WMS_TO_GENERO', 'order_line_items.nw_code',      'NW Stocking Code',       null,                                 null,                  'Awaiting Genero schema — NW code used to identify item in Genero order'),
+  ('WMS_TO_GENERO', 'order_line_items.qty_ordered',  'Quantity Ordered',       null,                                 null,                  'Awaiting Genero schema — quantity to send in Genero purchase order'),
+  ('WMS_TO_GENERO', 'supplier_orders.order_number',  'WMS Order Reference',    null,                                 null,                  'Awaiting Genero schema — WMS order ref to correlate with Genero dispatch note')
+ON CONFLICT (mapping_direction, source_field) DO NOTHING;
+
+CREATE INDEX IF NOT EXISTS idx_field_mappings_direction ON field_mappings(mapping_direction);
 `;
