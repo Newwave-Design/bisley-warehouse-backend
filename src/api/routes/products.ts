@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Products API Routes
  *
  * GET  /api/products              — live fetch from Medusa (5-min memory cache)
@@ -265,25 +265,36 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
   }
 });
 
-// ── POST /api/products/sync ───────────────────────────────────────────────────
-router.post('/sync', authMiddleware, async (req: AuthRequest, res: Response) => {
+// ── In-memory sync state (single-instance; survives for the lifetime of the process) ──
+interface SyncState {
+  running: boolean;
+  started_at: Date | null;
+  finished_at: Date | null;
+  progress: string;
+  result: Record<string, any> | null;
+  error: string | null;
+}
+const syncState: SyncState = {
+  running: false, started_at: null, finished_at: null,
+  progress: 'idle', result: null, error: null,
+};
+
+async function runSyncJob() {
   const syncStart = new Date();
-  const startedAt = Date.now();
   let inserted = 0, updated = 0, skipped = 0, barcodesSynced = 0;
   const errors: string[] = [];
 
   try {
-    // Always fetch fresh data from Medusa — never use cached data for a sync
+    syncState.progress = 'Fetching from Medusa…';
     const allProducts = await fetchAllProductsFromMedusa(true);
+
+    syncState.progress = `Writing ${allProducts.reduce((s, p) => s + p.variant_count, 0)} variants to DB…`;
 
     for (const product of allProducts) {
       for (const v of product.variants) {
-        // Skip variants without a SKU — they can't be tracked in the WMS
         if (!v.sku) { skipped++; continue; }
-
         try {
           const kitJson = JSON.stringify(v.kit_components);
-
           const r = await query(`
             INSERT INTO wms_products
               (medusa_product_id, medusa_variant_id,
@@ -342,7 +353,6 @@ router.post('/sync', authMiddleware, async (req: AuthRequest, res: Response) => 
           ]);
           if (r.rows[0]?.is_insert) inserted++; else updated++;
 
-          // Keep barcode_mappings in sync for the scanning workflow
           if (v.sku) {
             await query(`
               INSERT INTO barcode_mappings
@@ -370,40 +380,73 @@ router.post('/sync', authMiddleware, async (req: AuthRequest, res: Response) => 
       }
     }
 
-    // Enrich sku_mappings rows where medusa_sku matches a synced variant
     const enrichResult = await query(`
       UPDATE sku_mappings sm
       SET product_name = wmp.product_title,
           colour       = wmp.colour_name,
           updated_at   = NOW()
       FROM wms_products wmp
-      WHERE sm.medusa_sku = wmp.variant_sku
-        AND sm.medusa_sku IS NOT NULL
+      WHERE sm.medusa_sku = wmp.variant_sku AND sm.medusa_sku IS NOT NULL
     `);
 
-    // Detect stale rows — variants that existed before this sync but weren't touched.
-    // These are products/variants that have been removed from Medusa since last sync.
     const staleResult = await query(
       `SELECT COUNT(*)::int AS stale_count FROM wms_products WHERE last_synced_at < $1`,
       [syncStart]
     );
-    const staleCount = staleResult.rows[0]?.stale_count ?? 0;
 
-    res.json({
-      inserted,
-      updated,
-      skipped,
+    syncState.result = {
+      inserted, updated, skipped,
       barcodes_synced: barcodesSynced,
       sku_mappings_enriched: enrichResult.rowCount ?? 0,
-      stale_rows: staleCount, // rows not seen in Medusa this sync — may have been deleted
+      stale_rows: staleResult.rows[0]?.stale_count ?? 0,
       errors: errors.slice(0, 20),
-      duration_ms: Date.now() - startedAt,
+      duration_ms: Date.now() - syncStart.getTime(),
       total_variants: inserted + updated,
-    });
+    };
+    syncState.error = null;
   } catch (err: any) {
-    console.error('Sync error:', err);
-    res.status(500).json({ error: 'Sync failed', detail: err.message, inserted, updated, errors });
+    console.error('Sync job error:', err);
+    syncState.error = err.message;
+    syncState.result = { inserted, updated, errors };
+  } finally {
+    syncState.running = false;
+    syncState.finished_at = new Date();
+    syncState.progress = syncState.error ? 'failed' : 'complete';
   }
+}
+
+// ── POST /api/products/sync — responds immediately, runs in background ─────────
+router.post('/sync', authMiddleware, (req: AuthRequest, res: Response) => {
+  if (syncState.running) {
+    return res.status(409).json({
+      error: 'Sync already in progress',
+      progress: syncState.progress,
+      started_at: syncState.started_at,
+    });
+  }
+  syncState.running = true;
+  syncState.started_at = new Date();
+  syncState.finished_at = null;
+  syncState.result = null;
+  syncState.error = null;
+  syncState.progress = 'Starting…';
+
+  // Fire and forget — response is sent before sync completes to avoid Railway timeout
+  res.json({ status: 'started', message: 'Sync running in background. Poll GET /api/products/sync/status' });
+
+  runSyncJob();
+});
+
+// ── GET /api/products/sync/status — poll this after triggering a sync ─────────
+router.get('/sync/status', authMiddleware, (_req: AuthRequest, res: Response) => {
+  res.json({
+    running: syncState.running,
+    progress: syncState.progress,
+    started_at: syncState.started_at,
+    finished_at: syncState.finished_at,
+    result: syncState.result,
+    error: syncState.error,
+  });
 });
 
 // ── GET /api/products/:id ─────────────────────────────────────────────────────
