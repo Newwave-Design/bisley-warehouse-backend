@@ -1,483 +1,220 @@
-# Warehouse Management System (WMS) Backend
+﻿# Warehouse Management System — Backend
 
-Custom warehouse management system for Bisley Shop, designed to work in isolation while preparing for seamless integration with Medusa (e-commerce) and Genero (supplier order management).
-
-## 🎯 Overview
-
-This is a **Node.js/Express/PostgreSQL** application that manages:
-
-- **Barcode Scanning** — USB scanner input, supercode parsing (SKU + colour)
-- **Supplier Intake** — Log received stock, assign to bay/bin locations
-- **Inventory Tracking** — Real-time stock levels by location
-- **Pick Lists** — Orders to fulfill, pick/pack/ship workflow
-- **Audit Logging** — Full history of all warehouse activities
-
-Hosted on **Railway.app** (£20/mo) with PostgreSQL, designed for Mark to operate from the warehouse.
+Node.js + Express + PostgreSQL API powering the Bisley WMS.  
+Deployed on **Railway** — auto-deploys from `main` branch.  
+Production: `https://bisley-warehouse-backend-production.up.railway.app`
 
 ---
 
-## 🚀 Quick Start
-
-### 1. Install Dependencies
+## Quick Start
 
 ```bash
 cd apps/warehouse-backend
 npm install
+cp .env.example .env.local   # fill in DATABASE_URL + JWT_SECRET
+npm run db:migrate            # creates all tables (safe to re-run)
+npm run dev                   # http://localhost:3001
 ```
 
-### 2. Set Up Environment
+## Environment Variables
 
-```bash
-cp .env.example .env.local
-# Edit .env.local with your settings (DATABASE_URL, JWT_SECRET, etc)
-```
-
-### 3. Run Database Migrations
-
-```bash
-npm run db:migrate
-```
-
-This creates all 13 warehouse tables:
-- `warehouse_locations` (bays/bins)
-- `warehouse_inventory` (stock levels by location)
-- `barcode_mappings` (supercode lookup)
-- `pick_lists` (orders to pick)
-- `warehouse_movements` (audit trail)
-- `warehouse_users` (staff)
-- `supplier_orders` (replenishment requests to Genero)
-- `audit_log` (security/compliance)
-- + support tables
-
-### 4. Start Development Server
-
-```bash
-npm run dev
-```
-
-Server runs on `http://localhost:3001`  
-Health check: `http://localhost:3001/health`
+| Variable | Required | Description |
+|---|---|---|
+| `DATABASE_URL` | ✅ | PostgreSQL connection string (Railway provides this) |
+| `JWT_SECRET` | ✅ | JWT signing secret |
+| `MEDUSA_API_BASE_URL` | ✅ | Medusa backend URL (e.g. `https://bisley-shop.medusajs.app`) |
+| `MEDUSA_ADMIN_EMAIL` | ✅ | Medusa admin email for product sync auth |
+| `MEDUSA_ADMIN_PASSWORD` | ✅ | Medusa admin password |
+| `GENERO_API_URL` | ⚠️ | Bisley New Wave API endpoint. When unset the integration runs in **simulation mode** |
+| `GENERO_ACCOUNT_NO` | ⚠️ | NW account number (e.g. `NW123`) |
+| `PORT` | — | Server port (Railway sets this; defaults to 3001) |
+| `NODE_ENV` | — | `production` enables strict JWT validation |
 
 ---
 
-## 📋 API Endpoints
+## API Reference
 
-### Barcode Scanning
+All endpoints require `Authorization: Bearer <jwt>`.  
+Auth accepts any valid JWT or demo token (payload: `{ sub, email, role }`).
 
-#### `POST /api/scanning/scan`
-Process a barcode input (USB scanner or manual entry)
+### Dashboard
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/dashboard` | Live stats for all WMS entities (products, orders, check-in, etc.) |
 
-```bash
-curl -X POST http://localhost:3001/api/scanning/scan \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"barcode": "H2910NL-BLK"}'
-```
+### Products (Medusa Sync)
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/products` | Live fetch from Medusa (5-min memory cache) |
+| `GET` | `/api/products/wms-cache` | Read from local `wms_products` table |
+| `POST` | `/api/products/sync` | Pull all Medusa products into WMS DB (async background job) |
+| `GET` | `/api/products/sync/status` | Poll sync job status and result |
+| `GET` | `/api/products/:id` | Single product from memory cache |
 
-**Response:**
-```json
-{
-  "rawInput": "H2910NL-BLK",
-  "productSku": "H2910NL",
-  "colourCode": "BLK",
-  "colourName": "Black",
-  "isValid": true
-}
-```
+### Genero (Bisley New Wave API)
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/genero/submit/:orderId` | Submit all line items for a WMS order to Genero |
+| `POST` | `/api/genero/poll` | Re-poll all open lines for updated status/Est_delivery |
+| `GET` | `/api/genero/lines/:orderId` | Current Genero status for all lines on an order |
+| `GET` | `/api/genero/config` | Show configured API URL and account (no secrets) |
 
-**Barcode Format:**
-- Supercode: `SKU-COLOURCODE` (e.g., `H2910NL-BLK`)
-- Plain SKU: `SKU` (e.g., `H2910NL`)
-- If plain SKU, Mark will be prompted to confirm colour via UI
+**Genero field spec (from Bisley NW):**
 
----
+POST payload: `account` (required), `order_id?`, `order_ref?`, `name?`, `sku` (required), `quantity` (required)  
+Returns: `status`, `bisley_order`, `Est_delivery` — these update over time and should be polled regularly.
 
-### Inventory Management
+### Supplier Orders
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/orders` | List orders with filters |
+| `POST` | `/api/orders` | Create manual order |
+| `POST` | `/api/orders/from-nw` | Auto-create draft order from NW stocking programme |
+| `GET` | `/api/orders/:id` | Order + line items |
+| `PATCH` | `/api/orders/:id` | Update (status, notes, expected_delivery) |
+| `DELETE` | `/api/orders/:id` | Delete draft order |
 
-#### `POST /api/scanning/inventory/receive`
-Log stock received from supplier
+### SKU Mappings
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/sku-mappings` | List all mappings with filters + search |
+| `GET` | `/api/sku-mappings/unmapped` | Unmapped items only |
+| `GET` | `/api/sku-mappings/conflicts` | Conflict detection |
+| `PATCH` | `/api/sku-mappings/:id` | Update (medusa_sku, status, notes) |
+| `POST` | `/api/sku-mappings/:id/validate` | Mark as VALIDATED |
+| `POST` | `/api/sku-mappings/auto-match` | Run fuzzy matching against wms_products |
+| `POST` | `/api/sku-mappings/import` | Bulk import NW stocking items |
 
-```bash
-curl -X POST http://localhost:3001/api/scanning/inventory/receive \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "locationCode": "A1",
-    "productSku": "H2910NL",
-    "colourCode": "BLK",
-    "quantity": 10,
-    "notes": "Delivery from supplier, box damaged but contents OK"
-  }'
-```
+### Check-in (Receiving)
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/checkin/sessions` | Start a check-in session |
+| `GET` | `/api/checkin/sessions` | List sessions |
+| `POST` | `/api/checkin/sessions/:id/scan` | Scan item into session |
+| `POST` | `/api/checkin/sessions/:id/compare` | Auto-compare vs order |
+| `POST` | `/api/checkin/sessions/:id/complete` | Complete session |
 
-**Response:**
-```json
-{
-  "success": true,
-  "inventory": {
-    "id": "uuid",
-    "location_id": "uuid",
-    "product_sku": "H2910NL",
-    "colour_code": "BLK",
-    "quantity": 10,
-    "quantity_available": 10
-  },
-  "message": "Received 10 units of H2910NL at A1"
-}
-```
+### Bay Assignment (Receiving Queue)
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/receiving/queue` | Items awaiting bay assignment |
+| `PATCH` | `/api/receiving/queue/:id/assign` | Assign item to a bay |
+| `POST` | `/api/receiving/queue/:id/stock` | Mark as stocked (move to warehouse_inventory) |
 
-#### `GET /api/scanning/inventory/location/:locationCode`
-View all stock at a specific bin
+### Inventory Sync (WMS → Medusa)
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/inventory/pre-sync` | Compare WMS qty vs Medusa (Medusa is source of truth) |
+| `POST` | `/api/inventory/sync` | Push WMS quantities to Medusa |
+| `GET` | `/api/inventory/pre-sync?refresh=true` | Bust 10-min Medusa inventory cache |
 
-```bash
-curl -X GET http://localhost:3001/api/scanning/inventory/location/A1 \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN"
-```
+### Settings
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/settings/field-mappings` | All field mappings (Medusa→WMS and WMS→Genero) grouped by direction |
+| `POST` | `/api/settings/field-mappings` | Create mapping |
+| `PUT` | `/api/settings/field-mappings/:id` | Update mapping |
+| `DELETE` | `/api/settings/field-mappings/:id` | Delete mapping |
 
-#### `GET /api/scanning/inventory/search/:productSku`
-Find all locations where a SKU is stored
-
-```bash
-curl -X GET http://localhost:3001/api/scanning/inventory/search/H2910NL \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN"
-```
-
----
+### Scanning
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/scanning/scan` | Parse barcode (supercode or plain SKU) |
+| `POST` | `/api/scanning/inventory/receive` | Log received stock |
+| `GET` | `/api/scanning/inventory/location/:code` | View bin contents |
+| `GET` | `/api/scanning/inventory/search/:sku` | Find SKU across all locations |
 
 ### Pick Lists
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/pick-lists` | List active pick lists |
+| `GET` | `/api/pick-lists/:id` | Detail with items |
+| `POST` | `/api/pick-lists` | Create pick list |
+| `PATCH` | `/api/pick-lists/:id/items/:itemId/pick` | Mark item as picked |
+| `PATCH` | `/api/pick-lists/:id/complete` | Complete pick list |
 
-#### `GET /api/pick-lists`
-List all active pick lists
+---
+
+## Database Schema (22 tables)
+
+### Product Sync
+- `wms_products` — local Medusa cache (product + variant + kit data, refreshed via `/sync`)
+- `barcode_mappings` — supercode / SKU+colour lookups for scanning
+
+### NW Stocking Programme
+- `sku_mappings` — maps NW product codes → Medusa SKUs → Genero codes
+- `nw_stocking_items` — line items from the NW stocking spreadsheet
+
+### Supplier Orders & Genero
+- `supplier_orders` — purchase orders sent to New Wave
+- `order_line_items` — individual SKU quantities per order
+- `genero_order_lines` — per-line Genero API responses (`bisley_order`, `status`, `Est_delivery`)
+- `genero_dispatch_notes` — incoming dispatch notifications
+- `inventory_thresholds` — reorder trigger levels
+
+### Warehouse Operations
+- `warehouse_locations` — bays and bins
+- `warehouse_inventory` — physical stock by location
+- `warehouse_movements` — audit trail (receive, pick, adjust)
+- `warehouse_users` — staff accounts
+
+### Check-in & Receiving
+- `checkin_sessions` — receiving sessions
+- `checkin_items` — scanned items per session
+- `checkin_discrepancies` — auto-flagged mismatches vs order
+- `requires_location_queue` — items checked in, awaiting bay assignment
+
+### Pick & Fulfill
+- `pick_lists` — customer order fulfillment jobs
+- `pick_list_items` — individual line items
+
+### Configuration
+- `field_mappings` — Medusa→WMS and WMS→Genero field mapping config
+
+### Audit
+- `audit_log` — security / compliance log
+
+---
+
+## Workflow
+
+```
+NW Stocking Programme → SKU Mapping → Create Supplier Order
+        ↓
+Submit to Genero API (POST /api/genero/submit/:orderId)
+        ↓
+Poll for updates (POST /api/genero/poll) — status + Est_delivery
+        ↓
+Check-in (scan items vs order) → Discrepancy flags
+        ↓
+Bay Assignment (requires_location_queue → warehouse_inventory)
+        ↓
+Pre-Sync Comparison (WMS vs Medusa)
+        ↓
+Sync to Medusa (POST /api/inventory/sync)
+```
+
+---
+
+## Genero Integration
+
+The Genero integration is in **simulation mode** by default (no real API calls).  
+To go live, set two Railway env vars:
+
+```
+GENERO_API_URL=https://<bisley-nw-endpoint>/api/orders
+GENERO_ACCOUNT_NO=NW123
+```
+
+No code changes required. On next deploy, all Genero submit/poll calls will hit the live API.
+
+---
+
+## Scripts
 
 ```bash
-curl -X GET "http://localhost:3001/api/pick-lists?status=PENDING,IN_PROGRESS" \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+npm run dev          # development server (tsx watch)
+npm run start        # production start (tsx src/server.ts)
+npm run db:migrate   # run schema migrations (safe to re-run)
+npm run db:seed      # seed test data
 ```
-
-#### `GET /api/pick-lists/:pickListId`
-Get detailed view of a pick list with all items
-
-#### `POST /api/pick-lists`
-Create a new pick list from a Medusa order
-
-```bash
-curl -X POST http://localhost:3001/api/pick-lists \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "medusaOrderId": "order_abc123",
-    "notes": "Customer order from web"
-  }'
-```
-
-#### `POST /api/pick-lists/:pickListId/items`
-Add a line item to a pick list
-
-```bash
-curl -X POST http://localhost:3001/api/pick-lists/uuid/items \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "lineNumber": 1,
-    "productSku": "H2910NL",
-    "colourCode": "BLK",
-    "quantityRequired": 5
-  }'
-```
-
-#### `PATCH /api/pick-lists/:pickListId/items/:itemId/pick`
-Mark an item as picked (scan barcode to confirm)
-
-```bash
-curl -X PATCH http://localhost:3001/api/pick-lists/uuid/items/uuid/pick \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "quantityPicked": 5,
-    "pickedFromLocationCode": "A1",
-    "notes": "All units picked successfully"
-  }'
-```
-
-#### `PATCH /api/pick-lists/:pickListId/complete`
-Mark a pick list as fully completed
-
-```bash
-curl -X PATCH http://localhost:3001/api/pick-lists/uuid/complete \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"notes": "Ready for packing"}'
-```
-
----
-
-## 🔐 Authentication
-
-All endpoints require a **JWT Bearer token** in the Authorization header.
-
-```
-Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
-```
-
-**Token should include:**
-```json
-{
-  "id": "user_123",
-  "email": "mark@bisley.com",
-  "role": "PICKER"
-}
-```
-
-**Getting a token:**
-- Mark logs into Medusa Admin
-- Medusa issues a JWT
-- Mark uses that JWT for WMS API calls
-
-(Integration with Medusa auth is a future enhancement)
-
----
-
-## 📊 Database Schema
-
-### warehouse_locations
-Bays and bins in the warehouse
-
-| Column | Type | Description |
-|--------|------|-------------|
-| id | UUID | Primary key |
-| bay_code | VARCHAR | Bay identifier (e.g., "A") |
-| bin_code | VARCHAR | Bin identifier (e.g., "1") |
-| location_code | VARCHAR | Full location (e.g., "A1") UNIQUE |
-| description | TEXT | Bin purpose/notes |
-| max_weight_kg | DECIMAL | Weight capacity |
-| is_active | BOOLEAN | Active status |
-
-### warehouse_inventory
-Current stock at each location
-
-| Column | Type | Description |
-|--------|------|-------------|
-| id | UUID | Primary key |
-| location_id | UUID | References warehouse_locations |
-| product_sku | VARCHAR | Product code |
-| colour_code | VARCHAR | Colour variant |
-| quantity | INT | Total units in bin |
-| quantity_reserved | INT | Units reserved for pick lists |
-| quantity_available | INT | GENERATED: quantity - reserved |
-
-### barcode_mappings
-Supercode → product lookups
-
-| Column | Type | Description |
-|--------|------|-------------|
-| id | UUID | Primary key |
-| barcode | VARCHAR | Supercode (SKU-COLOUR) UNIQUE |
-| product_sku | VARCHAR | SKU |
-| colour_code | VARCHAR | Colour code |
-| colour_name | VARCHAR | Full colour name |
-| product_name | VARCHAR | Product title |
-| medusa_product_id | VARCHAR | Medusa ID (for sync) |
-| medusa_variant_id | VARCHAR | Medusa variant ID (for sync) |
-
-### pick_lists
-Order-level picking instructions
-
-| Column | Type | Description |
-|--------|------|-------------|
-| id | UUID | Primary key |
-| medusa_order_id | VARCHAR | Customer order ID UNIQUE |
-| pick_list_number | VARCHAR | Internal pick list # (e.g., "PL-20260818-0001") |
-| status | VARCHAR | PENDING → IN_PROGRESS → PICKED → PACKED → SHIPPED |
-| created_at | TIMESTAMP | When created |
-| completed_at | TIMESTAMP | When picking finished |
-
-### pick_list_items
-Individual line items in a pick list
-
-| Column | Type | Description |
-|--------|------|-------------|
-| id | UUID | Primary key |
-| pick_list_id | UUID | References pick_lists |
-| line_number | INT | Sequential line (1, 2, 3...) |
-| product_sku | VARCHAR | Product code |
-| colour_code | VARCHAR | Colour variant |
-| quantity_required | INT | How many to pick |
-| quantity_picked | INT | How many picked |
-| picked_from_location_id | UUID | Bin where picked from |
-| status | VARCHAR | PENDING → PICKING → PICKED → SHORT |
-
-### warehouse_movements
-Complete audit trail of all activity
-
-| Column | Type | Description |
-|--------|------|-------------|
-| id | UUID | Primary key |
-| movement_type | VARCHAR | RECEIVE, PICK, RETURN, ADJUST, RECOUNT |
-| location_id | UUID | Bin involved |
-| product_sku | VARCHAR | Product code |
-| quantity | INT | Units moved |
-| performed_by | UUID | User who did it |
-| notes | TEXT | Reason/notes |
-| movement_date | TIMESTAMP | When it happened |
-
-### warehouse_users, supplier_orders, audit_log
-(See full schema in `src/db/schema.ts`)
-
----
-
-## 🎬 Workflow: Mark Receives Stock
-
-1. **Mark receives box of stock** (e.g., 10x H2910NL-BLK from supplier)
-2. **Opens warehouse app** on his tablet/computer
-3. **Scans box barcode** via USB scanner
-   - API validates supercode: `H2910NL-BLK` ✓
-4. **Assigns to location** (e.g., "A1")
-5. **Confirms quantity** (10 units)
-6. **App updates inventory:**
-   - warehouse_inventory: A1 now has 10x H2910NL-BLK
-   - warehouse_movements: logs RECEIVE event
-   - audit_log: records who, when, what
-7. ✅ Stock now available for picking
-
----
-
-## 🎬 Workflow: Mark Picks an Order
-
-1. **Pick list created** (from Medusa order)
-   - medusa_order_id: order_abc123
-   - Pick list number: PL-20260818-0001
-   - Items: [1x H2910NL-BLK, 2x H2910NL-RED]
-2. **Mark opens "Active Pick Lists"** dashboard
-3. **Taps "Start Picking"** on PL-20260818-0001
-4. **For each item:**
-   - App says: "Pick 1x H2910NL-BLK from location A1"
-   - Mark walks to A1, scans the product
-   - Mark confirms: "1 unit picked"
-   - App updates: quantity_picked = 1, status = PICKED
-   - Inventory: quantity_reserved increases
-5. **All items picked?** Mark taps "Complete Pick List"
-6. ✅ Order ready for packing
-
----
-
-## 🔗 Future: Medusa Integration
-
-When ready, the WMS will:
-
-1. **Listen to Medusa webhooks** → Order created
-2. **Auto-create pick lists** from new orders
-3. **Sync inventory levels** back to Medusa in real-time
-4. **Prevent overselling** if warehouse stock drops
-
-(Implementation: see docs/WMS-SPECIFICATION.md)
-
----
-
-## 🔗 Future: Genero Integration
-
-When ready, the WMS will:
-
-1. **Monitor inventory thresholds**
-2. **Push replenishment requests** to intermediary table
-3. **Track supplier order status** from Genero
-4. **Update forecast** when stock arrives
-
-(Implementation: see docs/GENERO-INTERMEDIARY-TABLE.md)
-
----
-
-## 🧪 Testing
-
-### Manual Test: Barcode Scan
-
-```bash
-# 1. Get a JWT token (from Medusa Admin)
-TOKEN="your_jwt_token"
-
-# 2. Test valid supercode
-curl -X POST http://localhost:3001/api/scanning/scan \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"barcode": "H2910NL-BLK"}'
-
-# Expected: { "isValid": true, "productSku": "H2910NL", "colourCode": "BLK", ... }
-
-# 3. Test invalid barcode
-curl -X POST http://localhost:3001/api/scanning/scan \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"barcode": "INVALID"}'
-
-# Expected: { "isValid": false, "error": "Invalid barcode format..." }
-```
-
-### Manual Test: Receive Stock
-
-```bash
-TOKEN="your_jwt_token"
-
-curl -X POST http://localhost:3001/api/scanning/inventory/receive \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "locationCode": "A1",
-    "productSku": "H2910NL",
-    "colourCode": "BLK",
-    "quantity": 5
-  }'
-
-# Expected: { "success": true, "inventory": { ... } }
-```
-
----
-
-## 🛠️ Deployment to Railway
-
-### 1. Connect GitHub
-```bash
-git push origin main
-```
-
-### 2. Railway Dashboard
-- New Project → GitHub → Select repo
-- Railway auto-detects Node.js
-- Create PostgreSQL add-on
-- Set environment variables in Railway dashboard
-
-### 3. Deploy
-```bash
-git push  # Railway auto-deploys
-```
-
-Your WMS will be live at: `https://warehouse-wms.railway.app`
-
----
-
-## 📝 Environment Variables
-
-| Variable | Example | Notes |
-|----------|---------|-------|
-| DATABASE_URL | postgresql://... | Required |
-| PORT | 3001 | Default |
-| NODE_ENV | production | dev/production |
-| JWT_SECRET | your_secret_key | Change in production |
-| MEDUSA_API_BASE_URL | https://... | For future sync |
-| MEDUSA_API_KEY | your_key | For future sync |
-| GENERO_API_BASE_URL | https://... | For future sync |
-| GENERO_API_KEY | your_key | For future sync |
-
----
-
-## 📚 Further Reading
-
-- [WMS Specification](../../docs/WMS-SPECIFICATION.md) — Full technical blueprint
-- [Genero Integration](../../docs/GENERO-INTERMEDIARY-TABLE.md) — Supplier order sync
-- [Barcode Module](./src/modules/scanning/barcode.ts) — Supercode parser
-- [Pick List API](./src/api/routes/pick-lists.ts) — Picking workflows
-
----
-
-## 👤 Author
-
-Built for Mark @ Bisley Shop Warehouse  
-Questions? Check the docs or open an issue.
