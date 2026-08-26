@@ -61,8 +61,9 @@ async function fetchAllProductsFromMedusa(forceRefresh = false): Promise<WmsProd
   const token = await getMedusaToken();
   const auth = { Authorization: `Bearer ${token}` };
 
-  // Inventory qty map: SKU → available_qty
+  // Inventory maps: sku→qty and itemId→sku (needed for kit component SKU resolution)
   const inventoryMap = new Map<string, number>();
+  const itemIdToSku = new Map<string, string>();
   let invOff = 0;
   while (true) {
     const d = await fetch(
@@ -72,7 +73,10 @@ async function fetchAllProductsFromMedusa(forceRefresh = false): Promise<WmsProd
     ).then(r => r.json()) as any;
     for (const item of d.inventory_items ?? []) {
       const qty = (item.location_levels ?? []).reduce((s: number, l: any) => s + (l.available_quantity ?? 0), 0);
-      if (item.sku) inventoryMap.set(item.sku, qty);
+      if (item.sku) {
+        inventoryMap.set(item.sku, qty);
+        itemIdToSku.set(item.id, item.sku);
+      }
     }
     invOff += 100;
     if (invOff >= (d.count ?? 0)) break;
@@ -94,7 +98,11 @@ async function fetchAllProductsFromMedusa(forceRefresh = false): Promise<WmsProd
       const variants: WmsVariant[] = (p.variants ?? []).map((v: any) => {
         const links: any[] = v.inventory_items ?? [];
         const kit_components = links
-          .map((l: any) => ({ sku: l.inventory_item?.sku ?? null, required_quantity: l.required_quantity ?? 1 }))
+          .map((l: any) => ({
+            // Medusa v2 doesn't deep-expand inventory_item.sku in product queries — use itemIdToSku map
+            sku: l.inventory_item?.sku ?? itemIdToSku.get(l.inventory_item_id) ?? null,
+            required_quantity: l.required_quantity ?? 1,
+          }))
           .filter(c => c.sku);
         const is_kit = links.length > 1;
         const inventory_qty = is_kit && kit_components.length > 0
