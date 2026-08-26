@@ -116,17 +116,11 @@ CREATE TABLE IF NOT EXISTS warehouse_inventory (
   -- Functional unique index handles NULL colour_code (PostgreSQL NULLs are not equal in plain UNIQUE)
   CONSTRAINT unique_location_sku_colour UNIQUE(location_id, product_sku, colour_code)
 );
--- Replace plain UNIQUE with a functional index so NULL colour_code upserts work correctly
--- (two NULLs are treated as distinct in btree; COALESCE makes them equal)
-DO $$ BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes WHERE tablename='warehouse_inventory' AND indexname='idx_inventory_sku_loc_coalesce'
-  ) THEN
-    ALTER TABLE warehouse_inventory DROP CONSTRAINT IF EXISTS unique_location_sku_colour;
-    CREATE UNIQUE INDEX idx_inventory_sku_loc_coalesce
-      ON warehouse_inventory(location_id, product_sku, COALESCE(colour_code, ''));
-  END IF;
-END $$;
+-- Fix NULL colour_code uniqueness: replace plain UNIQUE with functional COALESCE index
+-- Note: runs as separate ALTER + CREATE to avoid DO $$ block (migration runner splits on ;)
+ALTER TABLE warehouse_inventory DROP CONSTRAINT IF EXISTS unique_location_sku_colour;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_sku_loc_coalesce
+  ON warehouse_inventory(location_id, product_sku, COALESCE(colour_code, ''));
 
 -- ================================================================================
 -- WAREHOUSE MOVEMENTS (Audit trail: receives, picks, adjustments)
