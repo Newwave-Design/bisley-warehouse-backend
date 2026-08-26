@@ -97,11 +97,11 @@ router.post('/receive', authMiddleware, async (req: AuthRequest, res: Response) 
     }
     const locationId = locResult.rows[0].id;
 
-    // Upsert inventory
+    // Upsert inventory — use COALESCE so NULL colour_code upserts work (functional unique index)
     await query(`
       INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity)
       VALUES ($1, $2, $3, $4)
-      ON CONFLICT (location_id, product_sku, colour_code)
+      ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
       DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
     `, [locationId, sku, colour_code ?? null, quantity]);
 

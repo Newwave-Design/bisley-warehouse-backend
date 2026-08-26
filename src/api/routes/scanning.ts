@@ -94,7 +94,7 @@ router.post('/inventory/receive', authMiddleware, async (req: Request, res: Resp
       `INSERT INTO warehouse_inventory 
        (location_id, product_sku, colour_code, quantity)
        VALUES ($1, $2, $3, $4)
-       ON CONFLICT (location_id, product_sku, colour_code) 
+       ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
        DO UPDATE SET quantity = quantity + $4, updated_at = NOW()
        RETURNING *`,
       [locationId, productSku, colourCode || null, quantity]
