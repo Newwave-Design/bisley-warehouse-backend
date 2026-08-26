@@ -202,11 +202,8 @@ CREATE TABLE IF NOT EXISTS supplier_orders (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   order_number VARCHAR(100) NOT NULL UNIQUE,
   status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
-  -- Statuses: PENDING, SUBMITTED_TO_GENERO, ACKNOWLEDGED, IN_PRODUCTION, READY_TO_RECEIVE, RECEIVED, CANCELLED
   colour_palette VARCHAR(20),
-  -- Palette 1 or Palette 2
   triggered_by UUID,
-  -- References warehouse_users.id
   created_at TIMESTAMP DEFAULT NOW(),
   submitted_at TIMESTAMP,
   expected_delivery_date DATE,
@@ -214,6 +211,11 @@ CREATE TABLE IF NOT EXISTS supplier_orders (
   notes TEXT,
   updated_at TIMESTAMP DEFAULT NOW()
 );
+-- Add Phase 2 columns to existing installations
+ALTER TABLE supplier_orders ADD COLUMN IF NOT EXISTS expected_delivery DATE;
+ALTER TABLE supplier_orders ADD COLUMN IF NOT EXISTS genero_dispatch_ref VARCHAR(100);
+ALTER TABLE supplier_orders ADD COLUMN IF NOT EXISTS created_by VARCHAR(100);
+UPDATE supplier_orders SET expected_delivery = expected_delivery_date WHERE expected_delivery IS NULL AND expected_delivery_date IS NOT NULL;
 
 -- ================================================================================
 -- SUPPLIER ORDER ITEMS (SKU quantities in a replenishment request)
