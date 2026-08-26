@@ -179,31 +179,51 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
     const search = ((req.query.search as string) ?? '').toLowerCase();
     const statusFilter = (req.query.status as string) ?? '';
 
+    // GROUP BY product only — MAX() is safe since product-level columns are identical per product
     let sql = `
       SELECT
-        medusa_product_id, product_title, product_handle, product_status, product_thumbnail,
-        COUNT(*)::int                                    AS variant_count,
-        COUNT(*) FILTER (WHERE is_kit)::int              AS kit_variant_count,
+        medusa_product_id,
+        MAX(product_title)                              AS product_title,
+        MAX(product_subtitle)                           AS product_subtitle,
+        MAX(product_handle)                             AS product_handle,
+        MAX(product_status)                             AS product_status,
+        MAX(product_thumbnail)                          AS product_thumbnail,
+        MAX(product_description)                        AS product_description,
+        MAX(product_material)                           AS product_material,
+        MAX(COALESCE(gallery_images::text, '[]'))::jsonb AS gallery_images,
+        MAX(COALESCE(metadata::text, '{}'))::jsonb      AS metadata,
+        MAX(weight_grams)                               AS weight_grams,
+        MAX(height_mm)                                  AS height_mm,
+        MAX(width_mm)                                   AS width_mm,
+        MAX(depth_mm)                                   AS depth_mm,
+        COUNT(*)::int                                   AS variant_count,
+        COUNT(*) FILTER (WHERE is_kit)::int             AS kit_variant_count,
         json_agg(json_build_object(
-          'id',             medusa_variant_id,
-          'sku',            variant_sku,
-          'title',          variant_title,
-          'colour_code',    colour_code,
-          'colour_name',    colour_name,
-          'thumbnail',      variant_thumbnail,
+          'id',              medusa_variant_id,
+          'sku',             variant_sku,
+          'title',           variant_title,
+          'colour_code',     colour_code,
+          'colour_name',     colour_name,
+          'thumbnail',       variant_thumbnail,
           'manage_inventory', manage_inventory,
-          'is_kit',         is_kit,
-          'kit_components', kit_components,
-          'inventory_qty',  inventory_qty
+          'allow_backorder', COALESCE(allow_backorder, false),
+          'price_gbp',       price_gbp,
+          'barcode',         variant_barcode,
+          'weight_grams',    COALESCE(variant_weight_grams, weight_grams),
+          'is_kit',          is_kit,
+          'kit_components',  kit_components,
+          'inventory_qty',   inventory_qty
         ) ORDER BY variant_sku) AS variants,
         MAX(last_synced_at) AS last_synced_at
       FROM wms_products WHERE 1=1`;
     const params: any[] = [];
     let pi = 1;
-    if (search) { sql += ` AND (product_title ILIKE $${pi} OR product_handle ILIKE $${pi})`; params.push(`%${search}%`); pi++; }
+    if (search) {
+      sql += ` AND (product_title ILIKE $${pi} OR product_handle ILIKE $${pi} OR variant_sku ILIKE $${pi})`;
+      params.push(`%${search}%`); pi++;
+    }
     if (statusFilter) { sql += ` AND product_status = $${pi}`; params.push(statusFilter); pi++; }
-    sql += ` GROUP BY medusa_product_id, product_title, product_handle, product_status, product_thumbnail
-             ORDER BY product_title`;
+    sql += ` GROUP BY medusa_product_id ORDER BY MAX(product_title)`;
 
     const [result, statsResult] = await Promise.all([
       query(sql, params),
@@ -217,10 +237,24 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
 
     res.json({
       products: result.rows.map(row => ({
-        id: row.medusa_product_id, title: row.product_title, handle: row.product_handle,
-        status: row.product_status, thumbnail: row.product_thumbnail,
-        variant_count: row.variant_count, kit_variant_count: row.kit_variant_count,
-        variants: row.variants ?? [], last_synced_at: row.last_synced_at,
+        id: row.medusa_product_id,
+        title: row.product_title,
+        subtitle: row.product_subtitle ?? null,
+        handle: row.product_handle,
+        status: row.product_status,
+        thumbnail: row.product_thumbnail,
+        description: row.product_description ?? null,
+        material: row.product_material ?? null,
+        gallery_images: row.gallery_images ?? [],
+        metadata: row.metadata ?? {},
+        weight_grams: row.weight_grams ?? null,
+        height_mm: row.height_mm ?? null,
+        width_mm: row.width_mm ?? null,
+        depth_mm: row.depth_mm ?? null,
+        variant_count: row.variant_count,
+        kit_variant_count: row.kit_variant_count,
+        variants: row.variants ?? [],
+        last_synced_at: row.last_synced_at,
       })),
       total: result.rows.length,
       stats: statsResult.rows[0] ?? null,
