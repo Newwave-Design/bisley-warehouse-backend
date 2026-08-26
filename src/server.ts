@@ -20,6 +20,7 @@ import settingsRoutes from './api/routes/settings.js';
 import dashboardRoutes from './api/routes/dashboard.js';
 import generoRoutes from './api/routes/genero.js';
 import reportsRoutes from './api/routes/reports.js';
+import mobileRoutes from './api/routes/mobile.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -58,6 +59,7 @@ app.use('/api/settings', settingsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/genero', generoRoutes);
 app.use('/api/reports', reportsRoutes);
+app.use('/api/mobile', mobileRoutes);
 
 // 404 handler
 app.use((req, res) => {
