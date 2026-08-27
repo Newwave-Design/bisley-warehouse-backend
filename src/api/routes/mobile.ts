@@ -434,7 +434,7 @@ router.get('/inventory', authMiddleware, async (req: AuthRequest, res: Response)
         ) AS locations
       FROM warehouse_inventory wi
       JOIN warehouse_locations wl ON wl.id = wi.location_id
-      LEFT JOIN wms_products wp ON wp.sku = wi.product_sku
+      LEFT JOIN wms_products wp ON wp.variant_sku = wi.product_sku
       ${whereClause}
       GROUP BY wi.product_sku, wi.colour_code, wp.colour_name, wp.product_title, wp.variant_thumbnail
       ORDER BY COALESCE(wp.product_title, wi.product_sku), wi.colour_code NULLS LAST
