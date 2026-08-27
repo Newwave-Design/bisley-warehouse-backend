@@ -322,4 +322,22 @@ router.post('/sessions/:id/complete', authMiddleware, async (req: AuthRequest, r
   }
 });
 
+/** DELETE /api/checkin/sessions/:id — abandon/cancel an open session */
+router.delete('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const session = await query(`SELECT status FROM checkin_sessions WHERE id = $1`, [req.params.id]);
+    if (!session.rows[0]) return res.status(404).json({ error: 'Session not found' });
+    if (session.rows[0].status === 'COMPLETE') {
+      return res.status(400).json({ error: 'Cannot abandon a completed session' });
+    }
+    await query(
+      `UPDATE checkin_sessions SET status = 'CANCELLED', updated_at = NOW() WHERE id = $1`,
+      [req.params.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to abandon session' });
+  }
+});
+
 export default router;
