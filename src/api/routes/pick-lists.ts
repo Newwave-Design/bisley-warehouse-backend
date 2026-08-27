@@ -291,13 +291,29 @@ router.patch('/:pickListId/complete', authMiddleware, async (req: Request, res: 
       return res.status(404).json({ error: 'Pick list not found' });
     }
 
-    return res.json({
-      pickList: result.rows[0],
-      message: 'Pick list completed',
-    });
+    return res.json({ pickList: result.rows[0], message: 'Pick list completed' });
   } catch (error) {
     console.error('Pick completion error:', error);
     return res.status(500).json({ error: 'Failed to complete pick list' });
+  }
+});
+
+/** DELETE /api/pick-lists/:pickListId — cancel a pending or in-progress pick list */
+router.delete('/:pickListId', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    const existing = await query(`SELECT status FROM pick_lists WHERE id = $1`, [pickListId]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+    if (existing.rows[0].status === 'PICKED') {
+      return res.status(400).json({ error: 'Cannot cancel a completed pick list' });
+    }
+    await query(
+      `UPDATE pick_lists SET status = 'CANCELLED', updated_at = NOW() WHERE id = $1`,
+      [pickListId]
+    );
+    return res.json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to cancel pick list' });
   }
 });
 

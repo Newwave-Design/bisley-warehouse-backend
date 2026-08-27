@@ -234,4 +234,19 @@ router.post('/locations/generate', authMiddleware, async (req: AuthRequest, res:
   }
 });
 
+/** DELETE /api/receiving/queue/:id — remove a pending item from the bay assignment queue */
+router.delete('/queue/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const existing = await query(`SELECT status FROM requires_location_queue WHERE id = $1`, [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Queue item not found' });
+    if (existing.rows[0].status === 'STOCKED') {
+      return res.status(400).json({ error: 'Cannot remove an already stocked item' });
+    }
+    await query(`DELETE FROM requires_location_queue WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to remove queue item' });
+  }
+});
+
 export default router;
