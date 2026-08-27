@@ -82,12 +82,20 @@ router.get('/sessions', authMiddleware, async (req: AuthRequest, res: Response) 
 // Start new session
 router.post('/sessions', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { order_id, notes } = req.body;
+    const { order_id, delivery_id, notes } = req.body;
     const result = await query(
       `INSERT INTO checkin_sessions (order_id, notes, started_by, created_at, updated_at)
        VALUES ($1, $2, $3, NOW(), NOW()) RETURNING *`,
       [order_id || null, notes || null, (req as any).user?.email || 'warehouse']
     );
+
+    // Link the session to a delivery record if provided
+    if (delivery_id) {
+      await query(
+        `UPDATE genero_deliveries SET checkin_session_id=$1, status='ARRIVED', last_updated=NOW() WHERE id=$2`,
+        [result.rows[0].id, delivery_id]
+      );
+    }
 
     // If linked to an order, mark it as being received
     if (order_id) {

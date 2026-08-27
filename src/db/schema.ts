@@ -602,4 +602,49 @@ CREATE INDEX IF NOT EXISTS idx_error_log_source ON wms_error_log(source);
 CREATE INDEX IF NOT EXISTS idx_error_log_severity ON wms_error_log(severity);
 CREATE INDEX IF NOT EXISTS idx_error_log_resolved ON wms_error_log(resolved);
 CREATE INDEX IF NOT EXISTS idx_error_log_created ON wms_error_log(created_at DESC);
+
+-- ================================================================================
+-- WMS NOTIFICATIONS (Site-wide alerts and operational events)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS wms_notifications (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  type VARCHAR(50) NOT NULL,
+  -- DELIVERY_TODAY, DELIVERY_UPCOMING, DELIVERY_DATE_CHANGE, DELIVERY_DISPATCHED,
+  -- INVENTORY_UNASSIGNED, API_ERROR, SYNC_ERROR, ORDER, SYSTEM
+  title VARCHAR(200) NOT NULL,
+  body TEXT,
+  link VARCHAR(300),
+  severity VARCHAR(20) NOT NULL DEFAULT 'info',
+  -- info, warning, error
+  is_read BOOLEAN NOT NULL DEFAULT false,
+  is_dismissed BOOLEAN NOT NULL DEFAULT false,
+  metadata JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_notif_read ON wms_notifications(is_read, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notif_type ON wms_notifications(type);
+
+-- ================================================================================
+-- GENERO DELIVERIES (Incoming dispatch batches detected from Genero poll)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS genero_deliveries (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  bisley_order_ref VARCHAR(50) NOT NULL,
+  est_delivery DATE,
+  status VARCHAR(30) NOT NULL DEFAULT 'UPCOMING',
+  -- UPCOMING, TODAY, IN_TRANSIT, ARRIVED, CHECKED_IN, CANCELLED
+  total_lines INT NOT NULL DEFAULT 0,
+  total_units INT NOT NULL DEFAULT 0,
+  skus JSONB NOT NULL DEFAULT '[]'::jsonb,
+  -- [{sku, quantity, name, genero_status}]
+  prev_est_delivery DATE,
+  -- tracks last known date for change detection
+  notification_created_at TIMESTAMP,
+  checkin_session_id UUID,
+  last_updated TIMESTAMP DEFAULT NOW(),
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(bisley_order_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_deliveries_est ON genero_deliveries(est_delivery);
+CREATE INDEX IF NOT EXISTS idx_deliveries_status ON genero_deliveries(status);
 `;

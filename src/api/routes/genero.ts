@@ -15,6 +15,7 @@ import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { logError, logWarning, logInfo } from '../../lib/logger.js';
+import { createNotification, createNotificationOnce } from '../../lib/notifications.js';
 
 const router = express.Router();
 
@@ -220,6 +221,9 @@ router.post('/poll', authMiddleware, async (req: AuthRequest, res: Response) => 
       }
     }
 
+    // Sync genero_deliveries table — group all lines by bisley_order ref
+    await syncDeliveries();
+
     res.json({ polled, updated, errors: errors.slice(0, 10), simulated: !GENERO_API_URL });
   } catch (err: any) {
     console.error('Genero poll error:', err);
@@ -251,5 +255,113 @@ router.get('/config', authMiddleware, (_req: AuthRequest, res: Response) => {
     simulation_mode: !GENERO_API_URL,
   });
 });
+
+/**
+ * Rebuild genero_deliveries from current genero_order_lines.
+ * Groups lines by bisley_order ref, detects date/status changes, fires notifications.
+ * Called after every poll.
+ */
+async function syncDeliveries(): Promise<void> {
+  try {
+    const allLines = await query(`
+      SELECT bisley_order, sku, quantity, name, genero_status, est_delivery
+      FROM genero_order_lines
+      WHERE bisley_order IS NOT NULL
+    `);
+
+    // Group by bisley_order
+    const groups = new Map<number, { skus: any[]; est_delivery: string | null; statuses: Set<string> }>();
+    for (const row of allLines.rows) {
+      const ref = row.bisley_order;
+      if (!groups.has(ref)) groups.set(ref, { skus: [], est_delivery: row.est_delivery, statuses: new Set() });
+      const g = groups.get(ref)!;
+      g.skus.push({ sku: row.sku, quantity: row.quantity, name: row.name, genero_status: row.genero_status });
+      if (row.genero_status) g.statuses.add(row.genero_status);
+      if (row.est_delivery && !g.est_delivery) g.est_delivery = row.est_delivery;
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+
+    for (const [bislOrderRef, g] of groups) {
+      const totalUnits = g.skus.reduce((s: number, l: any) => s + (l.quantity ?? 0), 0);
+      const estDelivery = g.est_delivery ? new Date(g.est_delivery).toISOString().split('T')[0] : null;
+      const allDispatched = g.statuses.size > 0 && [...g.statuses].every(s => ['Dispatched','Delivered','Received'].includes(s));
+      const derivedStatus = estDelivery === today ? 'TODAY'
+        : allDispatched ? 'IN_TRANSIT'
+        : 'UPCOMING';
+
+      // Upsert delivery record
+      const existing = await query(
+        `SELECT id, est_delivery, status, notification_created_at FROM genero_deliveries WHERE bisley_order_ref = $1`,
+        [String(bislOrderRef)]
+      );
+
+      if (!existing.rows[0]) {
+        // New delivery discovered
+        await query(`
+          INSERT INTO genero_deliveries (bisley_order_ref, est_delivery, status, total_lines, total_units, skus, last_updated)
+          VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        `, [String(bislOrderRef), estDelivery, derivedStatus, g.skus.length, totalUnits, JSON.stringify(g.skus)]);
+
+        if (estDelivery) {
+          const dateLabel = estDelivery === today ? 'today' : `on ${estDelivery}`;
+          await createNotification('DELIVERY_UPCOMING',
+            `New delivery expected ${dateLabel}`,
+            `Bisley order ref ${bislOrderRef}: ${g.skus.length} SKUs, ${totalUnits} units.`,
+            { link: '/deliveries', severity: estDelivery === today ? 'warning' : 'info',
+              metadata: { bisley_order_ref: bislOrderRef, est_delivery: estDelivery, total_units: totalUnits } }
+          );
+        }
+      } else {
+        const prev = existing.rows[0];
+        const prevDate = prev.est_delivery ? new Date(prev.est_delivery).toISOString().split('T')[0] : null;
+
+        // Date changed?
+        if (estDelivery && prevDate && estDelivery !== prevDate) {
+          await createNotification('DELIVERY_DATE_CHANGE',
+            `Delivery date changed: ${prevDate} → ${estDelivery}`,
+            `Bisley order ref ${bislOrderRef}, ${totalUnits} units.`,
+            { link: '/deliveries', severity: 'warning',
+              metadata: { bisley_order_ref: bislOrderRef, prev_date: prevDate, new_date: estDelivery } }
+          );
+        }
+
+        // First time we see it's dispatched?
+        if (allDispatched && prev.status === 'UPCOMING') {
+          await createNotification('DELIVERY_DISPATCHED',
+            `Delivery dispatched: ref ${bislOrderRef}`,
+            `Expected ${estDelivery ?? 'TBC'}. ${totalUnits} units en route.`,
+            { link: '/deliveries', severity: 'info',
+              metadata: { bisley_order_ref: bislOrderRef, est_delivery: estDelivery } }
+          );
+        }
+
+        // Delivery due today but not yet notified today?
+        if (estDelivery === today && !prev.notification_created_at) {
+          await createNotificationOnce('DELIVERY_TODAY',
+            `Delivery expected today (ref ${bislOrderRef})`,
+            `${g.skus.length} SKUs, ${totalUnits} units. Go to Check-in to receive stock.`,
+            { link: '/checkin', severity: 'warning',
+              metadata: { bisley_order_ref: bislOrderRef, total_units: totalUnits } }
+          );
+          await query(`UPDATE genero_deliveries SET notification_created_at=NOW() WHERE bisley_order_ref=$1`, [String(bislOrderRef)]);
+        }
+
+        await query(`
+          UPDATE genero_deliveries SET
+            est_delivery=$2, status=$3, total_lines=$4, total_units=$5, skus=$6,
+            prev_est_delivery=$7, last_updated=NOW()
+          WHERE bisley_order_ref=$1
+        `, [String(bislOrderRef), estDelivery, derivedStatus, g.skus.length, totalUnits,
+            JSON.stringify(g.skus), prevDate]);
+      }
+    }
+  } catch (err) {
+    console.error('[syncDeliveries] error:', err);
+  }
+}
+
+/** Expose syncDeliveries so server.ts can call it on startup */
+export { syncDeliveries };
 
 export default router;

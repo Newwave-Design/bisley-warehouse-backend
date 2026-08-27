@@ -24,6 +24,10 @@ import mobileRoutes from './api/routes/mobile.js';
 import webhooksRoutes from './api/routes/webhooks.js';
 import reorderRulesRoutes, { pendingRouter as pendingReordersRouter, runReorderCheck } from './api/routes/reorder-rules.js';
 import errorLogRoutes from './api/routes/error-log.js';
+import notificationsRoutes from './api/routes/notifications.js';
+import deliveriesRoutes from './api/routes/deliveries.js';
+import { createNotificationOnce } from './lib/notifications.js';
+import { query as dbQueryUtil } from './db/index.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -67,6 +71,8 @@ app.use('/api/webhooks', webhooksRoutes);
 app.use('/api/reorder-rules', reorderRulesRoutes);
 app.use('/api/pending-reorders', pendingReordersRouter);
 app.use('/api/error-log', errorLogRoutes);
+app.use('/api/notifications', notificationsRoutes);
+app.use('/api/deliveries', deliveriesRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -132,6 +138,9 @@ async function start() {
             // Also run reorder check after each Genero poll
             const triggered = await runReorderCheck();
             if (triggered.length > 0) console.log(`[scheduler] Reorder check triggered ${triggered.length} pending reorders: ${triggered.slice(0,5).join(', ')}`);
+
+            // Daily operational checks: unassigned inventory + deliveries today
+            await runDailyChecks();
           }
         } catch (err) { console.warn('[scheduler] Genero poll error:', err); }
       }, TWO_HOURS);
@@ -144,6 +153,34 @@ async function start() {
 }
 
 // Graceful shutdown
+async function runDailyChecks() {
+  try {
+    // Unassigned inventory notification
+    const unassigned = await dbQueryUtil(`SELECT COUNT(*)::int AS c FROM requires_location_queue WHERE status='PENDING'`);
+    const n = unassigned.rows[0].c;
+    if (n > 0) {
+      await createNotificationOnce('INVENTORY_UNASSIGNED',
+        `${n} item${n !== 1 ? 's' : ''} awaiting bay assignment`,
+        'Stock has been received but not yet assigned to a warehouse bay.',
+        { link: '/receiving', severity: 'warning', metadata: { count: n } }
+      );
+    }
+    // Any deliveries expected today not yet arrived?
+    const today = new Date().toISOString().split('T')[0];
+    const dueToday = await dbQueryUtil(
+      `SELECT count(*)::int AS c FROM genero_deliveries WHERE est_delivery=$1 AND status NOT IN ('CHECKED_IN','CANCELLED')`,
+      [today]
+    );
+    if (dueToday.rows[0].c > 0) {
+      await createNotificationOnce('DELIVERY_TODAY',
+        `${dueToday.rows[0].c} delivery expected today`,
+        'Check the Deliveries page to see what to expect and start a check-in when stock arrives.',
+        { link: '/deliveries', severity: 'warning' }
+      );
+    }
+  } catch (err) { console.warn('[daily-checks] error:', err); }
+}
+
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, shutting down gracefully...');
   await closePool();
