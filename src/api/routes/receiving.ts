@@ -111,15 +111,19 @@ router.get('/locations', authMiddleware, async (req: AuthRequest, res: Response)
 
 router.post('/locations', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { bay_code, bin_code, description } = req.body;
+    const { aisle_code, bay_code, bin_code, description } = req.body;
     if (!bay_code || !bin_code) return res.status(400).json({ error: 'bay_code and bin_code required' });
 
-    const location_code = `${bay_code}-${bin_code}`.toUpperCase();
+    const aisle = aisle_code ? String(aisle_code).toUpperCase() : null;
+    const row   = String(bay_code).toUpperCase();
+    const bay   = String(bin_code).toUpperCase();
+    const location_code = aisle ? `${aisle}-${row}-${bay}` : `${row}-${bay}`;
+
     const result = await query(
-      `INSERT INTO warehouse_locations (bay_code, bin_code, location_code, description, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, NOW(), NOW())
+      `INSERT INTO warehouse_locations (aisle_code, bay_code, bin_code, location_code, description, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
        ON CONFLICT (location_code) DO NOTHING RETURNING *`,
-      [bay_code.toUpperCase(), bin_code.toUpperCase(), location_code, description || null]
+      [aisle, row, bay, location_code, description || (aisle ? `Aisle ${aisle}, Row ${row}, Bay ${bay}` : `Row ${row}, Bay ${bay}`)]
     );
     if (!result.rows[0]) return res.status(409).json({ error: 'Location already exists' });
     res.status(201).json(result.rows[0]);
@@ -210,25 +214,30 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
 // Bulk-generate bay locations (e.g. rows A-C, bins 1-10 = 30 bays)
 router.post('/locations/generate', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { rows = ['A', 'B', 'C'], bins_per_row = 10 } = req.body;
+    const { aisles = ['A'], rows_per_aisle = 5, bays_per_row = 10 } = req.body;
     let created = 0, skipped = 0;
 
-    for (const row of rows) {
-      for (let bin = 1; bin <= bins_per_row; bin++) {
-        const bay_code = String(row).toUpperCase();
-        const bin_code = String(bin).padStart(2, '0');
-        const location_code = `${bay_code}-${bin_code}`;
-        const result = await query(
-          `INSERT INTO warehouse_locations (bay_code, bin_code, location_code, description, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, NOW(), NOW()) ON CONFLICT (location_code) DO NOTHING`,
-          [bay_code, bin_code, location_code, `Row ${bay_code}, Bin ${bin_code}`]
-        );
-        if (result.rowCount && result.rowCount > 0) created++;
-        else skipped++;
+    for (const aisle of aisles) {
+      const aisle_code = String(aisle).toUpperCase();
+      for (let row = 1; row <= rows_per_aisle; row++) {
+        const bay_code = String(row);
+        for (let bay = 1; bay <= bays_per_row; bay++) {
+          const bin_code = String(bay).padStart(2, '0');
+          const location_code = `${aisle_code}-${bay_code}-${bin_code}`;
+          const result = await query(
+            `INSERT INTO warehouse_locations (aisle_code, bay_code, bin_code, location_code, description, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+             ON CONFLICT (location_code) DO NOTHING`,
+            [aisle_code, bay_code, bin_code, location_code, `Aisle ${aisle_code}, Row ${bay_code}, Bay ${bin_code}`]
+          );
+          if (result.rowCount && result.rowCount > 0) created++;
+          else skipped++;
+        }
       }
     }
 
-    res.json({ success: true, created, skipped, total: rows.length * bins_per_row });
+    const total = aisles.length * rows_per_aisle * bays_per_row;
+    res.json({ success: true, created, skipped, total });
   } catch (err) {
     res.status(500).json({ error: 'Failed to generate bays' });
   }

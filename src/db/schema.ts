@@ -5,13 +5,14 @@
 
 export const WAREHOUSE_SCHEMA = `
 -- ================================================================================
--- WAREHOUSE LOCATIONS (Bays and Bins)
+-- WAREHOUSE LOCATIONS (Aisles, Rows and Bays)
 -- ================================================================================
 CREATE TABLE IF NOT EXISTS warehouse_locations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  aisle_code VARCHAR(10),
   bay_code VARCHAR(10) NOT NULL,
   bin_code VARCHAR(10) NOT NULL,
-  location_code VARCHAR(20) NOT NULL UNIQUE,
+  location_code VARCHAR(30) NOT NULL UNIQUE,
   description TEXT,
   max_weight_kg DECIMAL(8,2),
   is_active BOOLEAN DEFAULT true,
@@ -19,6 +20,10 @@ CREATE TABLE IF NOT EXISTS warehouse_locations (
   updated_at TIMESTAMP DEFAULT NOW(),
   CONSTRAINT unique_bay_bin UNIQUE(bay_code, bin_code)
 );
+-- Add aisle_code to existing deployments
+ALTER TABLE warehouse_locations ADD COLUMN IF NOT EXISTS aisle_code VARCHAR(10);
+-- Widen location_code to fit three-level codes (e.g. A-10-20)
+ALTER TABLE warehouse_locations ALTER COLUMN location_code TYPE VARCHAR(30);
 
 -- ================================================================================
 -- BARCODE MAPPINGS (Supercode / SKU+Colour lookups)
