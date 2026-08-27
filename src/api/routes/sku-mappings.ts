@@ -235,6 +235,24 @@ router.get('/conflicts', authMiddleware, async (req: AuthRequest, res: Response)
   }
 });
 
+/** GET /api/sku-mappings/stats — counts by status */
+router.get('/stats', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(`
+      SELECT
+        COUNT(*)::int                                          AS total,
+        COUNT(*) FILTER (WHERE status = 'VALIDATED')::int     AS validated,
+        COUNT(*) FILTER (WHERE status = 'ASSUMED')::int       AS assumed,
+        COUNT(*) FILTER (WHERE status = 'UNMAPPED')::int      AS unmapped,
+        COUNT(*) FILTER (WHERE status = 'REJECTED')::int      AS rejected
+      FROM sku_mappings
+    `);
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
 /**
  * GET /api/sku-mappings/:id
  * Get single mapping detail with linked items
@@ -536,24 +554,6 @@ router.post('/validate-assumed', authMiddleware, async (req: AuthRequest, res: R
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to validate assumed mappings' });
-  }
-});
-
-/** GET /api/sku-mappings/stats — counts by status */
-router.get('/stats', authMiddleware, async (_req: AuthRequest, res: Response) => {
-  try {
-    const result = await query(`
-      SELECT
-        COUNT(*)::int                                          AS total,
-        COUNT(*) FILTER (WHERE status = 'VALIDATED')::int     AS validated,
-        COUNT(*) FILTER (WHERE status = 'ASSUMED')::int       AS assumed,
-        COUNT(*) FILTER (WHERE status = 'UNMAPPED')::int      AS unmapped,
-        COUNT(*) FILTER (WHERE status = 'REJECTED')::int      AS rejected
-      FROM sku_mappings
-    `);
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch stats' });
   }
 });
 
