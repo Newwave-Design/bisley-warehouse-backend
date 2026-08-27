@@ -375,4 +375,77 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
   }
 });
 
+/** POST /api/mobile/pick-lists/:id/items/:itemId/pick — confirm item picked */
+router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { id, itemId } = req.params;
+    const { quantityPicked, pickedFromLocationCode } = req.body;
+
+    let locationId = null;
+    if (pickedFromLocationCode) {
+      const loc = await query('SELECT id FROM warehouse_locations WHERE location_code=$1', [pickedFromLocationCode]);
+      if (loc.rows[0]) locationId = loc.rows[0].id;
+    }
+
+    const result = await query(`
+      UPDATE pick_list_items SET status='PICKED', quantity_picked=$1, picked_from_location_id=$2, updated_at=NOW()
+      WHERE id=$3 AND pick_list_id=$4 RETURNING *
+    `, [quantityPicked, locationId, itemId, id]);
+
+    if (!result.rows[0]) return res.status(404).json({ error: 'Item not found' });
+    res.json({ item: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to mark item picked' });
+  }
+});
+
+/**
+ * GET /api/mobile/inventory — searchable SKU + bay location list
+ * ?q= search by SKU or product name (case-insensitive, partial match)
+ * Returns items grouped by SKU+colour with all bay locations aggregated
+ */
+router.get('/inventory', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const search = ((req.query.q as string) ?? '').trim();
+    const params: any[] = [];
+    let whereClause = 'WHERE wi.quantity > 0';
+
+    if (search) {
+      params.push(`%${search}%`);
+      whereClause += ` AND (wi.product_sku ILIKE $1 OR wp.product_title ILIKE $1 OR wp.colour_name ILIKE $1)`;
+    }
+
+    const result = await query(`
+      SELECT
+        wi.product_sku                                                      AS sku,
+        wi.colour_code,
+        COALESCE(wp.colour_name, wi.colour_code)                            AS colour_name,
+        COALESCE(wp.product_title, wi.product_sku)                          AS product_name,
+        wp.variant_thumbnail                                                AS thumbnail,
+        SUM(wi.quantity)::int                                               AS total_qty,
+        SUM(wi.quantity_available)::int                                     AS available_qty,
+        JSON_AGG(
+          JSON_BUILD_OBJECT(
+            'location', wl.location_code,
+            'bay', wl.bay_code,
+            'qty', wi.quantity,
+            'available', wi.quantity_available
+          ) ORDER BY wi.quantity DESC
+        ) AS locations
+      FROM warehouse_inventory wi
+      JOIN warehouse_locations wl ON wl.id = wi.location_id
+      LEFT JOIN wms_products wp ON wp.sku = wi.product_sku
+      ${whereClause}
+      GROUP BY wi.product_sku, wi.colour_code, wp.colour_name, wp.product_title, wp.variant_thumbnail
+      ORDER BY COALESCE(wp.product_title, wi.product_sku), wi.colour_code NULLS LAST
+      LIMIT 200
+    `, params);
+
+    res.json({ items: result.rows, total: result.rows.length, query: search });
+  } catch (err: any) {
+    console.error('Mobile inventory error:', err);
+    res.status(500).json({ error: 'Failed to load inventory' });
+  }
+});
+
 export default router;
