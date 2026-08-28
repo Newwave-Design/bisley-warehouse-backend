@@ -6,6 +6,7 @@
  * GET    /api/orders/:id          — Order detail with line items
  * PATCH  /api/orders/:id          — Update order (status, notes, expected delivery)
  * DELETE /api/orders/:id          — Delete draft order
+ * PATCH  /api/orders/:orderId/items/:itemId — Update a line item (nw_code, qty, notes, etc.)
  * POST   /api/orders/:id/submit   — Submit order to supplier
  * POST   /api/orders/:id/receive  — Mark as received
  * POST   /api/orders/from-nw      — Auto-create order from NW stocking programme
@@ -220,6 +221,39 @@ router.delete('/:id', authMiddleware, async (req: AuthRequest, res: Response) =>
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete order' });
+  }
+});
+
+// Update a single line item (e.g. correct nw_code, product_name, notes)
+router.patch('/:orderId/items/:itemId', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { nw_code, medusa_sku, product_name, family, colour, quantity_ordered, unit_cost, notes } = req.body;
+    const fields: string[] = [];
+    const params: any[] = [];
+    let i = 1;
+
+    if (nw_code !== undefined)        { fields.push(`nw_code=$${i++}`);        params.push(nw_code); }
+    if (medusa_sku !== undefined)     { fields.push(`medusa_sku=$${i++}`);     params.push(medusa_sku); }
+    if (product_name !== undefined)   { fields.push(`product_name=$${i++}`);   params.push(product_name); }
+    if (family !== undefined)         { fields.push(`family=$${i++}`);         params.push(family); }
+    if (colour !== undefined)         { fields.push(`colour=$${i++}`);         params.push(colour); }
+    if (quantity_ordered !== undefined){ fields.push(`quantity_ordered=$${i++}`); params.push(quantity_ordered); }
+    if (unit_cost !== undefined)      { fields.push(`unit_cost=$${i++}`);      params.push(unit_cost); }
+    if (notes !== undefined)          { fields.push(`notes=$${i++}`);          params.push(notes); }
+
+    if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+
+    fields.push(`updated_at=$${i++}`); params.push(new Date());
+    params.push(req.params.itemId, req.params.orderId);
+
+    const result = await query(
+      `UPDATE order_line_items SET ${fields.join(', ')} WHERE id=$${i} AND order_id=$${i + 1} RETURNING *`,
+      params
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Line item not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update line item' });
   }
 });
 
