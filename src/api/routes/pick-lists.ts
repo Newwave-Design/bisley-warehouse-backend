@@ -231,18 +231,6 @@ router.patch('/:pickListId/items/:itemId/pick', authMiddleware, async (req: Requ
       return res.status(404).json({ error: 'Pick item not found' });
     }
 
-    // Update inventory (reserve the quantity)
-    if (locationId && quantityPicked) {
-      await query(
-        `UPDATE warehouse_inventory 
-         SET quantity_reserved = quantity_reserved + $1, updated_at = NOW()
-         WHERE location_id = $2 AND product_sku = (
-           SELECT product_sku FROM pick_list_items WHERE id = $3
-         )`,
-        [quantityPicked, locationId, itemId]
-      );
-    }
-
     return res.json({
       item: result.rows[0],
       message: `Picked ${quantityPicked} units`,

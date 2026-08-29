@@ -76,6 +76,14 @@ async function handleOrderPlaced(order: any) {
         (pick_list_id, line_number, product_sku, colour_code, quantity_required, status, created_at, updated_at)
       VALUES ($1, $2, $3, $4, $5, 'PENDING', NOW(), NOW())
     `, [pickListId, lineNumber++, sku, colourCode, item.quantity]);
+
+    // Reserve the quantity immediately across all locations holding this SKU
+    await query(
+      `UPDATE warehouse_inventory
+       SET quantity_reserved = quantity_reserved + $1, updated_at = NOW()
+       WHERE product_sku = $2`,
+      [item.quantity, sku]
+    );
   }
 
   console.log(`✓ Pick list ${pickListNumber} created for order ${medusaOrderId} (${order.items?.length ?? 0} lines)`);
