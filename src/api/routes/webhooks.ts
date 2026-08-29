@@ -89,7 +89,7 @@ async function handleOrderPlaced(order: any) {
 
   // Push WMS available (quantity - quantity_reserved) to Medusa stocked_quantity
   // so Medusa's stock count drops immediately — no separate Medusa reservation needed
-  const affectedSkus = new Set((order.items ?? []).map((i: any) => i.variant?.sku ?? i.variant_sku ?? i.sku).filter(Boolean));
+  const affectedSkus = new Set<string>((order.items ?? []).map((i: any) => i.variant?.sku ?? i.variant_sku ?? i.sku).filter((s: unknown): s is string => typeof s === 'string'));
   for (const sku of affectedSkus) {
     const row = await query(
       `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
