@@ -17,6 +17,7 @@
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 
 const router = express.Router();
 
@@ -176,7 +177,19 @@ router.post('/queue/:id/stock', authMiddleware, async (req: AuthRequest, res: Re
       [req.params.id]
     );
 
-    res.json({ success: true, stocked: quantity, location_id });
+    // Push updated total for this SKU to Medusa immediately
+    const sku = medusa_sku || nw_code;
+    const totalResult = await query(
+      `SELECT SUM(quantity) as total FROM warehouse_inventory WHERE product_sku = $1`,
+      [sku]
+    );
+    const newTotal = parseInt(totalResult.rows[0]?.total ?? '0');
+    const syncResult = await syncSkuToMedusa(sku, newTotal);
+    if (!syncResult.ok) {
+      console.error(`[receiving/stock] Medusa sync failed for ${sku}: ${syncResult.error}`);
+    }
+
+    res.json({ success: true, stocked: quantity, location_id, medusa_synced: syncResult.ok, new_total: newTotal });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to stock item' });
@@ -188,6 +201,7 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
   try {
     const assigned = await query(`SELECT * FROM requires_location_queue WHERE status = 'ASSIGNED'`);
     let stocked = 0;
+    const syncedSkus = new Set<string>();
 
     for (const item of assigned.rows) {
       await query(`
@@ -201,10 +215,21 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
         `UPDATE requires_location_queue SET status='STOCKED', stocked_at=NOW(), updated_at=NOW() WHERE id=$1`,
         [item.id]
       );
+      syncedSkus.add(item.medusa_sku || item.nw_code);
       stocked++;
     }
 
-    res.json({ success: true, stocked });
+    // Push updated totals for all affected SKUs to Medusa
+    const syncErrors: string[] = [];
+    for (const sku of syncedSkus) {
+      const totalResult = await query(`SELECT SUM(quantity) as total FROM warehouse_inventory WHERE product_sku = $1`, [sku]);
+      const newTotal = parseInt(totalResult.rows[0]?.total ?? '0');
+      const syncResult = await syncSkuToMedusa(sku, newTotal);
+      if (!syncResult.ok) syncErrors.push(`${sku}: ${syncResult.error}`);
+    }
+    if (syncErrors.length) console.error('[receiving/bulk-stock] Medusa sync errors:', syncErrors);
+
+    res.json({ success: true, stocked, medusa_synced: syncedSkus.size - syncErrors.length, sync_errors: syncErrors.length });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to bulk stock' });
