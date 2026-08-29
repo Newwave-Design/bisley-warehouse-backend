@@ -7,6 +7,7 @@ import express, { Request, Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware } from '../../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
+import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 
 const router = express.Router();
 
@@ -295,6 +296,83 @@ router.patch('/:pickListId/complete', authMiddleware, async (req: Request, res: 
   } catch (error) {
     console.error('Pick completion error:', error);
     return res.status(500).json({ error: 'Failed to complete pick list' });
+  }
+});
+
+/**
+ * PATCH /api/pick-lists/:pickListId/dispatch
+ * Mark pick list as dispatched (items have physically left the warehouse).
+ * Decrements warehouse_inventory.quantity, clears reservations, pushes to Medusa.
+ * This is the only point where physical stock numbers change on outbound.
+ */
+router.patch('/:pickListId/dispatch', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+
+    const pickList = await query(`SELECT * FROM pick_lists WHERE id = $1`, [pickListId]);
+    if (!pickList.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+    if (!['PICKED', 'IN_PROGRESS'].includes(pickList.rows[0].status)) {
+      return res.status(400).json({ error: 'Pick list must be PICKED or IN_PROGRESS to dispatch' });
+    }
+
+    // Get all picked items
+    const items = await query(
+      `SELECT pli.*, wi.location_id as inv_location_id
+       FROM pick_list_items pli
+       LEFT JOIN warehouse_inventory wi
+         ON wi.product_sku = pli.product_sku
+         AND wi.location_id = pli.picked_from_location_id
+       WHERE pli.pick_list_id = $1 AND pli.quantity_picked > 0`,
+      [pickListId]
+    );
+
+    const syncSkus = new Set<string>();
+
+    for (const item of items.rows) {
+      const sku = item.product_sku;
+      const qty = parseInt(item.quantity_picked);
+      const locationId = item.picked_from_location_id;
+      if (!sku || !qty || !locationId) continue;
+
+      // Decrement physical stock and clear the reservation
+      await query(
+        `UPDATE warehouse_inventory
+         SET quantity = GREATEST(quantity - $1, 0),
+             quantity_reserved = GREATEST(quantity_reserved - $1, 0),
+             updated_at = NOW()
+         WHERE product_sku = $2 AND location_id = $3`,
+        [qty, sku, locationId]
+      );
+      syncSkus.add(sku);
+    }
+
+    // Mark pick list as dispatched
+    await query(
+      `UPDATE pick_lists SET status = 'DISPATCHED', dispatched_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [pickListId]
+    );
+
+    // Push new WMS totals to Medusa for all affected SKUs
+    const syncErrors: string[] = [];
+    for (const sku of syncSkus) {
+      const totalResult = await query(
+        `SELECT SUM(quantity) as total FROM warehouse_inventory WHERE product_sku = $1`,
+        [sku]
+      );
+      const newTotal = parseInt(totalResult.rows[0]?.total ?? '0');
+      const result = await syncSkuToMedusa(sku, newTotal);
+      if (!result.ok) syncErrors.push(`${sku}: ${result.error}`);
+    }
+
+    res.json({
+      success: true,
+      dispatched: items.rows.length,
+      skus_synced: syncSkus.size - syncErrors.length,
+      sync_errors: syncErrors.length > 0 ? syncErrors : undefined,
+    });
+  } catch (error) {
+    console.error('Pick list dispatch error:', error);
+    res.status(500).json({ error: 'Failed to dispatch pick list' });
   }
 });
 
