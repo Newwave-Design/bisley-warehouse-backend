@@ -13,6 +13,7 @@
 import express, { Request, Response } from 'express';
 import crypto from 'crypto';
 import { query } from '../../db/index.js';
+import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 
 const router = express.Router();
 
@@ -84,6 +85,18 @@ async function handleOrderPlaced(order: any) {
        WHERE product_sku = $2`,
       [item.quantity, sku]
     );
+  }
+
+  // Push WMS available (quantity - quantity_reserved) to Medusa stocked_quantity
+  // so Medusa's stock count drops immediately — no separate Medusa reservation needed
+  const affectedSkus = new Set((order.items ?? []).map((i: any) => i.variant?.sku ?? i.variant_sku ?? i.sku).filter(Boolean));
+  for (const sku of affectedSkus) {
+    const row = await query(
+      `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
+      [sku]
+    );
+    const available = Math.max(0, parseInt(row.rows[0]?.qty ?? '0') - parseInt(row.rows[0]?.reserved ?? '0'));
+    await syncSkuToMedusa(sku, available);
   }
 
   console.log(`✓ Pick list ${pickListNumber} created for order ${medusaOrderId} (${order.items?.length ?? 0} lines)`);

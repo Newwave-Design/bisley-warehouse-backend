@@ -177,13 +177,13 @@ router.post('/queue/:id/stock', authMiddleware, async (req: AuthRequest, res: Re
       [req.params.id]
     );
 
-    // Push updated total for this SKU to Medusa immediately
+    // Push WMS available (physical - reserved) to Medusa — no Medusa reservation needed
     const sku = medusa_sku || nw_code;
     const totalResult = await query(
-      `SELECT SUM(quantity) as total FROM warehouse_inventory WHERE product_sku = $1`,
+      `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
       [sku]
     );
-    const newTotal = parseInt(totalResult.rows[0]?.total ?? '0');
+    const newTotal = Math.max(0, parseInt(totalResult.rows[0]?.qty ?? '0') - parseInt(totalResult.rows[0]?.reserved ?? '0'));
     const syncResult = await syncSkuToMedusa(sku, newTotal);
     if (!syncResult.ok) {
       console.error(`[receiving/stock] Medusa sync failed for ${sku}: ${syncResult.error}`);
@@ -222,8 +222,8 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
     // Push updated totals for all affected SKUs to Medusa
     const syncErrors: string[] = [];
     for (const sku of syncedSkus) {
-      const totalResult = await query(`SELECT SUM(quantity) as total FROM warehouse_inventory WHERE product_sku = $1`, [sku]);
-      const newTotal = parseInt(totalResult.rows[0]?.total ?? '0');
+      const totalResult = await query(`SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`, [sku]);
+      const newTotal = Math.max(0, parseInt(totalResult.rows[0]?.qty ?? '0') - parseInt(totalResult.rows[0]?.reserved ?? '0'));
       const syncResult = await syncSkuToMedusa(sku, newTotal);
       if (!syncResult.ok) syncErrors.push(`${sku}: ${syncResult.error}`);
     }

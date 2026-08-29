@@ -344,10 +344,10 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: Request, res: 
     const syncErrors: string[] = [];
     for (const sku of syncSkus) {
       const totalResult = await query(
-        `SELECT SUM(quantity) as total FROM warehouse_inventory WHERE product_sku = $1`,
+        `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
         [sku]
       );
-      const newTotal = parseInt(totalResult.rows[0]?.total ?? '0');
+      const newTotal = Math.max(0, parseInt(totalResult.rows[0]?.qty ?? '0') - parseInt(totalResult.rows[0]?.reserved ?? '0'));
       const result = await syncSkuToMedusa(sku, newTotal);
       if (!result.ok) syncErrors.push(`${sku}: ${result.error}`);
     }
