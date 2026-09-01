@@ -199,41 +199,45 @@ router.post('/:pickListId/items', authMiddleware, async (req: Request, res: Resp
  */
 router.patch('/:pickListId/items/:itemId/pick', authMiddleware, async (req: Request, res: Response) => {
   try {
-    const { itemId } = req.params;
+    const { pickListId, itemId } = req.params;
     const { quantityPicked, pickedFromLocationCode, notes } = req.body;
+
+    // Check if this is a sandbox pick list — skip real inventory updates if so
+    const plCheck = await query(`SELECT is_sandbox FROM pick_lists WHERE id = $1`, [pickListId]);
+    const isSandbox = plCheck.rows[0]?.is_sandbox ?? false;
 
     // Get location ID
     let locationId = null;
     if (pickedFromLocationCode) {
-      const locResult = await query(
-        'SELECT id FROM warehouse_locations WHERE location_code = $1',
-        [pickedFromLocationCode]
-      );
-      if (locResult.rows.length > 0) {
-        locationId = locResult.rows[0].id;
-      }
+      const locResult = await query('SELECT id FROM warehouse_locations WHERE location_code = $1', [pickedFromLocationCode]);
+      if (locResult.rows.length > 0) locationId = locResult.rows[0].id;
     }
 
-    // Update pick list item
+    // Mark item as picked
     const result = await query(
       `UPDATE pick_list_items 
-       SET status = 'PICKED', 
-           quantity_picked = $1, 
-           picked_from_location_id = $2,
-           notes = $3,
-           updated_at = NOW()
-       WHERE id = $4
-       RETURNING *`,
+       SET status = 'PICKED', quantity_picked = $1, picked_from_location_id = $2,
+           notes = $3, updated_at = NOW()
+       WHERE id = $4 RETURNING *`,
       [quantityPicked, locationId, notes || null, itemId]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Pick item not found' });
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Pick item not found' });
+
+    // Reserve inventory — skip for sandbox lists to protect real stock
+    if (!isSandbox && locationId && quantityPicked) {
+      await query(
+        `UPDATE warehouse_inventory 
+         SET quantity_reserved = quantity_reserved + $1, updated_at = NOW()
+         WHERE location_id = $2 AND product_sku = (SELECT product_sku FROM pick_list_items WHERE id = $3)`,
+        [quantityPicked, locationId, itemId]
+      );
     }
 
     return res.json({
       item: result.rows[0],
-      message: `Picked ${quantityPicked} units`,
+      sandbox: isSandbox,
+      message: isSandbox ? `[Sandbox] Marked ${quantityPicked} units picked (no real stock change)` : `Picked ${quantityPicked} units`,
     });
   } catch (error) {
     console.error('Pick confirmation error:', error);
@@ -381,6 +385,30 @@ router.delete('/:pickListId', authMiddleware, async (req: Request, res: Response
   } catch (error) {
     return res.status(500).json({ error: 'Failed to cancel pick list' });
   }
+});
+
+/** GET /api/pick-lists/sandbox — list only sandbox pick lists */
+router.get('/sandbox', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at,
+              COUNT(pli.id)::int AS item_count, SUM(CASE WHEN pli.status='PICKED' THEN 1 ELSE 0 END)::int AS items_picked
+       FROM pick_lists pl LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
+       WHERE pl.is_sandbox = true GROUP BY pl.id ORDER BY pl.created_at DESC`
+    );
+    res.json({ pickLists: result.rows });
+  } catch (e) { res.status(500).json({ error: 'Failed to load sandbox lists' }); }
+});
+
+/** POST /api/pick-lists/sandbox/reset — reset sandbox pick list back to PENDING */
+router.post('/sandbox/reset', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    // Reset all sandbox pick lists to PENDING and items to PENDING
+    await query(`UPDATE pick_lists SET status='PENDING', updated_at=NOW() WHERE is_sandbox=true`);
+    await query(`UPDATE pick_list_items SET status='PENDING', quantity_picked=0, picked_from_location_id=NULL, updated_at=NOW() WHERE is_sandbox=true`);
+    const count = await query(`SELECT COUNT(*) AS c FROM pick_lists WHERE is_sandbox=true`);
+    res.json({ success: true, message: `Reset ${count.rows[0].c} sandbox pick list(s) to PENDING` });
+  } catch (e) { res.status(500).json({ error: 'Failed to reset sandbox' }); }
 });
 
 export default router;
