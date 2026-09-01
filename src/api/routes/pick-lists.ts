@@ -11,6 +11,29 @@ import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 
 const router = express.Router();
 
+/** GET /api/pick-lists/sandbox — list only sandbox pick lists (must be before /:pickListId) */
+router.get('/sandbox', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at,
+              COUNT(pli.id)::int AS item_count, SUM(CASE WHEN pli.status='PICKED' THEN 1 ELSE 0 END)::int AS items_picked
+       FROM pick_lists pl LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
+       WHERE pl.is_sandbox = true GROUP BY pl.id ORDER BY pl.created_at DESC`
+    );
+    res.json({ pickLists: result.rows });
+  } catch (e) { res.status(500).json({ error: 'Failed to load sandbox lists' }); }
+});
+
+/** POST /api/pick-lists/sandbox/reset — reset sandbox pick lists back to PENDING */
+router.post('/sandbox/reset', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    await query(`UPDATE pick_lists SET status='PENDING', updated_at=NOW() WHERE is_sandbox=true`);
+    await query(`UPDATE pick_list_items SET status='PENDING', quantity_picked=0, picked_from_location_id=NULL, updated_at=NOW() WHERE is_sandbox=true`);
+    const count = await query(`SELECT COUNT(*) AS c FROM pick_lists WHERE is_sandbox=true`);
+    res.json({ success: true, message: `Reset ${count.rows[0].c} sandbox pick list(s) to PENDING` });
+  } catch (e) { res.status(500).json({ error: 'Failed to reset sandbox' }); }
+});
+
 /**
  * GET /api/pick-lists
  * List all active pick lists (with status filtering)
@@ -385,30 +408,6 @@ router.delete('/:pickListId', authMiddleware, async (req: Request, res: Response
   } catch (error) {
     return res.status(500).json({ error: 'Failed to cancel pick list' });
   }
-});
-
-/** GET /api/pick-lists/sandbox — list only sandbox pick lists */
-router.get('/sandbox', authMiddleware, async (req: Request, res: Response) => {
-  try {
-    const result = await query(
-      `SELECT pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at,
-              COUNT(pli.id)::int AS item_count, SUM(CASE WHEN pli.status='PICKED' THEN 1 ELSE 0 END)::int AS items_picked
-       FROM pick_lists pl LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
-       WHERE pl.is_sandbox = true GROUP BY pl.id ORDER BY pl.created_at DESC`
-    );
-    res.json({ pickLists: result.rows });
-  } catch (e) { res.status(500).json({ error: 'Failed to load sandbox lists' }); }
-});
-
-/** POST /api/pick-lists/sandbox/reset — reset sandbox pick list back to PENDING */
-router.post('/sandbox/reset', authMiddleware, async (req: Request, res: Response) => {
-  try {
-    // Reset all sandbox pick lists to PENDING and items to PENDING
-    await query(`UPDATE pick_lists SET status='PENDING', updated_at=NOW() WHERE is_sandbox=true`);
-    await query(`UPDATE pick_list_items SET status='PENDING', quantity_picked=0, picked_from_location_id=NULL, updated_at=NOW() WHERE is_sandbox=true`);
-    const count = await query(`SELECT COUNT(*) AS c FROM pick_lists WHERE is_sandbox=true`);
-    res.json({ success: true, message: `Reset ${count.rows[0].c} sandbox pick list(s) to PENDING` });
-  } catch (e) { res.status(500).json({ error: 'Failed to reset sandbox' }); }
 });
 
 export default router;
