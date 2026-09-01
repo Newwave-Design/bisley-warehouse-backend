@@ -101,9 +101,13 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
          pli.*,
          wl.location_code,
          wl.bay_code,
-         wl.bin_code
+         wl.bin_code,
+         wp.product_title,
+         wp.colour_name,
+         wp.variant_thumbnail
        FROM pick_list_items pli
        LEFT JOIN warehouse_locations wl ON wl.id = pli.picked_from_location_id
+       LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
        WHERE pli.pick_list_id = $1
        ORDER BY pli.line_number`,
       [pickListId]
