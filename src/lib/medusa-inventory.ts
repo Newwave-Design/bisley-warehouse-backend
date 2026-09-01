@@ -70,8 +70,37 @@ export async function syncSkuToMedusa(
       return { ok: false, error: err.message ?? `HTTP ${updateRes.status}` };
     }
 
+    // When stock first arrives (qty transitions 0→positive), clear stocked=false on
+    // any variant linked to this inventory item so swatches become visible on the PDP.
+    if (wmsQty > 0) {
+      await activateVariantsForInventoryItem(token, item.id);
+    }
+
     return { ok: true, newQty: wmsQty };
   } catch (err: any) {
     return { ok: false, error: err.message };
+  }
+}
+
+/** Set stocked=true + manage_inventory=true on all variants linked to a given inventory item. */
+async function activateVariantsForInventoryItem(token: string, inventoryItemId: string): Promise<void> {
+  // Find all variant↔inventory-item links
+  const linksRes = await fetch(
+    `${MEDUSA_URL}/admin/inventory-items/${inventoryItemId}?fields=id,variants`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  const linksData = await linksRes.json() as any;
+  const variants: Array<{ id: string; product_id: string; metadata?: Record<string, unknown> }> =
+    linksData.inventory_item?.variants ?? [];
+
+  for (const v of variants) {
+    // Only update if stocked=false (avoids no-op writes on already-active variants)
+    if (v.metadata?.stocked === false) {
+      await fetch(`${MEDUSA_URL}/admin/products/${v.product_id}/variants/${v.id}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ metadata: { ...v.metadata, stocked: true } }),
+      });
+    }
   }
 }
