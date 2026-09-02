@@ -13,6 +13,9 @@ const router = express.Router();
 const MEDUSA_URL = process.env.MEDUSA_API_BASE_URL || 'https://bisley-shop.medusajs.app';
 const MEDUSA_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || 'matt@ovara.co.uk';
 const MEDUSA_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || 'Drautsrab85!';
+// Medusa has 2 stock locations (European Warehouse + an unused legacy "Ovara" location with
+// no sales channel). Every inventory lookup MUST filter to this one or quantities double-count.
+const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY792H831KT3TKH4CYPF7FT9';
 
 let _medusaToken: string | null = null;
 let _medusaTokenExpiry = 0;
@@ -43,13 +46,13 @@ async function fetchMedusaInventory(forceRefresh = false): Promise<Map<string, n
   let offset = 0;
   while (true) {
     const res = await fetch(
-      `${MEDUSA_URL}/admin/inventory-items?limit=100&offset=${offset}&fields=id,sku,location_levels.available_quantity`,
+      `${MEDUSA_URL}/admin/inventory-items?limit=100&offset=${offset}&fields=id,sku,location_levels.available_quantity,location_levels.location_id`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
     const data = await res.json() as any;
     for (const item of data.inventory_items ?? []) {
-      const qty = (item.location_levels ?? []).reduce((s: number, l: any) => s + (l.available_quantity ?? 0), 0);
-      if (item.sku) qtyMap.set(item.sku, qty);
+      const level = item.location_levels?.find((l: any) => l.location_id === LOCATION_ID);
+      if (item.sku) qtyMap.set(item.sku, level?.available_quantity ?? 0);
     }
     offset += 100;
     if (offset >= (data.count ?? 0)) break;
@@ -67,7 +70,7 @@ async function getMedusaItemInfo(sku: string): Promise<{ itemId: string; locatio
   );
   const data = await res.json() as any;
   const item = data.inventory_items?.[0];
-  const level = item?.location_levels?.[0];
+  const level = item?.location_levels?.find((l: any) => l.location_id === LOCATION_ID) ?? item?.location_levels?.[0];
   return level ? { itemId: item.id, locationId: level.location_id } : null;
 }
 

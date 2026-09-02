@@ -14,6 +14,10 @@ import { query } from '../../db/index.js';
 
 const router = express.Router();
 
+// Medusa has 2 stock locations (European Warehouse + an unused legacy "Ovara" location with
+// no sales channel). Every inventory lookup MUST filter to this one or quantities double-count.
+const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY792H831KT3TKH4CYPF7FT9';
+
 // ── Bisley colour code → display name lookup ──────────────────────────────────
 const COLOUR_NAMES: Record<string, string> = {
   av1: 'Black', aa3: 'Anthracite Grey', ba5: 'Traffic White',
@@ -68,11 +72,12 @@ async function fetchAllProductsFromMedusa(forceRefresh = false): Promise<WmsProd
   while (true) {
     const d = await fetch(
       `${MEDUSA_URL}/admin/inventory-items?limit=100&offset=${invOff}` +
-      `&fields=id,sku,location_levels.available_quantity`,
+      `&fields=id,sku,location_levels.available_quantity,location_levels.location_id`,
       { headers: auth }
     ).then(r => r.json()) as any;
     for (const item of d.inventory_items ?? []) {
-      const qty = (item.location_levels ?? []).reduce((s: number, l: any) => s + (l.available_quantity ?? 0), 0);
+      const level = item.location_levels?.find((l: any) => l.location_id === LOCATION_ID);
+      const qty = level?.available_quantity ?? 0;
       if (item.sku) {
         inventoryMap.set(item.sku, qty);
         itemIdToSku.set(item.id, item.sku);
