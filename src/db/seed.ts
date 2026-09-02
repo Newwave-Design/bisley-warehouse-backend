@@ -5,6 +5,7 @@
 
 import * as pg from 'pg';
 import { v4 as uuidv4 } from 'uuid';
+import bcrypt from 'bcryptjs';
 
 const { Client } = pg;
 
@@ -84,10 +85,11 @@ async function seed() {
     ];
 
     const createdUsers = [];
+    const devPasswordHash = await bcrypt.hash('demo123', 10);
     for (const user of users) {
       const result = await client.query(
-        `INSERT INTO warehouse_users (id, medusa_user_id, name, email, role, is_active)
-         VALUES ($1, $2, $3, $4, $5, true)
+        `INSERT INTO warehouse_users (id, medusa_user_id, name, email, role, password_hash, is_active)
+         VALUES ($1, $2, $3, $4, $5, $6, true)
          RETURNING id`,
         [
           uuidv4(),
@@ -95,6 +97,7 @@ async function seed() {
           user.name,
           user.email,
           user.role,
+          devPasswordHash,
         ]
       );
       createdUsers.push(result.rows[0].id);
