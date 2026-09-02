@@ -8,8 +8,24 @@ import express, { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { query } from '../../db/index.js';
+import { WAREHOUSE_SCHEMA } from '../../db/schema.js';
 
 const router = express.Router();
+
+// TEMPORARY diagnostic route — remove after use.
+// Finds exactly which schema statement is failing during startup migrations.
+router.get('/debug-migrate', async (_req: Request, res: Response) => {
+  const statements = WAREHOUSE_SCHEMA.split(';').map((s) => s.trim()).filter((s) => s.length > 0);
+  for (let i = 0; i < statements.length; i++) {
+    try {
+      await query(statements[i]);
+    } catch (err: any) {
+      if (err.code === '42P07') continue;
+      return res.json({ failedAtIndex: i, of: statements.length, statement: statements[i].slice(0, 300), error: err.message, code: err.code });
+    }
+  }
+  res.json({ success: true, ranStatements: statements.length });
+});
 
 router.post('/login', async (req: Request, res: Response) => {
   try {
