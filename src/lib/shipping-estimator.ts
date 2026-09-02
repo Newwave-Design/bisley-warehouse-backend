@@ -289,8 +289,8 @@ export function estimateShippingForServices(input: {
   estimates: ServiceEstimate[];
 } {
   const { dims, services, packagingProfiles, preferredPackagingCode } = input;
-  const paddingMin = Math.max(0, input.packagingPaddingMinMm ?? 15);
-  const paddingMax = Math.max(paddingMin, input.packagingPaddingMaxMm ?? 20);
+  const paddingMin = Math.max(0, input.packagingPaddingMinMm ?? 140);
+  const paddingMax = Math.max(paddingMin, input.packagingPaddingMaxMm ?? 140);
 
   // Conservative rule: use max packaging growth for eligibility and costing.
   const effectiveDims: ProductDims = {

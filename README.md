@@ -59,7 +59,7 @@ Auth accepts any valid JWT or demo token (payload: `{ sub, email, role }`).
 | `GET` | `/api/products/:id` | Single product from memory cache |
 
 `/api/products/:id/shipping-estimates` assumptions:
-- Packed dimensions include protective packaging allowance of +15 to +20 mm on each dimension.
+- Packed dimensions include protective packaging allowance of +140 mm on each dimension (moulded foam inserts + outer box).
 - Eligibility and costing use the conservative +20 mm values.
 - Service requirements are read from `shipping_services.constraints` (weight, size, girth+length, volume, package type).
 

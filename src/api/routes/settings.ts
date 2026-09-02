@@ -514,8 +514,8 @@ async function runUpsAutoTagJob() {
             dims: effectiveDims,
             services,
             packagingProfiles: profiles,
-            packagingPaddingMinMm: 15,
-            packagingPaddingMaxMm: 20,
+            packagingPaddingMinMm: 140,
+            packagingPaddingMaxMm: 140,
           })
         : null;
 
@@ -597,7 +597,7 @@ async function runUpsAutoTagJob() {
           preferredServiceCode,
           needsManual,
           JSON.stringify(needsManual ? ['ups-manual-review'] : ['ups-auto-tagged']),
-          manualReviewReason ?? 'Auto-tagged using a live UPS Rating API quote for packed dimensions (+15 to +20 mm).',
+          manualReviewReason ?? 'Auto-tagged using a live UPS Rating API quote for packed dimensions (+140 mm).',
           preferredCostAmount,
           preferredCostCurrency,
         ]

@@ -640,8 +640,8 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
         services,
         packagingProfiles,
         preferredPackagingCode: profile?.packaging_profile_code ?? null,
-        packagingPaddingMinMm: 15,
-        packagingPaddingMaxMm: 20,
+        packagingPaddingMinMm: 140,
+        packagingPaddingMaxMm: 140,
       });
 
       const upsServices = estimate.estimates.filter(s => s.is_ups);
@@ -720,9 +720,9 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
       assumptions: {
         data_source: dataSource,
         packaging_dimension_allowance_mm: {
-          min: 15,
-          max: 20,
-          used_for_estimation: 20,
+          min: 140,
+          max: 140,
+          used_for_estimation: 140,
         },
         live_rates: {
           source: 'ups_rating_api',
