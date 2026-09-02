@@ -206,6 +206,8 @@ CREATE TABLE IF NOT EXISTS product_fulfillment_profiles (
   is_fragile BOOLEAN DEFAULT false,
   is_multi_box BOOLEAN DEFAULT false,
   pack_instructions TEXT,
+  estimated_shipping_cost_gbp DECIMAL(10,2),
+  estimated_shipping_currency VARCHAR(10),
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );

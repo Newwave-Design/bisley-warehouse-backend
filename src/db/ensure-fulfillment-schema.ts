@@ -58,6 +58,8 @@ const STATEMENTS: string[] = [
     updated_at TIMESTAMP DEFAULT NOW()
   )`,
   `ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS selected_courier_code VARCHAR(50)`,
+  `ALTER TABLE product_fulfillment_profiles ADD COLUMN IF NOT EXISTS estimated_shipping_cost_gbp DECIMAL(10,2)`,
+  `ALTER TABLE product_fulfillment_profiles ADD COLUMN IF NOT EXISTS estimated_shipping_currency VARCHAR(10)`,
   `ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS selected_service_code VARCHAR(80)`,
   `ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS shipping_requirements JSONB NOT NULL DEFAULT '{}'::jsonb`,
   `ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS parcel_count INTEGER NOT NULL DEFAULT 0`,

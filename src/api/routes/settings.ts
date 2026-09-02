@@ -260,7 +260,9 @@ router.get('/product-fulfillment-map', authMiddleware, async (_req: AuthRequest,
       `SELECT DISTINCT wp.variant_sku AS sku,
               pfp.preferred_service_code,
               pfp.requires_manual_review,
-              pfp.packaging_profile_code
+              pfp.packaging_profile_code,
+              pfp.estimated_shipping_cost_gbp,
+              pfp.estimated_shipping_currency
        FROM wms_products wp
        LEFT JOIN product_fulfillment_profiles pfp ON pfp.product_sku = wp.variant_sku
        WHERE wp.variant_sku IS NOT NULL AND wp.variant_sku <> ''`
@@ -272,6 +274,7 @@ router.get('/product-fulfillment-map', authMiddleware, async (_req: AuthRequest,
     res.status(500).json({ error: 'Failed to load product fulfilment map' });
   }
 });
+
 
 router.post('/shipping-services/ups-sync', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
   try {
@@ -527,6 +530,8 @@ async function runUpsAutoTagJob() {
       // this exact packed size/weight — not a static constraint table. Whatever UPS actually
       // accepts (or rejects) is the final word.
       let preferredServiceCode: string | null = null;
+      let preferredCostAmount: number | null = null;
+      let preferredCostCurrency: string | null = null;
       let manualReviewReason: string | null = null;
 
       if (!hasCompleteDimensions) {
@@ -544,6 +549,8 @@ async function runUpsAutoTagJob() {
             return best;
           }, null as (typeof result.quotes)[number] | null);
           preferredServiceCode = cheapest?.internalServiceCode ?? null;
+          preferredCostAmount = cheapest?.totalChargesAmount ?? null;
+          preferredCostCurrency = cheapest?.totalChargesCurrency ?? null;
           if (!preferredServiceCode) {
             manualReviewReason = 'Manual review required - UPS returned quotes but none matched a configured internal service code.';
           }
@@ -567,9 +574,11 @@ async function runUpsAutoTagJob() {
            is_multi_box,
            fulfilment_tags,
            pack_instructions,
+           estimated_shipping_cost_gbp,
+           estimated_shipping_currency,
            updated_at
          )
-         VALUES ($1, $2, $3, $4, $5, false, false, $6::jsonb, $7, NOW())
+         VALUES ($1, $2, $3, $4, $5, false, false, $6::jsonb, $7, $8, $9, NOW())
          ON CONFLICT (product_sku) DO UPDATE SET
            packaging_profile_code = EXCLUDED.packaging_profile_code,
            checklist_template_code = EXCLUDED.checklist_template_code,
@@ -577,6 +586,8 @@ async function runUpsAutoTagJob() {
            requires_manual_review = EXCLUDED.requires_manual_review,
            fulfilment_tags = EXCLUDED.fulfilment_tags,
            pack_instructions = EXCLUDED.pack_instructions,
+           estimated_shipping_cost_gbp = EXCLUDED.estimated_shipping_cost_gbp,
+           estimated_shipping_currency = EXCLUDED.estimated_shipping_currency,
            updated_at = NOW()
          WHERE product_fulfillment_profiles.fulfilment_tags @> '["ups-auto-tagged"]'::jsonb`,
         [
@@ -587,6 +598,8 @@ async function runUpsAutoTagJob() {
           needsManual,
           JSON.stringify(needsManual ? ['ups-manual-review'] : ['ups-auto-tagged']),
           manualReviewReason ?? 'Auto-tagged using a live UPS Rating API quote for packed dimensions (+15 to +20 mm).',
+          preferredCostAmount,
+          preferredCostCurrency,
         ]
       );
 
