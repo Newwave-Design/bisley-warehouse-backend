@@ -513,6 +513,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
           `SELECT service_code, service_name, courier_code, courier_name, service_level, shipment_mode, constraints, metadata
            FROM shipping_services
            WHERE is_active = true
+             AND courier_code = 'ups'
            ORDER BY sort_order ASC, service_name ASC`
         ),
         query(
@@ -520,6 +521,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
                   max_weight_grams, tare_weight_grams, default_cost_gbp
            FROM packaging_profiles
            WHERE is_active = true
+             AND package_type = 'parcel'
            ORDER BY name ASC`
         ),
         skuList.length
@@ -560,8 +562,10 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
     } catch (err) {
       if (!isMissingRelationError(err)) throw err;
       dataSource = 'fallback';
-      services = DEFAULT_SHIPPING_SERVICES.map(withServiceConstraintDefaults);
-      packagingProfiles = DEFAULT_PACKAGING_PROFILES;
+      services = DEFAULT_SHIPPING_SERVICES
+        .filter(s => s.courier_code === 'ups')
+        .map(withServiceConstraintDefaults);
+      packagingProfiles = DEFAULT_PACKAGING_PROFILES.filter(p => p.package_type === 'parcel');
     }
 
     const variants = product.variants.map((variant) => {

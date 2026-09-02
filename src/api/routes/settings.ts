@@ -94,6 +94,7 @@ router.get('/shipping-services', authMiddleware, async (_req: AuthRequest, res: 
               shipment_mode, integration_type, constraints, metadata, is_active, sort_order,
               created_at, updated_at
        FROM shipping_services
+       WHERE courier_code = 'ups'
        ORDER BY sort_order ASC, courier_name ASC, service_name ASC`
     );
     res.json({ shipping_services: result.rows });
@@ -221,6 +222,7 @@ router.get('/packaging-profiles', authMiddleware, async (_req: AuthRequest, res:
       `SELECT code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm,
               max_weight_grams, tare_weight_grams, default_cost_gbp, is_active, notes
        FROM packaging_profiles
+       WHERE package_type = 'parcel'
        ORDER BY name ASC`
     );
     res.json({ packaging_profiles: result.rows });
