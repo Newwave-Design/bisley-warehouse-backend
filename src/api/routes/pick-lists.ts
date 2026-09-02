@@ -109,7 +109,10 @@ router.get('/:pickListId/fulfilment-plan', authMiddleware, async (req: Request, 
       ),
       query(
         `SELECT pli.id, pli.line_number, pli.product_sku, pli.quantity_required, pli.quantity_picked, pli.status,
-                wp.product_title, wp.colour_name, wp.variant_thumbnail,
+                wp.product_title, wp.colour_name, wp.colour_code, wp.variant_thumbnail, wp.metadata,
+                COALESCE(wp.variant_width_mm, wp.width_mm) AS width_mm,
+                COALESCE(wp.variant_height_mm, wp.height_mm) AS height_mm,
+                COALESCE(wp.variant_depth_mm, wp.depth_mm) AS depth_mm,
                 pfp.packaging_profile_code, pfp.checklist_template_code, pfp.shipping_group,
                 pfp.fulfilment_tags, pfp.preferred_service_code, pfp.requires_manual_review,
                 pfp.is_fragile, pfp.is_multi_box, pfp.pack_instructions

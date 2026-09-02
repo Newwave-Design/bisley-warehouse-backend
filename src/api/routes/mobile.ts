@@ -305,7 +305,10 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
         pli.picked_from_location_id, pli.notes,
         l.location_code,
         -- Enrich from wms_products for display
-        wp.product_title, wp.colour_name, wp.variant_thumbnail,
+        wp.product_title, wp.colour_name, wp.variant_thumbnail, wp.metadata,
+        COALESCE(wp.variant_width_mm, wp.width_mm) AS width_mm,
+        COALESCE(wp.variant_height_mm, wp.height_mm) AS height_mm,
+        COALESCE(wp.variant_depth_mm, wp.depth_mm) AS depth_mm,
         -- Show where this SKU is in the warehouse
         (SELECT json_agg(json_build_object('location_code', wl.location_code, 'qty', wi.quantity) ORDER BY wi.quantity DESC)
          FROM warehouse_inventory wi

@@ -27,8 +27,14 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
 
     // 1. Check barcode_mappings (EAN / Supercode barcode → product)
     const barcode = await query(
-      `SELECT product_sku as nw_code, colour_name as colour, product_name, colour_code
-       FROM barcode_mappings WHERE barcode = $1 AND is_active = true LIMIT 1`,
+      `SELECT bm.product_sku as nw_code, bm.colour_name as colour, bm.product_name, bm.colour_code,
+              wp.metadata, wp.product_handle,
+              COALESCE(wp.variant_width_mm, wp.width_mm) AS width_mm,
+              COALESCE(wp.variant_height_mm, wp.height_mm) AS height_mm,
+              COALESCE(wp.variant_depth_mm, wp.depth_mm) AS depth_mm
+       FROM barcode_mappings bm
+       LEFT JOIN wms_products wp ON wp.variant_sku = bm.product_sku
+       WHERE bm.barcode = $1 AND bm.is_active = true LIMIT 1`,
       [q]
     );
     if (barcode.rows[0]) {
@@ -37,7 +43,14 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
 
     // 2. Check sku_mappings by NW code
     const mapping = await query(
-      `SELECT nw_code, product_name, family, colour, medusa_sku FROM sku_mappings WHERE UPPER(nw_code) = $1 LIMIT 1`,
+      `SELECT sm.nw_code, sm.product_name, sm.family, sm.colour, sm.medusa_sku,
+              wp.metadata, wp.product_handle,
+              COALESCE(wp.variant_width_mm, wp.width_mm) AS width_mm,
+              COALESCE(wp.variant_height_mm, wp.height_mm) AS height_mm,
+              COALESCE(wp.variant_depth_mm, wp.depth_mm) AS depth_mm
+       FROM sku_mappings sm
+       LEFT JOIN wms_products wp ON wp.variant_sku = sm.medusa_sku
+       WHERE UPPER(sm.nw_code) = $1 LIMIT 1`,
       [q]
     );
     if (mapping.rows[0]) {
