@@ -375,30 +375,6 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
   }
 });
 
-/** POST /api/mobile/pick-lists/:id/items/:itemId/pick — confirm item picked */
-router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: AuthRequest, res: Response) => {
-  try {
-    const { id, itemId } = req.params;
-    const { quantityPicked, pickedFromLocationCode } = req.body;
-
-    let locationId = null;
-    if (pickedFromLocationCode) {
-      const loc = await query('SELECT id FROM warehouse_locations WHERE location_code=$1', [pickedFromLocationCode]);
-      if (loc.rows[0]) locationId = loc.rows[0].id;
-    }
-
-    const result = await query(`
-      UPDATE pick_list_items SET status='PICKED', quantity_picked=$1, picked_from_location_id=$2, updated_at=NOW()
-      WHERE id=$3 AND pick_list_id=$4 RETURNING *
-    `, [quantityPicked, locationId, itemId, id]);
-
-    if (!result.rows[0]) return res.status(404).json({ error: 'Item not found' });
-    res.json({ item: result.rows[0] });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to mark item picked' });
-  }
-});
-
 /**
  * GET /api/mobile/inventory — searchable SKU + bay location list
  * ?q= search by SKU or product name (case-insensitive, partial match)

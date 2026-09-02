@@ -344,6 +344,9 @@ CREATE TABLE IF NOT EXISTS supplier_orders (
 ALTER TABLE supplier_orders ADD COLUMN IF NOT EXISTS expected_delivery DATE;
 ALTER TABLE supplier_orders ADD COLUMN IF NOT EXISTS genero_dispatch_ref VARCHAR(100);
 ALTER TABLE supplier_orders ADD COLUMN IF NOT EXISTS created_by VARCHAR(100);
+ALTER TABLE supplier_orders ADD COLUMN IF NOT EXISTS supplier VARCHAR(100) DEFAULT 'New Wave';
+ALTER TABLE supplier_orders ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMP;
+ALTER TABLE supplier_orders ADD COLUMN IF NOT EXISTS received_at TIMESTAMP;
 UPDATE supplier_orders SET expected_delivery = expected_delivery_date WHERE expected_delivery IS NULL AND expected_delivery_date IS NOT NULL;
 
 -- ================================================================================
@@ -499,26 +502,10 @@ CREATE TABLE IF NOT EXISTS checkin_discrepancies (
 );
 
 -- ================================================================================
--- SUPPLIER ORDERS (Phase 2: Purchase orders sent to NW/Genero)
--- ================================================================================
-CREATE TABLE IF NOT EXISTS supplier_orders (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  order_number VARCHAR(50) NOT NULL UNIQUE,
-  status TEXT CHECK (status IN ('DRAFT', 'SUBMITTED', 'ACKNOWLEDGED', 'DISPATCHED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'CANCELLED')) DEFAULT 'DRAFT',
-  supplier VARCHAR(100) DEFAULT 'New Wave',
-  notes TEXT,
-  expected_delivery DATE,
-  submitted_at TIMESTAMP,
-  dispatched_at TIMESTAMP,
-  received_at TIMESTAMP,
-  genero_dispatch_ref VARCHAR(100),
-  created_by VARCHAR(100),
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- ================================================================================
 -- ORDER LINE ITEMS (Phase 2: Individual products within a supplier order)
+-- (supplier_orders is defined earlier — see SUPPLIER ORDERS section above.
+--  A duplicate CREATE TABLE for supplier_orders used to live here; removed —
+--  its extra columns are now ALTERed onto the original definition instead.)
 -- ================================================================================
 CREATE TABLE IF NOT EXISTS order_line_items (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
