@@ -48,6 +48,13 @@ const UPS_SERVICE_CODE_REVERSE_MAP: Record<string, string> = Object.fromEntries(
   Object.entries(UPS_SERVICE_CODE_MAP).map(([internalCode, upsCode]) => [upsCode, internalCode])
 )
 
+export type UpsItemizedCharge = {
+  code: string
+  description: string | null
+  amount: number | null
+  currency: string | null
+}
+
 export type UpsRateQuote = {
   upsServiceCode: string
   internalServiceCode: string | null
@@ -59,6 +66,7 @@ export type UpsRateQuote = {
   billedWeightValue: number | null
   billedWeightUnit: string | null
   guaranteedDaysInTransit: string | null
+  itemizedCharges: UpsItemizedCharge[]
   warnings: string[]
 }
 
@@ -359,6 +367,25 @@ export async function getUpsRates(input: UpsRateRequestInput): Promise<UpsRateQu
         : []
     const upsServiceCode: string = rated.Service?.Code ?? ''
 
+    // Parse whatever itemized charge breakdown UPS actually returns (shipment- and/or
+    // package-level) — we never invent surcharge categories, only report what's given.
+    const parseItemized = (source: any): UpsItemizedCharge[] => {
+      const raw = source?.ItemizedCharges
+      const list = Array.isArray(raw) ? raw : raw ? [raw] : []
+      return list.map((c: any): UpsItemizedCharge => ({
+        code: c?.Code ?? '',
+        description: c?.Description ?? null,
+        amount: c?.MonetaryValue ? Number(c.MonetaryValue) : null,
+        currency: c?.CurrencyCode ?? null,
+      }))
+    }
+    const ratedPackagesRaw = rated.RatedPackage
+    const ratedPackages = Array.isArray(ratedPackagesRaw) ? ratedPackagesRaw : ratedPackagesRaw ? [ratedPackagesRaw] : []
+    const itemizedCharges = [
+      ...parseItemized(rated),
+      ...ratedPackages.flatMap((p: any) => parseItemized(p)),
+    ]
+
     return {
       upsServiceCode,
       internalServiceCode: UPS_SERVICE_CODE_REVERSE_MAP[upsServiceCode] ?? null,
@@ -372,6 +399,7 @@ export async function getUpsRates(input: UpsRateRequestInput): Promise<UpsRateQu
       billedWeightValue: rated.BillingWeight?.Weight ? Number(rated.BillingWeight.Weight) : null,
       billedWeightUnit: rated.BillingWeight?.UnitOfMeasurement?.Code ?? null,
       guaranteedDaysInTransit: rated.GuaranteedDelivery?.BusinessDaysInTransit ?? null,
+      itemizedCharges,
       warnings,
     }
   })

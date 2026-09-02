@@ -7,7 +7,7 @@ import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
-import { estimateShippingForServices, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
+import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured } from '../../lib/ups.js';
 
 const router = express.Router();
@@ -410,7 +410,7 @@ async function runUpsAutoTagJob() {
          ORDER BY inner_length_mm ASC, inner_width_mm ASC, inner_height_mm ASC`
       ),
       query(
-        `SELECT variant_sku, variant_title, colour_name,
+        `SELECT variant_sku, variant_title, colour_name, is_kit, COALESCE(kit_components::text, '[]') AS kit_components,
                 COALESCE(variant_weight_grams, weight_grams) AS weight_grams,
                 COALESCE(variant_depth_mm, depth_mm) AS depth_mm,
                 COALESCE(variant_width_mm, width_mm) AS width_mm,
@@ -419,6 +419,33 @@ async function runUpsAutoTagJob() {
          WHERE variant_sku IS NOT NULL AND variant_sku <> ''`
       ),
     ]);
+
+    // Kit variants (e.g. MultiDesk) have no dims of their own — batch-load every component
+    // SKU's dims once so kit dimensions can be computed as stacked-in-a-box totals.
+    const kitComponentSkus = Array.from(new Set(
+      (productsResult.rows as any[]).flatMap(row => row.is_kit ? (JSON.parse(row.kit_components) as { sku: string }[]).map(c => c.sku) : [])
+    ));
+    const componentDimsBySku = new Map<string, { weight_grams: number | null; length_mm: number | null; width_mm: number | null; height_mm: number | null }>();
+    if (kitComponentSkus.length) {
+      const componentResult = await query(
+        `SELECT variant_sku,
+                COALESCE(variant_weight_grams, weight_grams) AS weight_grams,
+                COALESCE(variant_depth_mm, depth_mm) AS depth_mm,
+                COALESCE(variant_width_mm, width_mm) AS width_mm,
+                COALESCE(variant_height_mm, height_mm) AS height_mm
+         FROM wms_products
+         WHERE variant_sku = ANY($1::text[])`,
+        [kitComponentSkus]
+      );
+      for (const row of componentResult.rows as any[]) {
+        componentDimsBySku.set(row.variant_sku, {
+          weight_grams: asNumber(row.weight_grams),
+          length_mm: asNumber(row.depth_mm),
+          width_mm: asNumber(row.width_mm),
+          height_mm: asNumber(row.height_mm),
+        });
+      }
+    }
 
     const services: ShippingService[] = servicesResult.rows.map((row: any) => ({
       service_code: row.service_code,
@@ -463,16 +490,25 @@ async function runUpsAutoTagJob() {
         height_mm: asNumber(row.height_mm),
       };
 
-      const hasCompleteDimensions = Boolean(
+      let hasCompleteDimensions = Boolean(
         dims.length_mm && dims.width_mm && dims.height_mm && dims.weight_grams
       );
+      let effectiveDims = dims;
+      if (!hasCompleteDimensions && row.is_kit) {
+        const kitComponents = JSON.parse(row.kit_components) as { sku: string; required_quantity: number }[];
+        const kitDims = resolveKitDimensions(kitComponents, componentDimsBySku);
+        if (kitDims.complete) {
+          effectiveDims = kitDims;
+          hasCompleteDimensions = true;
+        }
+      }
       if (!hasCompleteDimensions) missingDims++;
 
       // Packaging profile pick is a real physical-packing decision (which Bisley carton/pallet
       // fits) — kept from the padded-dimension geometry check, independent of courier eligibility.
       const estimate = hasCompleteDimensions
         ? estimateShippingForServices({
-            dims,
+            dims: effectiveDims,
             services,
             packagingProfiles: profiles,
             packagingPaddingMinMm: 15,
