@@ -230,5 +230,24 @@ router.delete('/wms-inventory', authMiddleware, async (req: AuthRequest, res: Re
   }
 });
 
+// Purge specific legacy/phantom SKUs from warehouse_inventory — used to clean up
+// old test data (renamed/typo'd product codes) that no longer has a Medusa counterpart.
+// Body: { skus: string[] }
+router.post('/purge-skus', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { skus } = req.body as { skus?: string[] };
+    if (!Array.isArray(skus) || skus.length === 0) {
+      return res.status(400).json({ error: 'skus array required' });
+    }
+    const result = await query(
+      `DELETE FROM warehouse_inventory WHERE product_sku = ANY($1::text[]) RETURNING product_sku`,
+      [skus]
+    );
+    res.json({ success: true, deleted: result.rowCount, skus: result.rows.map(r => r.product_sku) });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to purge SKUs' });
+  }
+});
+
 export default router;
 
