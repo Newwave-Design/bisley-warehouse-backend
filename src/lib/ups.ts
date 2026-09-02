@@ -384,9 +384,18 @@ export async function getUpsRates(input: UpsRateRequestInput): Promise<UpsRateQu
     // For a single-package shipment, UPS repeats the same charges at shipment and package
     // level — prefer the per-package breakdown (the true source) and only fall back to the
     // shipment-level list when no package-level detail is present, to avoid double-counting.
-    const itemizedCharges = ratedPackages.length
+    const rawItemizedCharges = ratedPackages.length
       ? ratedPackages.flatMap((p: any) => parseItemized(p))
       : parseItemized(rated)
+    // UPS's own response can list the exact same charge line twice for a single package —
+    // this only drops true duplicates (identical code + amount + currency), never alters values.
+    const seenCharges = new Set<string>()
+    const itemizedCharges = rawItemizedCharges.filter((c) => {
+      const key = `${c.code}|${c.amount}|${c.currency}`
+      if (seenCharges.has(key)) return false
+      seenCharges.add(key)
+      return true
+    })
 
     return {
       upsServiceCode,
