@@ -8,7 +8,7 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     service_name: 'UPS Standard',
     service_level: 'standard',
     shipment_mode: 'parcel',
-    constraints: { max_weight_kg: 70, max_length_mm: 2740, max_girth_plus_length_mm: 4000, max_volume_litres: 1200 },
+    constraints: { required_packaging_type: 'parcel', max_weight_kg: 70, max_length_mm: 2740, max_girth_plus_length_mm: 4000, max_volume_litres: 1200 },
     metadata: { ready_for_api: true, category: 'parcel' },
   },
   {
@@ -18,7 +18,7 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     service_name: 'UPS Express Saver',
     service_level: 'express',
     shipment_mode: 'parcel',
-    constraints: { max_weight_kg: 70, max_length_mm: 2740, max_girth_plus_length_mm: 4000, max_volume_litres: 1200 },
+    constraints: { required_packaging_type: 'parcel', max_weight_kg: 70, max_length_mm: 2740, max_girth_plus_length_mm: 4000, max_volume_litres: 1200 },
     metadata: { ready_for_api: true, category: 'parcel' },
   },
   {
@@ -28,7 +28,7 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     service_name: 'UPS Worldwide Express',
     service_level: 'express',
     shipment_mode: 'parcel',
-    constraints: { max_weight_kg: 70, max_length_mm: 2740, max_girth_plus_length_mm: 4000, max_volume_litres: 1200 },
+    constraints: { required_packaging_type: 'parcel', max_weight_kg: 70, max_length_mm: 2740, max_girth_plus_length_mm: 4000, max_volume_litres: 1200 },
     metadata: { ready_for_api: false, category: 'parcel' },
   },
   {
@@ -38,7 +38,7 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     service_name: 'UPS Worldwide Express Plus',
     service_level: 'express',
     shipment_mode: 'parcel',
-    constraints: { max_weight_kg: 70, max_length_mm: 2740, max_girth_plus_length_mm: 4000, max_volume_litres: 1200 },
+    constraints: { required_packaging_type: 'parcel', max_weight_kg: 70, max_length_mm: 2740, max_girth_plus_length_mm: 4000, max_volume_litres: 1200 },
     metadata: { ready_for_api: false, category: 'parcel' },
   },
   {
@@ -48,7 +48,7 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     service_name: 'UPS Worldwide Expedited',
     service_level: 'standard',
     shipment_mode: 'parcel',
-    constraints: { max_weight_kg: 70, max_length_mm: 2740, max_girth_plus_length_mm: 4000, max_volume_litres: 1200 },
+    constraints: { required_packaging_type: 'parcel', max_weight_kg: 70, max_length_mm: 2740, max_girth_plus_length_mm: 4000, max_volume_litres: 1200 },
     metadata: { ready_for_api: false, category: 'parcel' },
   },
   {
@@ -58,7 +58,7 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     service_name: 'UPS Worldwide Express Freight',
     service_level: 'express',
     shipment_mode: 'freight',
-    constraints: { max_weight_kg: 500, max_length_mm: 3000, max_volume_litres: 5000 },
+    constraints: { required_packaging_type: 'freight', max_weight_kg: 500, max_length_mm: 3000, max_volume_litres: 5000 },
     metadata: { ready_for_api: false, category: 'freight' },
   },
 ];
@@ -96,6 +96,17 @@ export const DEFAULT_PACKAGING_PROFILES: PackagingProfile[] = [
     max_weight_grams: 30000,
     tare_weight_grams: 900,
     default_cost_gbp: 3.8,
+  },
+  {
+    code: 'UPS-FREIGHT-CUSTOM-PALLET',
+    name: 'UPS Freight Custom Pallet',
+    package_type: 'freight',
+    inner_length_mm: 3000,
+    inner_width_mm: 2000,
+    inner_height_mm: 2000,
+    max_weight_grams: 500000,
+    tare_weight_grams: 0,
+    default_cost_gbp: null,
   },
 ];
 

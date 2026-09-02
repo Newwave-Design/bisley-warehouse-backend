@@ -521,7 +521,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
                   max_weight_grams, tare_weight_grams, default_cost_gbp
            FROM packaging_profiles
            WHERE is_active = true
-             AND package_type = 'parcel'
+             AND package_type IN ('parcel', 'freight')
            ORDER BY name ASC`
         ),
         skuList.length
@@ -565,7 +565,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
       services = DEFAULT_SHIPPING_SERVICES
         .filter(s => s.courier_code === 'ups')
         .map(withServiceConstraintDefaults);
-      packagingProfiles = DEFAULT_PACKAGING_PROFILES.filter(p => p.package_type === 'parcel');
+      packagingProfiles = DEFAULT_PACKAGING_PROFILES.filter(p => p.package_type === 'parcel' || p.package_type === 'freight');
     }
 
     const variants = product.variants.map((variant) => {

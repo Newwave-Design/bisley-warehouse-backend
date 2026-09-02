@@ -232,7 +232,7 @@ router.get('/packaging-profiles', authMiddleware, async (_req: AuthRequest, res:
       `SELECT code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm,
               max_weight_grams, tare_weight_grams, default_cost_gbp, is_active, notes
        FROM packaging_profiles
-       WHERE package_type = 'parcel'
+      WHERE package_type IN ('parcel', 'freight')
        ORDER BY name ASC`
     );
     res.json({ packaging_profiles: result.rows });
@@ -302,7 +302,7 @@ router.post('/shipping-services/ups-sync', authMiddleware, async (_req: AuthRequ
            code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm,
            max_weight_grams, tare_weight_grams, default_cost_gbp, is_active, notes
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, COALESCE($10, notes))
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10)
          ON CONFLICT (code) DO UPDATE SET
            name = EXCLUDED.name,
            package_type = EXCLUDED.package_type,
@@ -324,7 +324,9 @@ router.post('/shipping-services/ups-sync', authMiddleware, async (_req: AuthRequ
           profile.max_weight_grams,
           profile.tare_weight_grams,
           profile.default_cost_gbp,
-          null,
+          profile.code === 'UPS-FREIGHT-CUSTOM-PALLET'
+            ? 'Oversize or heavy items. Freight and packaging pricing require a quote.'
+            : null,
         ]
       );
     }
@@ -333,7 +335,7 @@ router.post('/shipping-services/ups-sync', authMiddleware, async (_req: AuthRequ
       `UPDATE packaging_profiles
        SET is_active = false,
            updated_at = NOW()
-       WHERE package_type <> 'parcel'`
+       WHERE package_type NOT IN ('parcel', 'freight')`
     );
 
     const servicesAfter = await query(
@@ -367,7 +369,7 @@ router.post('/shipping-services/ups-auto-tag-products', authMiddleware, async (_
         `SELECT code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm,
                 max_weight_grams, tare_weight_grams, default_cost_gbp
          FROM packaging_profiles
-         WHERE package_type = 'parcel' AND is_active = true
+         WHERE package_type IN ('parcel', 'freight') AND is_active = true
          ORDER BY inner_length_mm ASC, inner_width_mm ASC, inner_height_mm ASC`
       ),
       query(
@@ -409,7 +411,7 @@ router.post('/shipping-services/ups-auto-tag-products', authMiddleware, async (_
     }
 
     if (!profiles.length) {
-      return res.status(400).json({ error: 'No active parcel packaging profiles found' });
+      return res.status(400).json({ error: 'No active UPS packaging profiles found' });
     }
 
     let tagged = 0;
@@ -425,20 +427,26 @@ router.post('/shipping-services/ups-auto-tag-products', authMiddleware, async (_
         height_mm: asNumber(row.height_mm),
       };
 
-      if (!dims.length_mm || !dims.width_mm || !dims.height_mm || !dims.weight_grams) {
+      const hasCompleteDimensions = Boolean(
+        dims.length_mm && dims.width_mm && dims.height_mm && dims.weight_grams
+      );
+      if (!hasCompleteDimensions) {
         missingDims++;
       }
 
-      const estimate = estimateShippingForServices({
-        dims,
-        services,
-        packagingProfiles: profiles,
-        packagingPaddingMinMm: 15,
-        packagingPaddingMaxMm: 20,
-      });
+      const estimate = hasCompleteDimensions
+        ? estimateShippingForServices({
+            dims,
+            services,
+            packagingProfiles: profiles,
+            packagingPaddingMinMm: 15,
+            packagingPaddingMaxMm: 20,
+          })
+        : null;
 
-      const preferred = estimate.estimates.find(s => s.eligible) ?? null;
-      const needsManual = !preferred || preferred.shipment_mode !== 'parcel' || !estimate.picked_packaging_profile;
+      const preferred = estimate?.estimates.find(s => s.eligible) ?? null;
+      const isFreight = preferred?.shipment_mode === 'freight';
+      const needsManual = !preferred || isFreight || !estimate?.picked_packaging_profile;
 
       if (!preferred) noEligible++;
       if (needsManual) manualReview++;
@@ -456,7 +464,7 @@ router.post('/shipping-services/ups-auto-tag-products', authMiddleware, async (_
            pack_instructions,
            updated_at
          )
-         VALUES ($1, $2, 'STD-PARCEL', $3, $4, false, false, $5::jsonb, $6, NOW())
+         VALUES ($1, $2, $3, $4, $5, false, false, $6::jsonb, $7, NOW())
          ON CONFLICT (product_sku) DO UPDATE SET
            packaging_profile_code = EXCLUDED.packaging_profile_code,
            checklist_template_code = EXCLUDED.checklist_template_code,
@@ -464,15 +472,21 @@ router.post('/shipping-services/ups-auto-tag-products', authMiddleware, async (_
            requires_manual_review = EXCLUDED.requires_manual_review,
            fulfilment_tags = EXCLUDED.fulfilment_tags,
            pack_instructions = EXCLUDED.pack_instructions,
-           updated_at = NOW()`,
+           updated_at = NOW()
+         WHERE product_fulfillment_profiles.fulfilment_tags @> '["ups-auto-tagged"]'::jsonb`,
         [
           row.variant_sku,
-          estimate.picked_packaging_profile?.code ?? null,
+          estimate?.picked_packaging_profile?.code ?? null,
+          isFreight ? 'PALLET-FREIGHT' : 'STD-PARCEL',
           preferred?.service_code ?? null,
           needsManual,
           JSON.stringify(needsManual ? ['ups-manual-review'] : ['ups-auto-tagged']),
-          needsManual
-            ? 'Manual review required - no eligible UPS parcel service or packaging profile found.'
+          !hasCompleteDimensions
+            ? 'Manual review required - product weight and all dimensions must be recorded before UPS service assignment.'
+            : isFreight
+              ? 'Manual review required - UPS freight handling and pricing must be confirmed before dispatch.'
+              : needsManual
+                ? 'Manual review required - no eligible UPS service or packaging profile found.'
             : 'Auto-tagged by UPS estimator using packed dimensions (+15 to +20 mm).',
         ]
       );
