@@ -18,17 +18,25 @@ import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 const router = express.Router();
 
 const WEBHOOK_SECRET = process.env.MEDUSA_WEBHOOK_SECRET ?? '';
+if (!WEBHOOK_SECRET) {
+  console.warn('[webhooks] MEDUSA_WEBHOOK_SECRET not set — /api/webhooks/medusa will reject all requests');
+}
 
 function verifySignature(rawBody: Buffer, signature: string): boolean {
-  if (!WEBHOOK_SECRET) return true; // skip verification if secret not configured
-  const expected = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(expected, 'hex'));
+  try {
+    const expected = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('hex');
+    const expectedBuf = Buffer.from(expected, 'hex');
+    const sigBuf = Buffer.from(signature, 'hex');
+    return sigBuf.length === expectedBuf.length && crypto.timingSafeEqual(sigBuf, expectedBuf);
+  } catch {
+    return false; // malformed signature header (bad hex, wrong length, etc.)
+  }
 }
 
 router.post('/medusa', express.raw({ type: '*/*' }), async (req: Request, res: Response) => {
   try {
     const sig = (req.headers['x-medusa-signature'] as string) ?? '';
-    if (WEBHOOK_SECRET && !verifySignature(req.body as Buffer, sig)) {
+    if (!WEBHOOK_SECRET || !verifySignature(req.body as Buffer, sig)) {
       return res.status(401).json({ error: 'Invalid webhook signature' });
     }
 

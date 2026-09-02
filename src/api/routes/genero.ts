@@ -13,7 +13,7 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
 import { logError, logWarning, logInfo } from '../../lib/logger.js';
 import { createNotification, createNotificationOnce } from '../../lib/notifications.js';
 
@@ -62,7 +62,7 @@ async function callGeneroApi(payload: {
  * Submit all line items for a supplier order to the Genero API.
  * Creates genero_order_lines records with the response.
  */
-router.post('/submit/:orderId', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/submit/:orderId', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { orderId } = req.params;
 
