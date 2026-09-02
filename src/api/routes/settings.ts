@@ -8,6 +8,7 @@ import { query } from '../../db/index.js';
 import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 import { estimateShippingForServices, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
+import { getCachedUpsRates, upsReferenceDestinationConfigured } from '../../lib/ups.js';
 
 const router = express.Router();
 
@@ -444,6 +445,7 @@ async function runUpsAutoTagJob() {
 
     if (!services.length) throw new Error('No active UPS shipping services found');
     if (!profiles.length) throw new Error('No active UPS packaging profiles found');
+    if (!upsReferenceDestinationConfigured()) throw new Error('Live UPS rates are not configured. Set UPS_REFERENCE_DESTINATION_* env vars on the backend.');
 
     let tagged = 0;
     let manualReview = 0;
@@ -464,10 +466,10 @@ async function runUpsAutoTagJob() {
       const hasCompleteDimensions = Boolean(
         dims.length_mm && dims.width_mm && dims.height_mm && dims.weight_grams
       );
-      if (!hasCompleteDimensions) {
-        missingDims++;
-      }
+      if (!hasCompleteDimensions) missingDims++;
 
+      // Packaging profile pick is a real physical-packing decision (which Bisley carton/pallet
+      // fits) — kept from the padded-dimension geometry check, independent of courier eligibility.
       const estimate = hasCompleteDimensions
         ? estimateShippingForServices({
             dims,
@@ -478,12 +480,45 @@ async function runUpsAutoTagJob() {
           })
         : null;
 
-      const preferred = estimate?.estimates.find(s => s.eligible) ?? null;
-      const isFreight = preferred?.shipment_mode === 'freight';
-      const needsManual = !preferred || isFreight || !estimate?.picked_packaging_profile;
+      const packed = estimate?.packaged_dimensions;
+      const lengthMm = packed?.used_length_mm ?? 0;
+      const widthMm = packed?.used_width_mm ?? 0;
+      const heightMm = packed?.used_height_mm ?? 0;
+      const packageWeightGrams = estimate?.package_weight_grams ?? 0;
+      const hasCompletePackedDims = lengthMm > 0 && widthMm > 0 && heightMm > 0 && packageWeightGrams > 0;
 
-      if (!preferred) noEligible++;
+      // Courier eligibility and service choice come from a REAL live UPS Rating API quote for
+      // this exact packed size/weight — not a static constraint table. Whatever UPS actually
+      // accepts (or rejects) is the final word.
+      let preferredServiceCode: string | null = null;
+      let manualReviewReason: string | null = null;
+
+      if (!hasCompleteDimensions) {
+        manualReviewReason = 'Manual review required - product weight and all dimensions must be recorded before UPS service assignment.';
+      } else if (!hasCompletePackedDims) {
+        manualReviewReason = 'Manual review required - no packaging profile could be resolved for this item\'s dimensions.';
+      } else {
+        const result = await getCachedUpsRates({ lengthMm, widthMm, heightMm, weightGrams: packageWeightGrams });
+        if (result.error || !result.quotes?.length) {
+          manualReviewReason = `Manual review required - UPS rejected this package: ${result.error ?? 'no services were returned'}.`;
+        } else {
+          const cheapest = result.quotes.reduce((best, quote) => {
+            if (quote.totalChargesAmount == null || !quote.internalServiceCode) return best;
+            if (!best || (best.totalChargesAmount ?? Infinity) > quote.totalChargesAmount) return quote;
+            return best;
+          }, null as (typeof result.quotes)[number] | null);
+          preferredServiceCode = cheapest?.internalServiceCode ?? null;
+          if (!preferredServiceCode) {
+            manualReviewReason = 'Manual review required - UPS returned quotes but none matched a configured internal service code.';
+          }
+        }
+      }
+
+      if (!preferredServiceCode) noEligible++;
+      const needsManual = Boolean(manualReviewReason);
       if (needsManual) manualReview++;
+
+      const isFreightPackaging = estimate?.picked_packaging_profile?.package_type === 'freight';
 
       await query(
         `INSERT INTO product_fulfillment_profiles (
@@ -511,17 +546,11 @@ async function runUpsAutoTagJob() {
         [
           row.variant_sku,
           estimate?.picked_packaging_profile?.code ?? null,
-          isFreight ? 'PALLET-FREIGHT' : 'STD-PARCEL',
-          preferred?.service_code ?? null,
+          isFreightPackaging ? 'PALLET-FREIGHT' : 'STD-PARCEL',
+          preferredServiceCode,
           needsManual,
           JSON.stringify(needsManual ? ['ups-manual-review'] : ['ups-auto-tagged']),
-          !hasCompleteDimensions
-            ? 'Manual review required - product weight and all dimensions must be recorded before UPS service assignment.'
-            : isFreight
-              ? 'Manual review required - UPS freight handling and pricing must be confirmed before dispatch.'
-              : needsManual
-                ? 'Manual review required - no eligible UPS service or packaging profile found.'
-              : 'Auto-tagged by UPS estimator using packed dimensions (+15 to +20 mm).',
+          manualReviewReason ?? 'Auto-tagged using a live UPS Rating API quote for packed dimensions (+15 to +20 mm).',
         ]
       );
 

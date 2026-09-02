@@ -28,6 +28,44 @@ export interface ShippingService {
   metadata: Record<string, unknown>;
 }
 
+export interface KitComponent {
+  sku: string;
+  required_quantity: number;
+}
+
+/**
+ * Kit variants (e.g. MultiDesk) have no physical dimensions of their own in Medusa — they are a
+ * bundle of separately-stocked component SKUs. This computes the combined shipping dims assuming
+ * the components are stacked on top of each other in one box: weight sums, footprint takes the
+ * largest component, height sums. Returns nulls (and complete: false) if any component is missing
+ * or itself has incomplete dimensions, so callers don't silently ship on a partial guess.
+ */
+export function resolveKitDimensions(
+  components: KitComponent[],
+  componentDimsBySku: Map<string, ProductDims>
+): ProductDims & { complete: boolean } {
+  if (!components.length) return { weight_grams: null, length_mm: null, width_mm: null, height_mm: null, complete: false };
+
+  let totalWeight = 0;
+  let maxLength = 0;
+  let maxWidth = 0;
+  let totalHeight = 0;
+
+  for (const component of components) {
+    const dims = componentDimsBySku.get(component.sku);
+    const qty = component.required_quantity > 0 ? component.required_quantity : 1;
+    if (!dims || !dims.weight_grams || !dims.length_mm || !dims.width_mm || !dims.height_mm) {
+      return { weight_grams: null, length_mm: null, width_mm: null, height_mm: null, complete: false };
+    }
+    totalWeight += dims.weight_grams * qty;
+    maxLength = Math.max(maxLength, dims.length_mm);
+    maxWidth = Math.max(maxWidth, dims.width_mm);
+    totalHeight += dims.height_mm * qty;
+  }
+
+  return { weight_grams: totalWeight, length_mm: maxLength, width_mm: maxWidth, height_mm: totalHeight, complete: true };
+}
+
 export interface ServiceEstimate {
   service_code: string;
   service_name: string;

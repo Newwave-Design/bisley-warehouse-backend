@@ -376,3 +376,51 @@ export async function getUpsRates(input: UpsRateRequestInput): Promise<UpsRateQu
     }
   })
 }
+
+export function upsReferenceDestinationConfigured(): boolean {
+  return Boolean(
+    process.env.UPS_REFERENCE_DESTINATION_ADDRESS_1 &&
+    process.env.UPS_REFERENCE_DESTINATION_CITY &&
+    process.env.UPS_REFERENCE_DESTINATION_POSTAL_CODE &&
+    process.env.UPS_REFERENCE_DESTINATION_COUNTRY_CODE
+  )
+}
+
+// Shared live-quote cache — keyed by packed dimensions + weight so every caller (product page,
+// bulk auto-tag job) reuses one result for identical-size items instead of re-hitting UPS.
+const liveRateCache = new Map<string, { expiresAt: number; quotes: UpsRateQuote[] | null; error: string | null }>()
+const LIVE_RATE_CACHE_OK_MS = 10 * 60 * 1000
+const LIVE_RATE_CACHE_ERROR_MS = 60 * 1000
+
+export async function getCachedUpsRates(params: {
+  lengthMm: number; widthMm: number; heightMm: number; weightGrams: number;
+}): Promise<{ quotes: UpsRateQuote[] | null; error: string | null }> {
+  const cacheKey = `${Math.round(params.lengthMm)}x${Math.round(params.widthMm)}x${Math.round(params.heightMm)}@${Math.round(params.weightGrams)}`
+  const cached = liveRateCache.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now()) return { quotes: cached.quotes, error: cached.error }
+
+  try {
+    const quotes = await getUpsRates({
+      package: {
+        description: 'Bisley product',
+        weightKg: Math.max(0.1, params.weightGrams / 1000),
+        lengthCm: params.lengthMm / 10,
+        widthCm: params.widthMm / 10,
+        heightCm: params.heightMm / 10,
+      },
+      shipTo: {
+        name: process.env.UPS_REFERENCE_DESTINATION_NAME || 'Reference Customer',
+        addressLine1: process.env.UPS_REFERENCE_DESTINATION_ADDRESS_1!,
+        city: process.env.UPS_REFERENCE_DESTINATION_CITY!,
+        postalCode: process.env.UPS_REFERENCE_DESTINATION_POSTAL_CODE!,
+        countryCode: process.env.UPS_REFERENCE_DESTINATION_COUNTRY_CODE!,
+      },
+    })
+    liveRateCache.set(cacheKey, { expiresAt: Date.now() + LIVE_RATE_CACHE_OK_MS, quotes, error: null })
+    return { quotes, error: null }
+  } catch (err: any) {
+    const message = err?.message || 'UPS rating request failed'
+    liveRateCache.set(cacheKey, { expiresAt: Date.now() + LIVE_RATE_CACHE_ERROR_MS, quotes: null, error: message })
+    return { quotes: null, error: message }
+  }
+}

@@ -11,59 +11,11 @@ import express, { Response } from 'express';
 import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
 import { getMedusaToken, MEDUSA_URL } from '../../lib/medusa-client.js';
 import { query } from '../../db/index.js';
-import { estimateShippingForServices, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
+import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
-import { getUpsRates, type UpsRateQuote } from '../../lib/ups.js';
+import { getCachedUpsRates, upsReferenceDestinationConfigured, type UpsRateQuote } from '../../lib/ups.js';
 
 const router = express.Router();
-
-// ── Live UPS rate quote cache ──────────────────────────────────────────────
-// Keyed by packed dimensions + weight so identical-size colour variants share one live call.
-const liveRateCache = new Map<string, { expiresAt: number; quotes: UpsRateQuote[] | null; error: string | null }>();
-const LIVE_RATE_CACHE_OK_MS = 10 * 60 * 1000;
-const LIVE_RATE_CACHE_ERROR_MS = 60 * 1000;
-
-function upsReferenceDestinationConfigured(): boolean {
-  return Boolean(
-    process.env.UPS_REFERENCE_DESTINATION_ADDRESS_1 &&
-    process.env.UPS_REFERENCE_DESTINATION_CITY &&
-    process.env.UPS_REFERENCE_DESTINATION_POSTAL_CODE &&
-    process.env.UPS_REFERENCE_DESTINATION_COUNTRY_CODE
-  );
-}
-
-async function getLiveUpsQuotesForPackage(params: {
-  lengthMm: number; widthMm: number; heightMm: number; weightGrams: number;
-}): Promise<{ quotes: UpsRateQuote[] | null; error: string | null }> {
-  const cacheKey = `${Math.round(params.lengthMm)}x${Math.round(params.widthMm)}x${Math.round(params.heightMm)}@${Math.round(params.weightGrams)}`;
-  const cached = liveRateCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return { quotes: cached.quotes, error: cached.error };
-
-  try {
-    const quotes = await getUpsRates({
-      package: {
-        description: 'Bisley product',
-        weightKg: Math.max(0.1, params.weightGrams / 1000),
-        lengthCm: params.lengthMm / 10,
-        widthCm: params.widthMm / 10,
-        heightCm: params.heightMm / 10,
-      },
-      shipTo: {
-        name: process.env.UPS_REFERENCE_DESTINATION_NAME || 'Reference Customer',
-        addressLine1: process.env.UPS_REFERENCE_DESTINATION_ADDRESS_1!,
-        city: process.env.UPS_REFERENCE_DESTINATION_CITY!,
-        postalCode: process.env.UPS_REFERENCE_DESTINATION_POSTAL_CODE!,
-        countryCode: process.env.UPS_REFERENCE_DESTINATION_COUNTRY_CODE!,
-      },
-    });
-    liveRateCache.set(cacheKey, { expiresAt: Date.now() + LIVE_RATE_CACHE_OK_MS, quotes, error: null });
-    return { quotes, error: null };
-  } catch (err: any) {
-    const message = err?.message || 'UPS rating request failed';
-    liveRateCache.set(cacheKey, { expiresAt: Date.now() + LIVE_RATE_CACHE_ERROR_MS, quotes: null, error: message });
-    return { quotes: null, error: message };
-  }
-}
 
 
 // Medusa has 2 stock locations (European Warehouse + an unused legacy "Ovara" location with
@@ -550,6 +502,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
     const productRows = await query(
       `SELECT medusa_product_id, product_title, product_handle,
               medusa_variant_id, variant_sku, variant_title, colour_name,
+              is_kit, COALESCE(kit_components::text, '[]') AS kit_components,
               COALESCE(variant_weight_grams, weight_grams) AS weight_grams,
               COALESCE(variant_depth_mm, depth_mm) AS depth_mm,
               COALESCE(variant_width_mm, width_mm) AS width_mm,
@@ -571,6 +524,33 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
     const variantRows = productRows.rows;
 
     const skuList = variantRows.map((v: any) => v.variant_sku).filter(Boolean);
+
+    // Kit variants (e.g. MultiDesk) carry no dims of their own — gather every component SKU across
+    // this product's kit variants in one batched lookup so we can compute stacked-in-a-box dims.
+    const kitComponentSkus = Array.from(new Set(
+      variantRows.flatMap((v: any) => v.is_kit ? (JSON.parse(v.kit_components) as { sku: string }[]).map(c => c.sku) : [])
+    ));
+    const componentDimsBySku = new Map<string, { weight_grams: number | null; length_mm: number | null; width_mm: number | null; height_mm: number | null }>();
+    if (kitComponentSkus.length) {
+      const componentResult = await query(
+        `SELECT variant_sku,
+                COALESCE(variant_weight_grams, weight_grams) AS weight_grams,
+                COALESCE(variant_depth_mm, depth_mm) AS depth_mm,
+                COALESCE(variant_width_mm, width_mm) AS width_mm,
+                COALESCE(variant_height_mm, height_mm) AS height_mm
+         FROM wms_products
+         WHERE variant_sku = ANY($1::text[])`,
+        [kitComponentSkus]
+      );
+      for (const row of componentResult.rows as any[]) {
+        componentDimsBySku.set(row.variant_sku, {
+          weight_grams: asNumber(row.weight_grams),
+          length_mm: asNumber(row.depth_mm),
+          width_mm: asNumber(row.width_mm),
+          height_mm: asNumber(row.height_mm),
+        });
+      }
+    }
 
     let services: ShippingService[] = [];
     let packagingProfiles: PackagingProfile[] = [];
@@ -640,12 +620,19 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
 
     const variants = await Promise.all(variantRows.map(async (row: any) => {
       const profile = fulfilmentBySku.get(row.variant_sku);
-      const dims = {
+      let dims = {
         weight_grams: asNumber(row.weight_grams),
         length_mm: asNumber(row.depth_mm),
         width_mm: asNumber(row.width_mm),
         height_mm: asNumber(row.height_mm),
       };
+
+      const hasOwnDims = Boolean(dims.weight_grams && dims.length_mm && dims.width_mm && dims.height_mm);
+      if (!hasOwnDims && row.is_kit) {
+        const kitComponents = JSON.parse(row.kit_components) as { sku: string; required_quantity: number }[];
+        const kitDims = resolveKitDimensions(kitComponents, componentDimsBySku);
+        if (kitDims.complete) dims = kitDims;
+      }
 
       const estimate = estimateShippingForServices({
         dims,
@@ -676,7 +663,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
       } else if (!hasCompletePackedDims) {
         liveQuoteError = 'Missing weight or dimensions — cannot request a live UPS rate.';
       } else {
-        const result = await getLiveUpsQuotesForPackage({ lengthMm, widthMm, heightMm, weightGrams: estimate.package_weight_grams });
+        const result = await getCachedUpsRates({ lengthMm, widthMm, heightMm, weightGrams: estimate.package_weight_grams });
         // UPS's Rating API often omits Service.Description for this account — fall back to our own
         // configured service name (same catalogue shown in Settings > Shipping & Packing) for the same code.
         liveQuotes = result.quotes?.map((quote) => {
