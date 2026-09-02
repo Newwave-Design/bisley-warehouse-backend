@@ -677,7 +677,17 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
         liveQuoteError = 'Missing weight or dimensions — cannot request a live UPS rate.';
       } else {
         const result = await getLiveUpsQuotesForPackage({ lengthMm, widthMm, heightMm, weightGrams: estimate.package_weight_grams });
-        liveQuotes = result.quotes;
+        // UPS's Rating API often omits Service.Description for this account — fall back to our own
+        // configured service name (same catalogue shown in Settings > Shipping & Packing) for the same code.
+        liveQuotes = result.quotes?.map((quote) => {
+          const matchedService = quote.internalServiceCode
+            ? services.find(s => s.service_code === quote.internalServiceCode)
+            : null;
+          return {
+            ...quote,
+            serviceName: matchedService?.service_name ?? quote.serviceName ?? `UPS service ${quote.upsServiceCode}`,
+          };
+        }) ?? null;
         liveQuoteError = result.error;
       }
 
