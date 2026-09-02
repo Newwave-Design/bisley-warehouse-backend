@@ -280,6 +280,24 @@ CREATE TABLE IF NOT EXISTS pick_list_items (
 );
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS is_sandbox BOOLEAN NOT NULL DEFAULT false;
 
+-- ================================================================================
+-- PICK SCANS (Individual scan history — supports partial-quantity picking,
+-- editing/deleting a scan, and resetting a pick list back to a clean state)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS pick_scans (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  pick_list_id UUID NOT NULL REFERENCES pick_lists(id) ON DELETE CASCADE,
+  pick_list_item_id UUID NOT NULL REFERENCES pick_list_items(id) ON DELETE CASCADE,
+  quantity INT NOT NULL,
+  location_id UUID REFERENCES warehouse_locations(id),
+  scanned_barcode VARCHAR(100),
+  performed_by UUID,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_pick_scans_item ON pick_scans(pick_list_item_id);
+CREATE INDEX IF NOT EXISTS idx_pick_scans_list ON pick_scans(pick_list_id);
+
 CREATE TABLE IF NOT EXISTS pick_list_packages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   pick_list_id UUID NOT NULL REFERENCES pick_lists(id) ON DELETE CASCADE,

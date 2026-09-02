@@ -8,6 +8,7 @@
  * POST   /api/checkin/sessions/:id/scan     — Add scanned item
  * PATCH  /api/checkin/sessions/:id/items/:itemId — Update scanned qty
  * DELETE /api/checkin/sessions/:id/items/:itemId — Remove item
+ * POST   /api/checkin/sessions/:id/reset    — Clear all scanned items, keep session open
  * POST   /api/checkin/sessions/:id/compare  — Generate discrepancy report vs order
  * POST   /api/checkin/sessions/:id/complete — Finalise session
  */
@@ -133,7 +134,18 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
       [req.params.id]
     );
 
-    res.json({ ...session.rows[0], items: items.rows, discrepancies: discrepancies.rows });
+    // Expected quantities from the linked order, if any — lets the UI show a live
+    // "scanned / expected" count per code as the user scans, without running Compare.
+    let order_line_items: any[] = [];
+    if (session.rows[0].order_id) {
+      const lines = await query(
+        `SELECT nw_code, colour, quantity_ordered, medusa_sku FROM order_line_items WHERE order_id = $1`,
+        [session.rows[0].order_id]
+      );
+      order_line_items = lines.rows;
+    }
+
+    res.json({ ...session.rows[0], items: items.rows, discrepancies: discrepancies.rows, order_line_items });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch session' });
   }
@@ -206,6 +218,23 @@ router.delete('/sessions/:id/items/:itemId', authMiddleware, async (req: AuthReq
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to remove item' });
+  }
+});
+
+// Reset — clear every scanned item and discrepancy, keep the session open to start again
+router.post('/sessions/:id/reset', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const session = await query(`SELECT status FROM checkin_sessions WHERE id = $1`, [req.params.id]);
+    if (!session.rows[0]) return res.status(404).json({ error: 'Session not found' });
+    if (session.rows[0].status === 'COMPLETE') return res.status(400).json({ error: 'Session is complete' });
+
+    await query(`DELETE FROM checkin_items WHERE session_id = $1`, [req.params.id]);
+    await query(`DELETE FROM checkin_discrepancies WHERE session_id = $1`, [req.params.id]);
+    await query(`UPDATE checkin_sessions SET status = 'OPEN', updated_at = NOW() WHERE id = $1`, [req.params.id]);
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to reset session' });
   }
 });
 

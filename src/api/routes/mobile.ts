@@ -15,6 +15,12 @@ import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
 
+// performed_by columns are UUID - the demo token's user id ('1') is not a valid UUID, so guard it.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function toUuidOrNull(id: unknown): string | null {
+  return typeof id === 'string' && UUID_RE.test(id) ? id : null;
+}
+
 /** GET /api/mobile/lookup?q=BARCODE — resolve any scan to product info + stock */
 router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
@@ -320,10 +326,39 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
   }
 });
 
-/** POST /api/mobile/pick-lists/:id/items/:itemId/pick — scan to pick an item */
+/** Recompute a pick_list_item's quantity_picked/status from its pick_scans, then the parent pick_list's status. */
+async function recomputePickItem(pickListId: string, itemId: string) {
+  const sum = await query(
+    `SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM pick_scans WHERE pick_list_item_id = $1`,
+    [itemId]
+  );
+  const item = await query(`SELECT quantity_required FROM pick_list_items WHERE id = $1`, [itemId]);
+  const required = item.rows[0]?.quantity_required ?? 0;
+  const picked = Math.min(sum.rows[0].qty, required);
+  const status = picked >= required && required > 0 ? 'PICKED' : picked > 0 ? 'PICKING' : 'PENDING';
+
+  const updated = await query(
+    `UPDATE pick_list_items SET quantity_picked = $1, status = $2, updated_at = NOW() WHERE id = $3 RETURNING *`,
+    [picked, status, itemId]
+  );
+
+  const remaining = await query(
+    `SELECT COUNT(*) FROM pick_list_items WHERE pick_list_id = $1 AND status != 'PICKED'`,
+    [pickListId]
+  );
+  const allPicked = parseInt(remaining.rows[0].count) === 0;
+  await query(
+    `UPDATE pick_lists SET status = $1, updated_at = NOW() WHERE id = $2`,
+    [allPicked ? 'PICKED' : 'IN_PROGRESS', pickListId]
+  );
+
+  return { item: updated.rows[0], allPicked };
+}
+
+/** POST /api/mobile/pick-lists/:id/items/:itemId/pick — scan to pick a quantity (defaults to all remaining) */
 router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { location_code, scanned_barcode } = req.body;
+    const { location_code, scanned_barcode, quantity } = req.body;
     const { id: pickListId, itemId } = req.params;
 
     const item = await query(
@@ -332,6 +367,12 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
     );
     if (!item.rows[0]) return res.status(404).json({ error: 'Item not found' });
     if (item.rows[0].status === 'PICKED') return res.status(400).json({ error: 'Already picked' });
+
+    const remainingQty = item.rows[0].quantity_required - item.rows[0].quantity_picked;
+    const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : remainingQty;
+    if (qty > remainingQty) {
+      return res.status(400).json({ error: `Only ${remainingQty} remaining — reduce the quantity` });
+    }
 
     // Verify the scanned barcode matches the expected SKU
     if (scanned_barcode) {
@@ -351,27 +392,108 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
       locationId = loc.rows[0]?.id ?? null;
     }
 
-    await query(`
-      UPDATE pick_list_items
-      SET status = 'PICKED', quantity_picked = quantity_required,
-          picked_from_location_id = COALESCE($1, picked_from_location_id), updated_at = NOW()
-      WHERE id = $2
-    `, [locationId, itemId]);
-
-    // Check if all items are picked → auto-complete the pick list
-    const remaining = await query(
-      `SELECT COUNT(*) FROM pick_list_items WHERE pick_list_id = $1 AND status != 'PICKED'`,
-      [pickListId]
+    await query(
+      `INSERT INTO pick_scans (pick_list_id, pick_list_item_id, quantity, location_id, scanned_barcode, performed_by)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [pickListId, itemId, qty, locationId, scanned_barcode ?? null, toUuidOrNull(req.user?.id)]
     );
-    if (parseInt(remaining.rows[0].count) === 0) {
-      await query(`UPDATE pick_lists SET status = 'PICKED', updated_at = NOW() WHERE id = $1`, [pickListId]);
-    } else {
-      await query(`UPDATE pick_lists SET status = 'IN_PROGRESS', updated_at = NOW() WHERE id = $1`, [pickListId]);
+    if (locationId) {
+      await query(`UPDATE pick_list_items SET picked_from_location_id = $1 WHERE id = $2`, [locationId, itemId]);
     }
 
-    res.json({ success: true, all_picked: parseInt(remaining.rows[0].count) === 0 });
+    const { item: updatedItem, allPicked } = await recomputePickItem(pickListId, itemId);
+
+    res.json({ success: true, all_picked: allPicked, item: updatedItem });
   } catch (err: any) {
     res.status(500).json({ error: err.message ?? 'Pick failed' });
+  }
+});
+
+/** GET /api/mobile/pick-lists/:id/scans — full scan history for the list (newest first) */
+router.get('/pick-lists/:id/scans', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(`
+      SELECT ps.id, ps.pick_list_item_id, ps.quantity, ps.scanned_barcode, ps.created_at,
+             pli.product_sku, pli.colour_code,
+             l.location_code,
+             wp.product_title, wp.colour_name
+      FROM pick_scans ps
+      JOIN pick_list_items pli ON pli.id = ps.pick_list_item_id
+      LEFT JOIN warehouse_locations l ON l.id = ps.location_id
+      LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
+      WHERE ps.pick_list_id = $1
+      ORDER BY ps.created_at DESC
+    `, [req.params.id]);
+    res.json({ scans: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load scan history' });
+  }
+});
+
+/** PATCH /api/mobile/pick-lists/:id/scans/:scanId — correct a scan's quantity */
+router.patch('/pick-lists/:id/scans/:scanId', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { quantity } = req.body;
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      return res.status(400).json({ error: 'quantity must be a positive integer' });
+    }
+    const scan = await query(
+      `SELECT * FROM pick_scans WHERE id = $1 AND pick_list_id = $2`,
+      [req.params.scanId, req.params.id]
+    );
+    if (!scan.rows[0]) return res.status(404).json({ error: 'Scan not found' });
+
+    const item = await query(`SELECT quantity_required FROM pick_list_items WHERE id = $1`, [scan.rows[0].pick_list_item_id]);
+    const otherScans = await query(
+      `SELECT COALESCE(SUM(quantity),0)::int AS qty FROM pick_scans WHERE pick_list_item_id = $1 AND id != $2`,
+      [scan.rows[0].pick_list_item_id, req.params.scanId]
+    );
+    const maxAllowed = item.rows[0].quantity_required - otherScans.rows[0].qty;
+    if (quantity > maxAllowed) {
+      return res.status(400).json({ error: `Quantity would exceed the ${item.rows[0].quantity_required} required — max ${maxAllowed}` });
+    }
+
+    await query(`UPDATE pick_scans SET quantity = $1, updated_at = NOW() WHERE id = $2`, [quantity, req.params.scanId]);
+    const { item: updatedItem, allPicked } = await recomputePickItem(req.params.id, scan.rows[0].pick_list_item_id);
+    res.json({ success: true, item: updatedItem, all_picked: allPicked });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message ?? 'Failed to update scan' });
+  }
+});
+
+/** DELETE /api/mobile/pick-lists/:id/scans/:scanId — remove a single scan */
+router.delete('/pick-lists/:id/scans/:scanId', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const scan = await query(
+      `SELECT * FROM pick_scans WHERE id = $1 AND pick_list_id = $2`,
+      [req.params.scanId, req.params.id]
+    );
+    if (!scan.rows[0]) return res.status(404).json({ error: 'Scan not found' });
+
+    await query(`DELETE FROM pick_scans WHERE id = $1`, [req.params.scanId]);
+    const { item: updatedItem, allPicked } = await recomputePickItem(req.params.id, scan.rows[0].pick_list_item_id);
+    res.json({ success: true, item: updatedItem, all_picked: allPicked });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message ?? 'Failed to delete scan' });
+  }
+});
+
+/** POST /api/mobile/pick-lists/:id/reset — clear all scans and start the list again */
+router.post('/pick-lists/:id/reset', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const pl = await query(`SELECT id FROM pick_lists WHERE id = $1`, [req.params.id]);
+    if (!pl.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+
+    await query(`DELETE FROM pick_scans WHERE pick_list_id = $1`, [req.params.id]);
+    await query(
+      `UPDATE pick_list_items SET quantity_picked = 0, status = 'PENDING', picked_from_location_id = NULL, updated_at = NOW() WHERE pick_list_id = $1`,
+      [req.params.id]
+    );
+    await query(`UPDATE pick_lists SET status = 'PENDING', updated_at = NOW() WHERE id = $1`, [req.params.id]);
+
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message ?? 'Failed to reset pick list' });
   }
 });
 
