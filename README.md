@@ -172,6 +172,11 @@ Returns: `status`, `bisley_order`, `Est_delivery` — poll periodically as deliv
 - `product_fulfillment_profiles` stores SKU-level fulfilment tags, packaging defaults and service hints.
 - `pick_list_packages` stores real packages, tracking numbers, label state and cost per package.
 
+### UPS Packaging Profiles
+- UPS parcel cartons are limited by their maximum packed-content weight; this is separate from each UPS service's shipment limit.
+- `UPS-FREIGHT-CUSTOM-PALLET` covers products that cannot use a parcel carton. It uses the freight checklist and always requires manual confirmation of packing, account eligibility and pricing before dispatch.
+- The automated UPS tagger assigns no carrier service when weight or any dimension is missing, and does not overwrite manually maintained fulfilment profiles.
+
 ### Scanning
 | Method | Path | Description |
 |---|---|---|
