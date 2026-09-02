@@ -27,6 +27,7 @@ import reorderRulesRoutes, { pendingRouter as pendingReordersRouter, runReorderC
 import errorLogRoutes from './api/routes/error-log.js';
 import notificationsRoutes from './api/routes/notifications.js';
 import deliveriesRoutes from './api/routes/deliveries.js';
+import authRoutes from './api/routes/auth.js';
 import { createNotificationOnce } from './lib/notifications.js';
 import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
 import { query as dbQueryUtil } from './db/index.js';
@@ -56,6 +57,7 @@ app.get('/health', (req, res) => {
 });
 
 // API Routes
+app.use('/api/auth', authRoutes);
 app.use('/api/scanning', scanningRoutes);
 app.use('/api/pick-lists', pickListRoutes);
 app.use('/api/inventory', inventorySyncRoutes);
@@ -140,7 +142,12 @@ async function start() {
           const { query: dbQuery } = await import('./db/index.js');
           const open = await dbQuery(`SELECT COUNT(*) FROM genero_order_lines WHERE genero_status NOT IN ('Received','Cancelled','Complete','Delivered') OR genero_status IS NULL`);
           if (parseInt(open.rows[0].count) > 0) {
-            const token = `${Buffer.from(JSON.stringify({ alg: 'HS256' })).toString('base64')}.${Buffer.from(JSON.stringify({ sub: 'scheduler', email: 'scheduler@wms', role: 'MANAGER' })).toString('base64')}.sig`;
+            const jwtModule = await import('jsonwebtoken');
+            const token = jwtModule.default.sign(
+              { sub: 'scheduler', email: 'scheduler@wms', role: 'MANAGER' },
+              process.env.JWT_SECRET || 'your_secret',
+              { expiresIn: '5m' }
+            );
             await fetch(`http://localhost:${PORT}/api/genero/poll`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
             console.log(`[scheduler] Genero poll ran at ${new Date().toISOString()}`);
             // Also run reorder check after each Genero poll

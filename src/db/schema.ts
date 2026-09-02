@@ -318,11 +318,13 @@ CREATE TABLE IF NOT EXISTS warehouse_users (
   email VARCHAR(255) NOT NULL UNIQUE,
   role VARCHAR(50) NOT NULL DEFAULT 'PICKER',
   -- Roles: ADMIN, MANAGER, PICKER, RECEIVER
+  password_hash VARCHAR(255),
   is_active BOOLEAN DEFAULT true,
   last_login_at TIMESTAMP,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
+ALTER TABLE warehouse_users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
 
 -- ================================================================================
 -- SUPPLIER ORDERS / REPLENISHMENT REQUESTS (Integration with Genero)

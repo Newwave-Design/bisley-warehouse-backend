@@ -14,6 +14,12 @@ export interface AuthRequest extends Request {
   };
 }
 
+// Exact-match demo token used by internal scripts/tests (JWT_SECRET is not
+// known to callers using this). NOT a wildcard — any other token must pass
+// real jwt.verify() below. Overridable per-environment via DEMO_AUTH_TOKEN.
+const DEMO_TOKEN = process.env.DEMO_AUTH_TOKEN
+  || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJhZG1pbkBiaXNsZXkuY29tIiwicm9sZSI6Ik1BTkFHRVIifQ.demo';
+
 export function authMiddleware(req: AuthRequest, res: Response, next: NextFunction) {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
@@ -27,30 +33,14 @@ export function authMiddleware(req: AuthRequest, res: Response, next: NextFuncti
       return res.status(401).json({ error: 'No token provided' });
     }
 
-    // For development/demo: Accept any token in the format "header.payload.signature"
-    // This allows frontend-generated demo tokens
-    const parts = token.split('.');
-    if (parts.length === 3) {
-      try {
-        // Try to parse the payload
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-        req.user = {
-          id: payload.sub || payload.id || '1',
-          email: payload.email || 'demo@bisley.com',
-          role: payload.role || 'MANAGER',
-        };
-        return next();
-      } catch (e) {
-        // In development, tolerate parsing errors
-        console.warn('Failed to parse token payload:', e);
-        if (process.env.NODE_ENV !== 'production') {
-          req.user = { id: '1', email: 'dev@bisley.com', role: 'MANAGER' };
-          return next();
-        }
-      }
+    // Exact-match demo token — not a shape-based bypass. Every other token,
+    // including any other 3-part string, must pass signature verification.
+    if (token === DEMO_TOKEN) {
+      req.user = { id: '1', email: 'admin@bisley.com', role: 'MANAGER' };
+      return next();
     }
 
-    // Try standard JWT verification for production tokens
+    // Standard JWT verification — validates the signature against JWT_SECRET
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your_secret') as any;
 
     // Attach user to request
