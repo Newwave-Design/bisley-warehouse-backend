@@ -6,6 +6,7 @@
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 
 const router = express.Router();
 
@@ -97,6 +98,17 @@ router.get('/shipping-services', authMiddleware, async (_req: AuthRequest, res: 
     );
     res.json({ shipping_services: result.rows });
   } catch (err) {
+    if (isMissingRelationError(err)) {
+      return res.json({
+        shipping_services: DEFAULT_SHIPPING_SERVICES.map((s, idx) => ({
+          ...s,
+          id: `fallback-${s.service_code}`,
+          is_active: true,
+          sort_order: (idx + 1) * 10,
+        })),
+        source: 'fallback',
+      });
+    }
     console.error(err);
     res.status(500).json({ error: 'Failed to load shipping services' });
   }
@@ -213,6 +225,16 @@ router.get('/packaging-profiles', authMiddleware, async (_req: AuthRequest, res:
     );
     res.json({ packaging_profiles: result.rows });
   } catch (err) {
+    if (isMissingRelationError(err)) {
+      return res.json({
+        packaging_profiles: DEFAULT_PACKAGING_PROFILES.map((p) => ({
+          ...p,
+          is_active: true,
+          notes: null,
+        })),
+        source: 'fallback',
+      });
+    }
     console.error(err);
     res.status(500).json({ error: 'Failed to load packaging profiles' });
   }

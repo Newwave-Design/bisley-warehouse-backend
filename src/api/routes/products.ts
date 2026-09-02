@@ -12,6 +12,7 @@ import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { getMedusaToken, MEDUSA_URL } from '../../lib/medusa-client.js';
 import { query } from '../../db/index.js';
 import { estimateShippingForServices, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
+import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 
 const router = express.Router();
 
@@ -501,56 +502,67 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
 
     const skuList = product.variants.map(v => v.sku).filter(Boolean);
 
-    const [servicesResult, profilesResult, fulfilmentResult] = await Promise.all([
-      query(
-        `SELECT service_code, service_name, courier_code, courier_name, service_level, shipment_mode, constraints, metadata
-         FROM shipping_services
-         WHERE is_active = true
-         ORDER BY sort_order ASC, service_name ASC`
-      ),
-      query(
-        `SELECT code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm,
-                max_weight_grams, tare_weight_grams, default_cost_gbp
-         FROM packaging_profiles
-         WHERE is_active = true
-         ORDER BY name ASC`
-      ),
-      skuList.length
-        ? query(
-            `SELECT product_sku, packaging_profile_code, preferred_service_code,
-                    requires_manual_review, is_fragile, is_multi_box
-             FROM product_fulfillment_profiles
-             WHERE product_sku = ANY($1::text[])`,
-            [skuList]
-          )
-        : Promise.resolve({ rows: [] as FulfillmentProfileRow[] }),
-    ]);
-
-    const services: ShippingService[] = servicesResult.rows.map((row: any) => withServiceConstraintDefaults({
-      service_code: row.service_code,
-      service_name: row.service_name,
-      courier_code: row.courier_code,
-      courier_name: row.courier_name,
-      service_level: row.service_level,
-      shipment_mode: row.shipment_mode,
-      constraints: row.constraints ?? {},
-      metadata: row.metadata ?? {},
-    }));
-
-    const packagingProfiles: PackagingProfile[] = profilesResult.rows.map((row: any) => ({
-      code: row.code,
-      name: row.name,
-      package_type: row.package_type,
-      inner_length_mm: row.inner_length_mm,
-      inner_width_mm: row.inner_width_mm,
-      inner_height_mm: row.inner_height_mm,
-      max_weight_grams: row.max_weight_grams,
-      tare_weight_grams: row.tare_weight_grams,
-      default_cost_gbp: row.default_cost_gbp,
-    }));
-
+    let services: ShippingService[] = [];
+    let packagingProfiles: PackagingProfile[] = [];
     const fulfilmentBySku = new Map<string, FulfillmentProfileRow>();
-    for (const row of fulfilmentResult.rows as FulfillmentProfileRow[]) fulfilmentBySku.set(row.product_sku, row);
+    let dataSource: 'database' | 'fallback' = 'database';
+
+    try {
+      const [servicesResult, profilesResult, fulfilmentResult] = await Promise.all([
+        query(
+          `SELECT service_code, service_name, courier_code, courier_name, service_level, shipment_mode, constraints, metadata
+           FROM shipping_services
+           WHERE is_active = true
+           ORDER BY sort_order ASC, service_name ASC`
+        ),
+        query(
+          `SELECT code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm,
+                  max_weight_grams, tare_weight_grams, default_cost_gbp
+           FROM packaging_profiles
+           WHERE is_active = true
+           ORDER BY name ASC`
+        ),
+        skuList.length
+          ? query(
+              `SELECT product_sku, packaging_profile_code, preferred_service_code,
+                      requires_manual_review, is_fragile, is_multi_box
+               FROM product_fulfillment_profiles
+               WHERE product_sku = ANY($1::text[])`,
+              [skuList]
+            )
+          : Promise.resolve({ rows: [] as FulfillmentProfileRow[] }),
+      ]);
+
+      services = servicesResult.rows.map((row: any) => withServiceConstraintDefaults({
+        service_code: row.service_code,
+        service_name: row.service_name,
+        courier_code: row.courier_code,
+        courier_name: row.courier_name,
+        service_level: row.service_level,
+        shipment_mode: row.shipment_mode,
+        constraints: row.constraints ?? {},
+        metadata: row.metadata ?? {},
+      }));
+
+      packagingProfiles = profilesResult.rows.map((row: any) => ({
+        code: row.code,
+        name: row.name,
+        package_type: row.package_type,
+        inner_length_mm: row.inner_length_mm,
+        inner_width_mm: row.inner_width_mm,
+        inner_height_mm: row.inner_height_mm,
+        max_weight_grams: row.max_weight_grams,
+        tare_weight_grams: row.tare_weight_grams,
+        default_cost_gbp: row.default_cost_gbp,
+      }));
+
+      for (const row of fulfilmentResult.rows as FulfillmentProfileRow[]) fulfilmentBySku.set(row.product_sku, row);
+    } catch (err) {
+      if (!isMissingRelationError(err)) throw err;
+      dataSource = 'fallback';
+      services = DEFAULT_SHIPPING_SERVICES.map(withServiceConstraintDefaults);
+      packagingProfiles = DEFAULT_PACKAGING_PROFILES;
+    }
 
     const variants = product.variants.map((variant) => {
       const profile = fulfilmentBySku.get(variant.sku);
@@ -618,6 +630,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
         title: product.title,
       },
       assumptions: {
+        data_source: dataSource,
         packaging_dimension_allowance_mm: {
           min: 15,
           max: 20,
