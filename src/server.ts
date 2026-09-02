@@ -8,6 +8,7 @@ import express from 'express';
 import cors from 'cors';
 import { initializePool, closePool } from './db/index.js';
 import { runMigrations } from './db/migrate.js';
+import { ensureFulfillmentSchema } from './db/ensure-fulfillment-schema.js';
 import scanningRoutes from './api/routes/scanning.js';
 import pickListRoutes from './api/routes/pick-lists.js';
 import inventorySyncRoutes from './api/routes/inventory-sync.js';
@@ -113,6 +114,12 @@ async function start() {
       console.log('✓ Database migrations complete');
     } catch (migrateError) {
       console.warn('⚠️  Migration warning:', (migrateError as Error).message);
+    }
+
+    try {
+      await ensureFulfillmentSchema();
+    } catch (bootstrapError) {
+      console.warn('⚠️  Fulfillment schema bootstrap warning:', (bootstrapError as Error).message);
     }
 
     // Start server
