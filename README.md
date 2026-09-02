@@ -70,6 +70,8 @@ Auth accepts any valid JWT or demo token (payload: `{ sub, email, role }`).
 | `POST` | `/api/webhooks/medusa` | Medusa `order.placed` → auto-create pick list |
 | `GET` | `/api/webhooks/test-order` | Create test pick list (dev only) |
 
+Webhook-created pick lists now also snapshot customer and delivery metadata for downstream packing and shipping.
+
 **Medusa webhook setup:** Admin → Settings → Webhooks → add URL + event `order.placed`
 
 ### Genero (Bisley New Wave API)
@@ -138,6 +140,25 @@ Returns: `status`, `bisley_order`, `Est_delivery` — poll periodically as deliv
 |---|---|---|
 | `GET` | `/api/settings/field-mappings` | Medusa→WMS + WMS→Genero field mappings |
 | `POST` / `PUT` / `DELETE` | `/api/settings/field-mappings/:id` | CRUD |
+
+### Pick Lists
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/pick-lists` | List active pick lists |
+| `GET` | `/api/pick-lists/:pickListId` | Pick list detail with items and package summary |
+| `GET` | `/api/pick-lists/:pickListId/fulfilment-plan` | Courier-agnostic shipping plan, package plan and reference data |
+| `PATCH` | `/api/pick-lists/:pickListId/fulfilment-plan` | Save courier choice, packaging costs, parcel count and package records |
+| `PATCH` | `/api/pick-lists/:pickListId/packing/start` | Move a picked order into packing |
+| `PATCH` | `/api/pick-lists/:pickListId/packing/complete` | Mark packing complete and store packaging totals |
+| `PATCH` | `/api/pick-lists/:pickListId/label-printed` | Mark labels printed before dispatch |
+| `PATCH` | `/api/pick-lists/:pickListId/dispatch` | Final outbound stock decrement and dispatch completion |
+
+### Fulfilment Data Model
+- `shipping_services` stores courier/service options without binding the system to one carrier API.
+- `packaging_profiles` stores reusable cartons, pallets and their default costs.
+- `packaging_checklist_templates` stores repeatable packing checklists.
+- `product_fulfillment_profiles` stores SKU-level fulfilment tags, packaging defaults and service hints.
+- `pick_list_packages` stores real packages, tracking numbers, label state and cost per package.
 
 ### Scanning
 | Method | Path | Description |

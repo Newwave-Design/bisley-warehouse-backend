@@ -50,6 +50,21 @@ router.post('/medusa', express.raw({ type: '*/*' }), async (req: Request, res: R
 async function handleOrderPlaced(order: any) {
   const medusaOrderId = order.id;
   const displayId = order.display_id ?? order.id;
+  const primaryShippingMethod = order.shipping_methods?.[0] ?? null;
+  const shippingAddress = order.shipping_address ?? order.address ?? null;
+  const customerName = [shippingAddress?.first_name, shippingAddress?.last_name].filter(Boolean).join(' ') || order.customer?.email || null;
+  const shippingSnapshot = shippingAddress ? {
+    first_name: shippingAddress.first_name ?? null,
+    last_name: shippingAddress.last_name ?? null,
+    company: shippingAddress.company ?? null,
+    address_1: shippingAddress.address_1 ?? null,
+    address_2: shippingAddress.address_2 ?? null,
+    city: shippingAddress.city ?? null,
+    province: shippingAddress.province ?? null,
+    postal_code: shippingAddress.postal_code ?? null,
+    country_code: shippingAddress.country_code ?? null,
+    phone: shippingAddress.phone ?? null,
+  } : {};
 
   // Check if pick list already exists for this order
   const existing = await query(`SELECT id FROM pick_lists WHERE medusa_order_id = $1`, [medusaOrderId]);
@@ -58,10 +73,23 @@ async function handleOrderPlaced(order: any) {
   const pickListNumber = `PL-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${String(displayId).padStart(4, '0')}`;
 
   const plResult = await query(`
-    INSERT INTO pick_lists (medusa_order_id, pick_list_number, status, created_at, updated_at)
-    VALUES ($1, $2, 'PENDING', NOW(), NOW())
+    INSERT INTO pick_lists (
+      medusa_order_id, pick_list_number, status,
+      customer_name, customer_email,
+      shipping_method_name, shipping_method_code, shipping_address,
+      created_at, updated_at
+    )
+    VALUES ($1, $2, 'PENDING', $3, $4, $5, $6, $7::jsonb, NOW(), NOW())
     RETURNING id
-  `, [medusaOrderId, pickListNumber]);
+  `, [
+    medusaOrderId,
+    pickListNumber,
+    customerName,
+    order.email ?? order.customer?.email ?? null,
+    primaryShippingMethod?.name ?? primaryShippingMethod?.shipping_option?.name ?? null,
+    primaryShippingMethod?.id ?? primaryShippingMethod?.shipping_option_id ?? null,
+    JSON.stringify(shippingSnapshot),
+  ]);
 
   const pickListId = plResult.rows[0].id;
   let lineNumber = 1;

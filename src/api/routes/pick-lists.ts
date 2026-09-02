@@ -75,6 +75,88 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
   }
 });
 
+router.get('/:pickListId/fulfilment-plan', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+
+    const headerResult = await query(
+      `SELECT id, pick_list_number, medusa_order_id, status, customer_name, customer_email,
+              shipping_method_name, shipping_method_code, shipping_address,
+              selected_courier_code, selected_service_code, shipping_requirements,
+              parcel_count, packaging_cost_gbp, packing_notes,
+              packing_started_at, packed_at, label_printed_at,
+              created_at, updated_at
+       FROM pick_lists
+       WHERE id = $1`,
+      [pickListId]
+    );
+
+    if (headerResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Pick list not found' });
+    }
+
+    const [packagesResult, itemsResult, servicesResult, packagingResult, templatesResult] = await Promise.all([
+      query(
+        `SELECT pkg.*, pp.name AS packaging_profile_name, pp.package_type,
+                ss.courier_code, ss.courier_name, ss.service_name, ss.service_level, ss.shipment_mode
+         FROM pick_list_packages pkg
+         LEFT JOIN packaging_profiles pp ON pp.code = pkg.packaging_profile_code
+         LEFT JOIN shipping_services ss ON ss.service_code = pkg.courier_service_code
+         WHERE pkg.pick_list_id = $1
+         ORDER BY pkg.package_number ASC`,
+        [pickListId]
+      ),
+      query(
+        `SELECT pli.id, pli.line_number, pli.product_sku, pli.quantity_required, pli.quantity_picked, pli.status,
+                wp.product_title, wp.colour_name, wp.variant_thumbnail,
+                pfp.packaging_profile_code, pfp.checklist_template_code, pfp.shipping_group,
+                pfp.fulfilment_tags, pfp.preferred_service_code, pfp.requires_manual_review,
+                pfp.is_fragile, pfp.is_multi_box, pfp.pack_instructions
+         FROM pick_list_items pli
+         LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
+         LEFT JOIN product_fulfillment_profiles pfp ON pfp.product_sku = pli.product_sku
+         WHERE pli.pick_list_id = $1
+         ORDER BY pli.line_number ASC`,
+        [pickListId]
+      ),
+      query(
+        `SELECT courier_code, courier_name, service_code, service_name, service_level, shipment_mode,
+                integration_type, constraints, metadata, sort_order
+         FROM shipping_services
+         WHERE is_active = true
+         ORDER BY sort_order ASC, courier_name ASC, service_name ASC`
+      ),
+      query(
+        `SELECT code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm,
+                max_weight_grams, tare_weight_grams, default_cost_gbp, notes
+         FROM packaging_profiles
+         WHERE is_active = true
+         ORDER BY name ASC`
+      ),
+      query(
+        `SELECT code, name, checklist_items
+         FROM packaging_checklist_templates
+         WHERE is_active = true
+         ORDER BY name ASC`
+      ),
+    ]);
+
+    return res.json({
+      pickList: headerResult.rows[0],
+      packages: packagesResult.rows,
+      items: itemsResult.rows,
+      reference: {
+        shipping_services: servicesResult.rows,
+        packaging_profiles: packagingResult.rows,
+        checklist_templates: templatesResult.rows,
+      },
+    });
+  } catch (error) {
+    console.error('Fulfilment plan fetch error:', error);
+    return res.status(500).json({ error: 'Failed to fetch fulfilment plan' });
+  }
+});
+
 /**
  * GET /api/pick-lists/:pickListId
  * Get detailed view of a specific pick list with all items
@@ -113,9 +195,23 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
       [pickListId]
     );
 
+    const packagesResult = await query(
+      `SELECT pkg.id, pkg.package_number, pkg.packaging_profile_code, pkg.courier_service_code,
+              pkg.label_status, pkg.tracking_number, pkg.package_cost_gbp,
+              pp.name AS packaging_profile_name,
+              ss.courier_name, ss.service_name
+       FROM pick_list_packages pkg
+       LEFT JOIN packaging_profiles pp ON pp.code = pkg.packaging_profile_code
+       LEFT JOIN shipping_services ss ON ss.service_code = pkg.courier_service_code
+       WHERE pkg.pick_list_id = $1
+       ORDER BY pkg.package_number ASC`,
+      [pickListId]
+    );
+
     return res.json({
       pickList,
       items: itemsResult.rows,
+      packages: packagesResult.rows,
     });
   } catch (error) {
     console.error('Pick list detail error:', error);
@@ -318,6 +414,165 @@ router.patch('/:pickListId/complete', authMiddleware, async (req: Request, res: 
   }
 });
 
+router.patch('/:pickListId/fulfilment-plan', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    const {
+      selectedCourierCode,
+      selectedServiceCode,
+      shippingRequirements,
+      parcelCount,
+      packagingCostGbp,
+      packingNotes,
+      packages,
+    } = req.body ?? {};
+
+    const existing = await query(`SELECT id FROM pick_lists WHERE id = $1`, [pickListId]);
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+
+    await query(
+      `UPDATE pick_lists
+       SET selected_courier_code = COALESCE($1, selected_courier_code),
+           selected_service_code = COALESCE($2, selected_service_code),
+           shipping_requirements = CASE WHEN $3::jsonb IS NULL THEN shipping_requirements ELSE $3::jsonb END,
+           parcel_count = COALESCE($4, parcel_count),
+           packaging_cost_gbp = COALESCE($5, packaging_cost_gbp),
+           packing_notes = COALESCE($6, packing_notes),
+           updated_at = NOW()
+       WHERE id = $7`,
+      [
+        selectedCourierCode ?? null,
+        selectedServiceCode ?? null,
+        shippingRequirements ? JSON.stringify(shippingRequirements) : null,
+        parcelCount ?? null,
+        packagingCostGbp ?? null,
+        packingNotes ?? null,
+        pickListId,
+      ]
+    );
+
+    if (Array.isArray(packages)) {
+      for (const pkg of packages) {
+        const packageId = pkg.id || uuidv4();
+        await query(
+          `INSERT INTO pick_list_packages (
+             id, pick_list_id, package_number, packaging_profile_code, courier_service_code,
+             label_status, tracking_number, package_weight_grams, package_length_mm,
+             package_width_mm, package_height_mm, package_cost_gbp, contents_summary,
+             checklist_state, metadata, updated_at
+           )
+           VALUES (
+             $1, $2, $3, $4, $5,
+             COALESCE($6, 'NOT_PRINTED'), $7, $8, $9,
+             $10, $11, COALESCE($12, 0), $13,
+             COALESCE($14::jsonb, '[]'::jsonb), COALESCE($15::jsonb, '{}'::jsonb), NOW()
+           )
+           ON CONFLICT (pick_list_id, package_number)
+           DO UPDATE SET packaging_profile_code = EXCLUDED.packaging_profile_code,
+                         courier_service_code = EXCLUDED.courier_service_code,
+                         label_status = EXCLUDED.label_status,
+                         tracking_number = EXCLUDED.tracking_number,
+                         package_weight_grams = EXCLUDED.package_weight_grams,
+                         package_length_mm = EXCLUDED.package_length_mm,
+                         package_width_mm = EXCLUDED.package_width_mm,
+                         package_height_mm = EXCLUDED.package_height_mm,
+                         package_cost_gbp = EXCLUDED.package_cost_gbp,
+                         contents_summary = EXCLUDED.contents_summary,
+                         checklist_state = EXCLUDED.checklist_state,
+                         metadata = EXCLUDED.metadata,
+                         updated_at = NOW()`,
+          [
+            packageId,
+            pickListId,
+            pkg.packageNumber,
+            pkg.packagingProfileCode ?? null,
+            pkg.courierServiceCode ?? null,
+            pkg.labelStatus ?? null,
+            pkg.trackingNumber ?? null,
+            pkg.packageWeightGrams ?? null,
+            pkg.packageLengthMm ?? null,
+            pkg.packageWidthMm ?? null,
+            pkg.packageHeightMm ?? null,
+            pkg.packageCostGbp ?? null,
+            pkg.contentsSummary ?? null,
+            pkg.checklistState ? JSON.stringify(pkg.checklistState) : null,
+            pkg.metadata ? JSON.stringify(pkg.metadata) : null,
+          ]
+        );
+      }
+    }
+
+    return res.json({ success: true, message: 'Fulfilment plan updated' });
+  } catch (error) {
+    console.error('Fulfilment plan update error:', error);
+    return res.status(500).json({ error: 'Failed to update fulfilment plan' });
+  }
+});
+
+router.patch('/:pickListId/packing/start', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    const result = await query(
+      `UPDATE pick_lists
+       SET status = 'PACKING',
+           packing_started_at = COALESCE(packing_started_at, NOW()),
+           updated_at = NOW()
+       WHERE id = $1 AND status IN ('PICKED', 'IN_PROGRESS')
+       RETURNING *`,
+      [pickListId]
+    );
+    if (!result.rows[0]) return res.status(400).json({ error: 'Pick list must be picked before packing starts' });
+    return res.json({ pickList: result.rows[0] });
+  } catch (error) {
+    console.error('Packing start error:', error);
+    return res.status(500).json({ error: 'Failed to start packing' });
+  }
+});
+
+router.patch('/:pickListId/packing/complete', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    const { packagingCostGbp, parcelCount, packingNotes } = req.body ?? {};
+    const result = await query(
+      `UPDATE pick_lists
+       SET status = 'PACKED',
+           packed_at = NOW(),
+           packaging_cost_gbp = COALESCE($1, packaging_cost_gbp),
+           parcel_count = COALESCE($2, parcel_count),
+           packing_notes = COALESCE($3, packing_notes),
+           updated_at = NOW()
+       WHERE id = $4 AND status IN ('PACKING', 'PICKED')
+       RETURNING *`,
+      [packagingCostGbp ?? null, parcelCount ?? null, packingNotes ?? null, pickListId]
+    );
+    if (!result.rows[0]) return res.status(400).json({ error: 'Pick list must be in packing before completion' });
+    return res.json({ pickList: result.rows[0] });
+  } catch (error) {
+    console.error('Packing completion error:', error);
+    return res.status(500).json({ error: 'Failed to complete packing' });
+  }
+});
+
+router.patch('/:pickListId/label-printed', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    const result = await query(
+      `UPDATE pick_lists
+       SET label_printed_at = NOW(),
+           status = CASE WHEN status IN ('PACKED', 'PACKING', 'PICKED') THEN 'LABEL_PRINTED' ELSE status END,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [pickListId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+    return res.json({ pickList: result.rows[0] });
+  } catch (error) {
+    console.error('Label printed update error:', error);
+    return res.status(500).json({ error: 'Failed to update label status' });
+  }
+});
+
 /**
  * PATCH /api/pick-lists/:pickListId/dispatch
  * Mark pick list as dispatched (items have physically left the warehouse).
@@ -330,8 +585,8 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: Request, res: 
 
     const pickList = await query(`SELECT * FROM pick_lists WHERE id = $1`, [pickListId]);
     if (!pickList.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
-    if (!['PICKED', 'IN_PROGRESS'].includes(pickList.rows[0].status)) {
-      return res.status(400).json({ error: 'Pick list must be PICKED or IN_PROGRESS to dispatch' });
+    if (!['PICKED', 'IN_PROGRESS', 'PACKING', 'PACKED', 'LABEL_PRINTED'].includes(pickList.rows[0].status)) {
+      return res.status(400).json({ error: 'Pick list must be picked or packed before dispatch' });
     }
 
     // Get all picked items
