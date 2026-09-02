@@ -66,9 +66,9 @@ router.post('/bootstrap-admin', async (_req: Request, res: Response) => {
     );
 
     res.json({ success: true, email: 'admin@bisley.com', message: 'Admin account created — log in with admin@bisley.com / demo123, then change the password' });
-  } catch (err) {
+  } catch (err: any) {
     console.error('Bootstrap error:', err);
-    res.status(500).json({ error: 'Bootstrap failed' });
+    res.status(500).json({ error: 'Bootstrap failed', detail: err.message });
   }
 });
 
