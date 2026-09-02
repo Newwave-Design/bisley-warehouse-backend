@@ -693,23 +693,29 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
           const heightMm = packed.used_height_mm ?? 0;
           const hasCompletePackedDims = lengthMm > 0 && widthMm > 0 && heightMm > 0 && estimate.package_weight_grams > 0;
           const isFreightPackaging = estimate.picked_packaging_profile?.package_type === 'freight';
+          // MultiDesk kit bundles always ship via AIT regardless of whether UPS would technically
+          // accept them — everything else tries real UPS first, and only falls back to AIT if UPS
+          // itself rejects the package (i.e. it's genuinely too big for a courier parcel/freight service).
+          const isMultidesk = Boolean(row.is_kit);
 
           let liveQuotes: UpsRateQuote[] | null = null;
           let liveQuoteError: string | null = null;
           let liveQuoteConfigRequired = false;
           let aitQuote: VariantShippingGroup['aitQuote'] = null;
 
-          if (isFreightPackaging) {
-            // Doesn't fit a standard Bisley carton — Bisley ships these via AIT today, not UPS
-            // parcel, so skip the live UPS Rating API call entirely and use a flat percentage.
+          const buildAitQuote = (): VariantShippingGroup['aitQuote'] => {
             const priceGbp = asNumber(row.price_gbp);
-            aitQuote = {
+            return {
               service_code: aitServiceCode,
               service_name: aitServiceName,
               percentage_of_price: aitPercentageOfPrice,
               price_gbp: priceGbp,
               estimated_cost_gbp: priceGbp != null ? Math.round(priceGbp * (aitPercentageOfPrice / 100) * 100) / 100 : null,
             };
+          };
+
+          if (isMultidesk) {
+            aitQuote = buildAitQuote();
           } else if (!upsReferenceDestinationConfigured()) {
             liveQuoteConfigRequired = true;
             liveQuoteError = 'Live UPS rates are not configured. Set UPS_REFERENCE_DESTINATION_* env vars on the backend.';
@@ -729,6 +735,10 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
               };
             }) ?? null;
             liveQuoteError = result.error;
+            // Genuinely too big for UPS to carry at all — fall back to AIT rather than a dead end.
+            if (liveQuoteError || !liveQuotes?.length) {
+              aitQuote = buildAitQuote();
+            }
           }
 
           return { estimate, isUpsEligible, upsIneligibleReasons, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote };

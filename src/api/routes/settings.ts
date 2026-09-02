@@ -568,26 +568,34 @@ async function runUpsAutoTagJob() {
         let manualReviewReason: string | null = null;
 
         const isFreightPackaging = estimate?.picked_packaging_profile?.package_type === 'freight';
+        // MultiDesk kit bundles always ship via AIT regardless of whether UPS would technically
+        // accept them — everything else tries real UPS first, and only falls back to AIT if UPS
+        // itself rejects the package (i.e. it's genuinely too big for a courier parcel/freight service).
+        const isMultidesk = Boolean(row.is_kit);
+
+        function assignAit(priceGbp: number | null): boolean {
+          if (priceGbp == null) return false;
+          preferredServiceCode = aitServiceCode;
+          preferredCostAmount = Math.round(priceGbp * (aitPercentageOfPrice / 100) * 100) / 100;
+          preferredCostCurrency = 'GBP';
+          return true;
+        }
 
         if (!hasCompleteDimensions) {
           manualReviewReason = 'Manual review required - product weight and all dimensions must be recorded before a shipping service can be assigned.';
         } else if (!hasCompletePackedDims) {
           manualReviewReason = 'Manual review required - no packaging profile could be resolved for this item\'s dimensions.';
-        } else if (isFreightPackaging) {
-          // Doesn't fit a standard Bisley carton (BOX-SMALL/MEDIUM/LARGE) — Bisley ships these via
-          // AIT today, not UPS parcel, so skip the live UPS quote entirely and use a flat percentage.
-          const priceGbp = asNumber(row.price_gbp);
-          if (priceGbp == null) {
+        } else if (isMultidesk) {
+          if (!assignAit(asNumber(row.price_gbp))) {
             manualReviewReason = 'Manual review required - no price recorded to calculate AIT percentage-based shipping cost.';
-          } else {
-            preferredServiceCode = aitServiceCode;
-            preferredCostAmount = Math.round(priceGbp * (aitPercentageOfPrice / 100) * 100) / 100;
-            preferredCostCurrency = 'GBP';
           }
         } else {
           const result = await getCachedUpsRates({ lengthMm, widthMm, heightMm, weightGrams: packageWeightGrams });
           if (result.error || !result.quotes?.length) {
-            manualReviewReason = `Manual review required - UPS rejected this package: ${result.error ?? 'no services were returned'}.`;
+            // Genuinely too big for UPS to carry at all — fall back to AIT rather than leaving it unassigned.
+            if (!assignAit(asNumber(row.price_gbp))) {
+              manualReviewReason = `Manual review required - UPS rejected this package (${result.error ?? 'no services were returned'}) and no price is recorded to fall back to AIT.`;
+            }
           } else {
             const cheapest = result.quotes.reduce((best, quote) => {
               if (quote.totalChargesAmount == null || !quote.internalServiceCode) return best;
