@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS warehouse_inventory (
   CONSTRAINT unique_location_sku_colour UNIQUE(location_id, product_sku, colour_code)
 );
 -- Fix NULL colour_code uniqueness: replace plain UNIQUE with functional COALESCE index
--- Note: runs as separate ALTER + CREATE to avoid DO $$ block (migration runner splits on ;)
+-- Note: runs as separate ALTER + CREATE to avoid a DO block, since the migration runner splits on the semicolon character
 ALTER TABLE warehouse_inventory DROP CONSTRAINT IF EXISTS unique_location_sku_colour;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_sku_loc_coalesce
   ON warehouse_inventory(location_id, product_sku, COALESCE(colour_code, ''));

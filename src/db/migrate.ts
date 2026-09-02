@@ -15,10 +15,18 @@ export async function runMigrations() {
 
     // Split schema into individual statements and execute each one
     // This avoids transaction issues with some Neon configurations
-    const statements = WAREHOUSE_SCHEMA.split(';')
+    // Strip '--' line comments first: a semicolon inside a comment (e.g. "note: splits on ;")
+    // would otherwise be mistaken for a statement terminator, silently truncating and
+    // aborting the rest of the migration run.
+    const schemaWithoutComments = WAREHOUSE_SCHEMA
+      .split('\n')
+      .map((line) => line.replace(/--.*$/, ''))
+      .join('\n');
+    const statements = schemaWithoutComments.split(';')
       .map((stmt) => stmt.trim())
       .filter((stmt) => stmt.length > 0);
 
+    let failureCount = 0;
     for (const statement of statements) {
       try {
         await client.query(statement);
@@ -27,10 +35,16 @@ export async function runMigrations() {
         if (error.code === '42P07') {
           console.log(`⚠️  Table already exists (skipping)`);
         } else {
-          console.error(`Error executing statement:`, error.message.substring(0, 100));
-          throw error;
+          // Statements are independent idempotent CREATE/ALTER/INDEX operations —
+          // one bad statement should not prevent the rest of the schema from applying.
+          failureCount++;
+          console.error(`⚠️  Statement failed (continuing):`, error.message?.substring(0, 200));
+          console.error(`   Statement was:`, statement.substring(0, 200));
         }
       }
+    }
+    if (failureCount > 0) {
+      console.error(`❌ ${failureCount} schema statement(s) failed to apply — check logs above`);
     }
 
     console.log('✓ Warehouse schema created/verified');
