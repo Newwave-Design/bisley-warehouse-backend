@@ -101,21 +101,25 @@ const STATEMENTS: string[] = [
    VALUES
     ('ups', 'UPS', 'ups_standard', 'UPS Standard', 'standard', 'parcel', 'manual', '{"max_weight_kg":70,"max_length_mm":2740,"max_girth_plus_length_mm":4000,"max_volume_litres":1200}'::jsonb, '{"ready_for_api":true,"category":"parcel"}'::jsonb, 5),
     ('ups', 'UPS', 'ups_express', 'UPS Express Saver', 'express', 'parcel', 'manual', '{"max_weight_kg":70,"max_length_mm":2740,"max_girth_plus_length_mm":4000,"max_volume_litres":1200}'::jsonb, '{"ready_for_api":true,"category":"parcel"}'::jsonb, 6),
-    ('dpd', 'DPD', 'dpd_next_day', 'DPD Next Day', 'standard', 'parcel', 'manual', '{"max_weight_kg":30,"max_length_mm":1750,"max_girth_plus_length_mm":3000,"max_volume_litres":500}'::jsonb, '{"ready_for_api":false,"category":"parcel"}'::jsonb, 30),
-    ('dhl', 'DHL Parcel UK', 'dhl_parcel_uk', 'DHL Parcel UK', 'standard', 'parcel', 'manual', '{"max_weight_kg":25,"max_length_mm":1200,"max_girth_plus_length_mm":3000,"max_volume_litres":350}'::jsonb, '{"ready_for_api":false,"category":"parcel"}'::jsonb, 40),
-    ('palletways', 'Palletways', 'palletways_economy', 'Palletways Economy', 'economy', 'pallet', 'manual', '{"required_packaging_type":"pallet","max_weight_kg":700,"max_length_mm":1200,"max_width_mm":1000,"max_height_mm":2200,"max_volume_litres":2640}'::jsonb, '{"ready_for_api":false,"category":"pallet"}'::jsonb, 60),
-    ('palletforce', 'Palletforce', 'palletforce_premium', 'Palletforce Premium', 'express', 'pallet', 'manual', '{"required_packaging_type":"pallet","max_weight_kg":700,"max_length_mm":1200,"max_width_mm":1000,"max_height_mm":2200,"max_volume_litres":2640}'::jsonb, '{"ready_for_api":false,"category":"pallet"}'::jsonb, 70),
-    ('manual', 'Manual Selection', 'manual_standard', 'Manual Standard', 'standard', 'parcel', 'manual', '{}'::jsonb, '{"ready_for_api":false}'::jsonb, 10),
-    ('manual', 'Manual Selection', 'manual_express', 'Manual Express', 'express', 'parcel', 'manual', '{}'::jsonb, '{"ready_for_api":false}'::jsonb, 20),
-    ('manual', 'Manual Selection', 'manual_pallet', 'Manual Pallet', 'economy', 'pallet', 'manual', '{}'::jsonb, '{"ready_for_api":false}'::jsonb, 80)
+    ('ups', 'UPS', 'ups_express_worldwide', 'UPS Worldwide Express', 'express', 'parcel', 'manual', '{"max_weight_kg":70,"max_length_mm":2740,"max_girth_plus_length_mm":4000,"max_volume_litres":1200}'::jsonb, '{"ready_for_api":true,"category":"parcel"}'::jsonb, 7),
+    ('ups', 'UPS', 'ups_express_plus', 'UPS Worldwide Express Plus', 'express', 'parcel', 'manual', '{"max_weight_kg":70,"max_length_mm":2740,"max_girth_plus_length_mm":4000,"max_volume_litres":1200}'::jsonb, '{"ready_for_api":false,"category":"parcel"}'::jsonb, 8),
+    ('ups', 'UPS', 'ups_expedited', 'UPS Worldwide Expedited', 'standard', 'parcel', 'manual', '{"max_weight_kg":70,"max_length_mm":2740,"max_girth_plus_length_mm":4000,"max_volume_litres":1200}'::jsonb, '{"ready_for_api":false,"category":"parcel"}'::jsonb, 9),
+    ('ups', 'UPS', 'ups_express_freight', 'UPS Worldwide Express Freight', 'express', 'freight', 'manual', '{"max_weight_kg":500,"max_length_mm":3000,"max_volume_litres":5000}'::jsonb, '{"ready_for_api":false,"category":"freight"}'::jsonb, 10)
    ON CONFLICT (service_code) DO NOTHING`,
+    `UPDATE shipping_services
+     SET is_active = false,
+       updated_at = NOW()
+     WHERE courier_code <> 'ups'`,
   `INSERT INTO packaging_profiles (code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm, max_weight_grams, tare_weight_grams, default_cost_gbp, notes)
    VALUES
     ('BOX-SMALL', 'Small Carton', 'parcel', 350, 250, 180, 10000, 250, 1.25, 'Generic small parcel carton'),
     ('BOX-MEDIUM', 'Medium Carton', 'parcel', 500, 350, 250, 18000, 450, 2.10, 'Generic medium parcel carton'),
-    ('PALLET-HALF', 'Half Pallet', 'pallet', 1200, 800, 1200, 350000, 12000, 18.00, 'For bulky mixed furniture orders'),
-    ('PALLET-FULL', 'Full Pallet', 'pallet', 1200, 1000, 1800, 700000, 18000, 24.00, 'For larger consolidated dispatches')
+    ('BOX-LARGE', 'Large Carton', 'parcel', 700, 500, 400, 30000, 900, 3.80, 'Large parcel carton for bigger items')
    ON CONFLICT (code) DO NOTHING`,
+    `UPDATE packaging_profiles
+     SET is_active = false,
+       updated_at = NOW()
+     WHERE package_type <> 'parcel'`,
   `INSERT INTO packaging_checklist_templates (code, name, checklist_items)
    VALUES
     ('STD-PARCEL', 'Standard Parcel', '["Check finish and colour","Add protection wrap","Add packing slip","Seal carton","Apply shipping label"]'::jsonb),

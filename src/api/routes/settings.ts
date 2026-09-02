@@ -7,8 +7,18 @@ import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
+import { estimateShippingForServices, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 
 const router = express.Router();
+
+function asNumber(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
 
 /** GET /api/settings/field-mappings — returns all mappings grouped by direction */
 router.get('/field-mappings', authMiddleware, async (_req: AuthRequest, res: Response) => {
@@ -239,6 +249,256 @@ router.get('/packaging-profiles', authMiddleware, async (_req: AuthRequest, res:
     }
     console.error(err);
     res.status(500).json({ error: 'Failed to load packaging profiles' });
+  }
+});
+
+router.post('/shipping-services/ups-sync', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    let upserted = 0;
+
+    for (const [idx, service] of DEFAULT_SHIPPING_SERVICES.entries()) {
+      await query(
+        `INSERT INTO shipping_services (
+           courier_code, courier_name, service_code, service_name, service_level,
+           shipment_mode, integration_type, constraints, metadata, is_active, sort_order
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, 'manual', $7::jsonb, $8::jsonb, true, $9)
+         ON CONFLICT (service_code) DO UPDATE SET
+           courier_code = EXCLUDED.courier_code,
+           courier_name = EXCLUDED.courier_name,
+           service_name = EXCLUDED.service_name,
+           service_level = EXCLUDED.service_level,
+           shipment_mode = EXCLUDED.shipment_mode,
+           constraints = EXCLUDED.constraints,
+           metadata = EXCLUDED.metadata,
+           is_active = true,
+           sort_order = EXCLUDED.sort_order,
+           updated_at = NOW()`,
+        [
+          service.courier_code,
+          service.courier_name,
+          service.service_code,
+          service.service_name,
+          service.service_level,
+          service.shipment_mode,
+          JSON.stringify(service.constraints ?? {}),
+          JSON.stringify(service.metadata ?? {}),
+          (idx + 1) * 5,
+        ]
+      );
+      upserted++;
+    }
+
+    await query(
+      `UPDATE shipping_services
+       SET is_active = false,
+           updated_at = NOW()
+       WHERE courier_code <> 'ups'`
+    );
+
+    for (const profile of DEFAULT_PACKAGING_PROFILES) {
+      await query(
+        `INSERT INTO packaging_profiles (
+           code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm,
+           max_weight_grams, tare_weight_grams, default_cost_gbp, is_active, notes
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, COALESCE($10, notes))
+         ON CONFLICT (code) DO UPDATE SET
+           name = EXCLUDED.name,
+           package_type = EXCLUDED.package_type,
+           inner_length_mm = EXCLUDED.inner_length_mm,
+           inner_width_mm = EXCLUDED.inner_width_mm,
+           inner_height_mm = EXCLUDED.inner_height_mm,
+           max_weight_grams = EXCLUDED.max_weight_grams,
+           tare_weight_grams = EXCLUDED.tare_weight_grams,
+           default_cost_gbp = EXCLUDED.default_cost_gbp,
+           is_active = true,
+           updated_at = NOW()`,
+        [
+          profile.code,
+          profile.name,
+          profile.package_type,
+          profile.inner_length_mm,
+          profile.inner_width_mm,
+          profile.inner_height_mm,
+          profile.max_weight_grams,
+          profile.tare_weight_grams,
+          profile.default_cost_gbp,
+          null,
+        ]
+      );
+    }
+
+    await query(
+      `UPDATE packaging_profiles
+       SET is_active = false,
+           updated_at = NOW()
+       WHERE package_type <> 'parcel'`
+    );
+
+    const servicesAfter = await query(
+      `SELECT service_code, is_active
+       FROM shipping_services
+       WHERE courier_code = 'ups'
+       ORDER BY sort_order ASC, service_code ASC`
+    );
+
+    res.json({
+      success: true,
+      upserted_services: upserted,
+      active_ups_services: servicesAfter.rows,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to sync UPS services' });
+  }
+});
+
+router.post('/shipping-services/ups-auto-tag-products', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    const [servicesResult, profilesResult, productsResult] = await Promise.all([
+      query(
+        `SELECT service_code, service_name, courier_code, courier_name, service_level, shipment_mode, constraints, metadata
+         FROM shipping_services
+         WHERE courier_code = 'ups' AND is_active = true
+         ORDER BY sort_order ASC, service_name ASC`
+      ),
+      query(
+        `SELECT code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm,
+                max_weight_grams, tare_weight_grams, default_cost_gbp
+         FROM packaging_profiles
+         WHERE package_type = 'parcel' AND is_active = true
+         ORDER BY inner_length_mm ASC, inner_width_mm ASC, inner_height_mm ASC`
+      ),
+      query(
+        `SELECT variant_sku, variant_title, colour_name,
+                COALESCE(variant_weight_grams, weight_grams) AS weight_grams,
+                COALESCE(variant_depth_mm, depth_mm) AS depth_mm,
+                COALESCE(variant_width_mm, width_mm) AS width_mm,
+                COALESCE(variant_height_mm, height_mm) AS height_mm
+         FROM wms_products
+         WHERE variant_sku IS NOT NULL AND variant_sku <> ''`
+      ),
+    ]);
+
+    const services: ShippingService[] = servicesResult.rows.map((row: any) => ({
+      service_code: row.service_code,
+      service_name: row.service_name,
+      courier_code: row.courier_code,
+      courier_name: row.courier_name,
+      service_level: row.service_level,
+      shipment_mode: row.shipment_mode,
+      constraints: row.constraints ?? {},
+      metadata: row.metadata ?? {},
+    }));
+
+    const profiles: PackagingProfile[] = profilesResult.rows.map((row: any) => ({
+      code: row.code,
+      name: row.name,
+      package_type: row.package_type,
+      inner_length_mm: row.inner_length_mm,
+      inner_width_mm: row.inner_width_mm,
+      inner_height_mm: row.inner_height_mm,
+      max_weight_grams: row.max_weight_grams,
+      tare_weight_grams: row.tare_weight_grams,
+      default_cost_gbp: row.default_cost_gbp,
+    }));
+
+    if (!services.length) {
+      return res.status(400).json({ error: 'No active UPS shipping services found' });
+    }
+
+    if (!profiles.length) {
+      return res.status(400).json({ error: 'No active parcel packaging profiles found' });
+    }
+
+    let tagged = 0;
+    let manualReview = 0;
+    let noEligible = 0;
+    let missingDims = 0;
+
+    for (const row of productsResult.rows as any[]) {
+      const dims = {
+        weight_grams: asNumber(row.weight_grams),
+        length_mm: asNumber(row.depth_mm),
+        width_mm: asNumber(row.width_mm),
+        height_mm: asNumber(row.height_mm),
+      };
+
+      if (!dims.length_mm || !dims.width_mm || !dims.height_mm || !dims.weight_grams) {
+        missingDims++;
+      }
+
+      const estimate = estimateShippingForServices({
+        dims,
+        services,
+        packagingProfiles: profiles,
+        packagingPaddingMinMm: 15,
+        packagingPaddingMaxMm: 20,
+      });
+
+      const preferred = estimate.estimates.find(s => s.eligible) ?? null;
+      const needsManual = !preferred || preferred.shipment_mode !== 'parcel' || !estimate.picked_packaging_profile;
+
+      if (!preferred) noEligible++;
+      if (needsManual) manualReview++;
+
+      await query(
+        `INSERT INTO product_fulfillment_profiles (
+           product_sku,
+           packaging_profile_code,
+           checklist_template_code,
+           preferred_service_code,
+           requires_manual_review,
+           is_fragile,
+           is_multi_box,
+           fulfilment_tags,
+           pack_instructions,
+           updated_at
+         )
+         VALUES ($1, $2, 'STD-PARCEL', $3, $4, false, false, $5::jsonb, $6, NOW())
+         ON CONFLICT (product_sku) DO UPDATE SET
+           packaging_profile_code = EXCLUDED.packaging_profile_code,
+           checklist_template_code = EXCLUDED.checklist_template_code,
+           preferred_service_code = EXCLUDED.preferred_service_code,
+           requires_manual_review = EXCLUDED.requires_manual_review,
+           fulfilment_tags = EXCLUDED.fulfilment_tags,
+           pack_instructions = EXCLUDED.pack_instructions,
+           updated_at = NOW()`,
+        [
+          row.variant_sku,
+          estimate.picked_packaging_profile?.code ?? null,
+          preferred?.service_code ?? null,
+          needsManual,
+          JSON.stringify(needsManual ? ['ups-manual-review'] : ['ups-auto-tagged']),
+          needsManual
+            ? 'Manual review required - no eligible UPS parcel service or packaging profile found.'
+            : 'Auto-tagged by UPS estimator using packed dimensions (+15 to +20 mm).',
+        ]
+      );
+
+      tagged++;
+    }
+
+    const sample = await query(
+      `SELECT product_sku, packaging_profile_code, preferred_service_code, requires_manual_review
+       FROM product_fulfillment_profiles
+       WHERE preferred_service_code IS NOT NULL
+       ORDER BY updated_at DESC
+       LIMIT 10`
+    );
+
+    res.json({
+      success: true,
+      tagged,
+      manual_review_count: manualReview,
+      no_eligible_count: noEligible,
+      missing_dimension_count: missingDims,
+      sample: sample.rows,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to auto-tag products with UPS options' });
   }
 });
 

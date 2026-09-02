@@ -38,6 +38,10 @@ let tokenCache: UpsToken | null = null
 const UPS_SERVICE_CODE_MAP: Record<string, string> = {
   ups_standard: '11',
   ups_express: '65',
+  ups_express_worldwide: '07',
+  ups_express_plus: '54',
+  ups_expedited: '08',
+  ups_express_freight: '96',
 }
 
 function requireEnv(name: string): string {
