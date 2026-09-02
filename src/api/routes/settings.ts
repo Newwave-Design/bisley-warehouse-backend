@@ -376,8 +376,24 @@ router.post('/shipping-services/ups-sync', authMiddleware, requireRole(['MANAGER
   }
 });
 
-router.post('/shipping-services/ups-auto-tag-products', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
+interface AutoTagState {
+  running: boolean;
+  started_at: Date | null;
+  finished_at: Date | null;
+  progress: string;
+  result: Record<string, any> | null;
+  error: string | null;
+}
+const autoTagState: AutoTagState = {
+  running: false, started_at: null, finished_at: null,
+  progress: 'idle', result: null, error: null,
+};
+
+// Runs as a background job (not awaited by the route) — thousands of sequential per-SKU
+// upserts exceed Railway's proxy timeout if run inline within a single HTTP request.
+async function runUpsAutoTagJob() {
   try {
+    autoTagState.progress = 'Loading services, packaging profiles and products…';
     const [servicesResult, profilesResult, productsResult] = await Promise.all([
       query(
         `SELECT service_code, service_name, courier_code, courier_name, service_level, shipment_mode, constraints, metadata
@@ -426,20 +442,18 @@ router.post('/shipping-services/ups-auto-tag-products', authMiddleware, requireR
       default_cost_gbp: row.default_cost_gbp,
     }));
 
-    if (!services.length) {
-      return res.status(400).json({ error: 'No active UPS shipping services found' });
-    }
-
-    if (!profiles.length) {
-      return res.status(400).json({ error: 'No active UPS packaging profiles found' });
-    }
+    if (!services.length) throw new Error('No active UPS shipping services found');
+    if (!profiles.length) throw new Error('No active UPS packaging profiles found');
 
     let tagged = 0;
     let manualReview = 0;
     let noEligible = 0;
     let missingDims = 0;
+    const total = productsResult.rows.length;
 
-    for (const row of productsResult.rows as any[]) {
+    for (const [idx, row] of (productsResult.rows as any[]).entries()) {
+      if (idx % 200 === 0) autoTagState.progress = `Tagging ${idx}/${total} SKUs…`;
+
       const dims = {
         weight_grams: asNumber(row.weight_grams),
         length_mm: asNumber(row.depth_mm),
@@ -507,7 +521,7 @@ router.post('/shipping-services/ups-auto-tag-products', authMiddleware, requireR
               ? 'Manual review required - UPS freight handling and pricing must be confirmed before dispatch.'
               : needsManual
                 ? 'Manual review required - no eligible UPS service or packaging profile found.'
-            : 'Auto-tagged by UPS estimator using packed dimensions (+15 to +20 mm).',
+              : 'Auto-tagged by UPS estimator using packed dimensions (+15 to +20 mm).',
         ]
       );
 
@@ -522,18 +536,56 @@ router.post('/shipping-services/ups-auto-tag-products', authMiddleware, requireR
        LIMIT 10`
     );
 
-    res.json({
+    autoTagState.result = {
       success: true,
       tagged,
       manual_review_count: manualReview,
       no_eligible_count: noEligible,
       missing_dimension_count: missingDims,
       sample: sample.rows,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to auto-tag products with UPS options' });
+    };
+    autoTagState.error = null;
+  } catch (err: any) {
+    console.error('UPS auto-tag job error:', err);
+    autoTagState.error = err.message || 'Failed to auto-tag products with UPS options';
+  } finally {
+    autoTagState.running = false;
+    autoTagState.finished_at = new Date();
+    autoTagState.progress = autoTagState.error ? 'failed' : 'complete';
   }
+}
+
+/** POST /api/settings/shipping-services/ups-auto-tag-products — starts the auto-tag job in the background; poll ups-auto-tag-status. */
+router.post('/shipping-services/ups-auto-tag-products', authMiddleware, requireRole(['MANAGER','ADMIN']), (_req: AuthRequest, res: Response) => {
+  if (autoTagState.running) {
+    return res.status(409).json({
+      error: 'Auto-tag job already in progress',
+      progress: autoTagState.progress,
+      started_at: autoTagState.started_at,
+    });
+  }
+  autoTagState.running = true;
+  autoTagState.started_at = new Date();
+  autoTagState.finished_at = null;
+  autoTagState.result = null;
+  autoTagState.error = null;
+  autoTagState.progress = 'Starting…';
+
+  res.json({ status: 'started', message: 'Auto-tag running in background. Poll GET /api/settings/shipping-services/ups-auto-tag-status' });
+
+  runUpsAutoTagJob();
+});
+
+/** GET /api/settings/shipping-services/ups-auto-tag-status — poll this after triggering the auto-tag job. */
+router.get('/shipping-services/ups-auto-tag-status', authMiddleware, requireRole(['MANAGER','ADMIN']), (_req: AuthRequest, res: Response) => {
+  res.json({
+    running: autoTagState.running,
+    progress: autoTagState.progress,
+    started_at: autoTagState.started_at,
+    finished_at: autoTagState.finished_at,
+    result: autoTagState.result,
+    error: autoTagState.error,
+  });
 });
 
 export default router;
