@@ -46,7 +46,7 @@ async function fetchMedusaInventory(forceRefresh = false): Promise<Map<string, n
   let offset = 0;
   while (true) {
     const res = await fetch(
-      `${MEDUSA_URL}/admin/inventory-items?limit=100&offset=${offset}&fields=id,sku,location_levels.available_quantity,location_levels.location_id`,
+      `${MEDUSA_URL}/admin/inventory-items?limit=100&offset=${offset}&fields=id,sku,*location_levels`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
     const data = await res.json() as any;
@@ -65,7 +65,7 @@ async function fetchMedusaInventory(forceRefresh = false): Promise<Map<string, n
 async function getMedusaItemInfo(sku: string): Promise<{ itemId: string; locationId: string } | null> {
   const token = await getMedusaToken();
   const res = await fetch(
-    `${MEDUSA_URL}/admin/inventory-items?sku=${encodeURIComponent(sku)}&fields=id,sku,location_levels.id,location_levels.location_id`,
+    `${MEDUSA_URL}/admin/inventory-items?sku=${encodeURIComponent(sku)}&fields=id,sku,*location_levels`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
   const data = await res.json() as any;

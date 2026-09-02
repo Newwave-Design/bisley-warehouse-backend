@@ -72,7 +72,7 @@ async function fetchAllProductsFromMedusa(forceRefresh = false): Promise<WmsProd
   while (true) {
     const d = await fetch(
       `${MEDUSA_URL}/admin/inventory-items?limit=100&offset=${invOff}` +
-      `&fields=id,sku,location_levels.available_quantity,location_levels.location_id`,
+      `&fields=id,sku,*location_levels`,
       { headers: auth }
     ).then(r => r.json()) as any;
     for (const item of d.inventory_items ?? []) {
