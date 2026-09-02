@@ -200,7 +200,7 @@ router.post('/seed-from-medusa', authMiddleware, async (req: AuthRequest, res: R
       await query(`
         INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, created_at, updated_at)
         VALUES ($1, $2, '', $3, NOW(), NOW())
-        ON CONFLICT (location_id, product_sku, colour_code)
+        ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
         DO UPDATE SET quantity = $3, updated_at = NOW()
       `, [locationId, sku, qty]);
       imported++;

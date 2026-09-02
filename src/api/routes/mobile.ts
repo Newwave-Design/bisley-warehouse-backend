@@ -160,7 +160,7 @@ router.post('/move', authMiddleware, async (req: AuthRequest, res: Response) => 
     await query(`
       INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity)
       VALUES ($1, $2, $3, $4)
-      ON CONFLICT (location_id, product_sku, colour_code)
+      ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
       DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
     `, [toId, sku, colour_code ?? null, quantity]);
 

@@ -168,7 +168,7 @@ router.post('/queue/:id/stock', authMiddleware, async (req: AuthRequest, res: Re
     await query(`
       INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, created_at, updated_at)
       VALUES ($1, $2, $3, $4, NOW(), NOW())
-      ON CONFLICT (location_id, product_sku, colour_code)
+      ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
       DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
     `, [location_id, medusa_sku || nw_code, colour || '', quantity]);
 
@@ -207,7 +207,7 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
       await query(`
         INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, created_at, updated_at)
         VALUES ($1, $2, $3, $4, NOW(), NOW())
-        ON CONFLICT (location_id, product_sku, colour_code)
+        ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
         DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
       `, [item.location_id, item.medusa_sku || item.nw_code, item.colour || '', item.quantity]);
 
