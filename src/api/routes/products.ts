@@ -507,7 +507,8 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
               COALESCE(variant_weight_grams, weight_grams) AS weight_grams,
               COALESCE(variant_depth_mm, depth_mm) AS depth_mm,
               COALESCE(variant_width_mm, width_mm) AS width_mm,
-              COALESCE(variant_height_mm, height_mm) AS height_mm
+              COALESCE(variant_height_mm, height_mm) AS height_mm,
+              price_gbp
        FROM wms_products
        WHERE medusa_product_id = $1 OR product_handle = $1
        ORDER BY variant_sku`,
@@ -557,6 +558,22 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
     let packagingProfiles: PackagingProfile[] = [];
     const fulfilmentBySku = new Map<string, FulfillmentProfileRow>();
     let dataSource: 'database' | 'fallback' = 'database';
+    let aitServiceCode = 'ait_freight';
+    let aitServiceName = 'AIT Freight (Oversized / Non-Parcel)';
+    let aitPercentageOfPrice = 10;
+
+    try {
+      const aitResult = await query(
+        `SELECT service_code, service_name, metadata FROM shipping_services WHERE service_code = 'ait_freight' AND is_active = true LIMIT 1`
+      );
+      if (aitResult.rows[0]) {
+        aitServiceCode = aitResult.rows[0].service_code;
+        aitServiceName = aitResult.rows[0].service_name;
+        aitPercentageOfPrice = asNumber(aitResult.rows[0].metadata?.percentage_of_price) ?? 10;
+      }
+    } catch (err) {
+      if (!isMissingRelationError(err)) throw err;
+    }
 
     try {
       const [servicesResult, profilesResult, fulfilmentResult] = await Promise.all([
@@ -653,12 +670,25 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
       const widthMm = packed.used_width_mm ?? 0;
       const heightMm = packed.used_height_mm ?? 0;
       const hasCompletePackedDims = lengthMm > 0 && widthMm > 0 && heightMm > 0 && estimate.package_weight_grams > 0;
+      const isFreightPackaging = estimate.picked_packaging_profile?.package_type === 'freight';
 
       let liveQuotes: UpsRateQuote[] | null = null;
       let liveQuoteError: string | null = null;
       let liveQuoteConfigRequired = false;
+      let aitQuote: { service_code: string; service_name: string; percentage_of_price: number; price_gbp: number | null; estimated_cost_gbp: number | null } | null = null;
 
-      if (!upsReferenceDestinationConfigured()) {
+      if (isFreightPackaging) {
+        // Doesn't fit a standard Bisley carton — Bisley ships these via AIT today, not UPS parcel,
+        // so skip the live UPS Rating API call entirely and use a flat percentage-of-price quote.
+        const priceGbp = asNumber(row.price_gbp);
+        aitQuote = {
+          service_code: aitServiceCode,
+          service_name: aitServiceName,
+          percentage_of_price: aitPercentageOfPrice,
+          price_gbp: priceGbp,
+          estimated_cost_gbp: priceGbp != null ? Math.round(priceGbp * (aitPercentageOfPrice / 100) * 100) / 100 : null,
+        };
+      } else if (!upsReferenceDestinationConfigured()) {
         liveQuoteConfigRequired = true;
         liveQuoteError = 'Live UPS rates are not configured. Set UPS_REFERENCE_DESTINATION_* env vars on the backend.';
       } else if (!hasCompletePackedDims) {
@@ -708,6 +738,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
         ups_live_quotes: liveQuotes,
         ups_live_quote_error: liveQuoteError,
         ups_live_quote_configuration_required: liveQuoteConfigRequired,
+        ait_quote: aitQuote,
       };
     }));
 

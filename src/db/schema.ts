@@ -397,7 +397,8 @@ VALUES
   ('dx', 'DX Freight', 'dx_freight_two_man', 'DX Freight Two-Man', 'standard', 'freight', 'manual', '{"oversized": true}'::jsonb, '{"ready_for_api": false, "category": "freight"}'::jsonb, 50),
   ('palletways', 'Palletways', 'palletways_economy', 'Palletways Economy', 'economy', 'pallet', 'manual', '{"pallet_required": true}'::jsonb, '{"ready_for_api": false, "category": "pallet"}'::jsonb, 60),
   ('palletforce', 'Palletforce', 'palletforce_premium', 'Palletforce Premium', 'express', 'pallet', 'manual', '{"pallet_required": true}'::jsonb, '{"ready_for_api": false, "category": "pallet"}'::jsonb, 70),
-  ('manual', 'Manual Selection', 'manual_pallet', 'Manual Pallet', 'economy', 'pallet', 'manual', '{}'::jsonb, '{"ready_for_api": false}'::jsonb, 80)
+  ('manual', 'Manual Selection', 'manual_pallet', 'Manual Pallet', 'economy', 'pallet', 'manual', '{}'::jsonb, '{"ready_for_api": false}'::jsonb, 80),
+  ('ait', 'AIT', 'ait_freight', 'AIT Freight (Oversized / Non-Parcel)', 'standard', 'freight', 'percentage', '{"required_packaging_type": "freight"}'::jsonb, '{"ready_for_api": false, "category": "freight", "percentage_of_price": 10}'::jsonb, 45)
 ON CONFLICT (service_code) DO NOTHING;
 
 -- Default size/weight/volume rules used by the shipping estimator.

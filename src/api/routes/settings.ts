@@ -105,7 +105,7 @@ router.get('/shipping-services', authMiddleware, requireRole(['MANAGER','ADMIN']
               shipment_mode, integration_type, constraints, metadata, is_active, sort_order,
               created_at, updated_at
        FROM shipping_services
-       WHERE courier_code = 'ups'
+       WHERE courier_code IN ('ups', 'ait')
        ORDER BY sort_order ASC, courier_name ASC, service_name ASC`
     );
     res.json({ shipping_services: result.rows });
@@ -317,7 +317,7 @@ router.post('/shipping-services/ups-sync', authMiddleware, requireRole(['MANAGER
       `UPDATE shipping_services
        SET is_active = false,
            updated_at = NOW()
-       WHERE courier_code <> 'ups'`
+       WHERE courier_code NOT IN ('ups', 'ait')`
     );
 
     for (const profile of DEFAULT_PACKAGING_PROFILES) {
@@ -365,7 +365,7 @@ router.post('/shipping-services/ups-sync', authMiddleware, requireRole(['MANAGER
     const servicesAfter = await query(
       `SELECT service_code, is_active
        FROM shipping_services
-       WHERE courier_code = 'ups'
+       WHERE courier_code IN ('ups', 'ait')
        ORDER BY sort_order ASC, service_code ASC`
     );
 
@@ -398,7 +398,7 @@ const autoTagState: AutoTagState = {
 async function runUpsAutoTagJob() {
   try {
     autoTagState.progress = 'Loading services, packaging profiles and products…';
-    const [servicesResult, profilesResult, productsResult] = await Promise.all([
+    const [servicesResult, profilesResult, productsResult, aitServiceResult] = await Promise.all([
       query(
         `SELECT service_code, service_name, courier_code, courier_name, service_level, shipment_mode, constraints, metadata
          FROM shipping_services
@@ -417,11 +417,21 @@ async function runUpsAutoTagJob() {
                 COALESCE(variant_weight_grams, weight_grams) AS weight_grams,
                 COALESCE(variant_depth_mm, depth_mm) AS depth_mm,
                 COALESCE(variant_width_mm, width_mm) AS width_mm,
-                COALESCE(variant_height_mm, height_mm) AS height_mm
+                COALESCE(variant_height_mm, height_mm) AS height_mm,
+                price_gbp
          FROM wms_products
          WHERE variant_sku IS NOT NULL AND variant_sku <> ''`
       ),
+      query(
+        `SELECT service_code, metadata FROM shipping_services WHERE service_code = 'ait_freight' AND is_active = true LIMIT 1`
+      ),
     ]);
+
+    // AIT is Bisley's real current shipping operation for anything that doesn't fit a standard
+    // carton — a flat percentage-of-price cost estimate, not a live-quoted courier. Percentage is
+    // configurable via the shipping-services settings UI (falls back to 10% if not set up yet).
+    const aitServiceCode = aitServiceResult.rows[0]?.service_code ?? 'ait_freight';
+    const aitPercentageOfPrice = asNumber(aitServiceResult.rows[0]?.metadata?.percentage_of_price) ?? 10;
 
     // Kit variants (e.g. MultiDesk) have no dims of their own — batch-load every component
     // SKU's dims once so kit dimensions can be computed as stacked-in-a-box totals.
@@ -534,10 +544,23 @@ async function runUpsAutoTagJob() {
       let preferredCostCurrency: string | null = null;
       let manualReviewReason: string | null = null;
 
+      const isFreightPackaging = estimate?.picked_packaging_profile?.package_type === 'freight';
+
       if (!hasCompleteDimensions) {
-        manualReviewReason = 'Manual review required - product weight and all dimensions must be recorded before UPS service assignment.';
+        manualReviewReason = 'Manual review required - product weight and all dimensions must be recorded before a shipping service can be assigned.';
       } else if (!hasCompletePackedDims) {
         manualReviewReason = 'Manual review required - no packaging profile could be resolved for this item\'s dimensions.';
+      } else if (isFreightPackaging) {
+        // Doesn't fit a standard Bisley carton (BOX-SMALL/MEDIUM/LARGE) — Bisley ships these via
+        // AIT today, not UPS parcel, so skip the live UPS quote entirely and use a flat percentage.
+        const priceGbp = asNumber(row.price_gbp);
+        if (priceGbp == null) {
+          manualReviewReason = 'Manual review required - no price recorded to calculate AIT percentage-based shipping cost.';
+        } else {
+          preferredServiceCode = aitServiceCode;
+          preferredCostAmount = Math.round(priceGbp * (aitPercentageOfPrice / 100) * 100) / 100;
+          preferredCostCurrency = 'GBP';
+        }
       } else {
         const result = await getCachedUpsRates({ lengthMm, widthMm, heightMm, weightGrams: packageWeightGrams });
         if (result.error || !result.quotes?.length) {
@@ -560,8 +583,6 @@ async function runUpsAutoTagJob() {
       if (!preferredServiceCode) noEligible++;
       const needsManual = Boolean(manualReviewReason);
       if (needsManual) manualReview++;
-
-      const isFreightPackaging = estimate?.picked_packaging_profile?.package_type === 'freight';
 
       await query(
         `INSERT INTO product_fulfillment_profiles (
@@ -597,7 +618,9 @@ async function runUpsAutoTagJob() {
           preferredServiceCode,
           needsManual,
           JSON.stringify(needsManual ? ['ups-manual-review'] : ['ups-auto-tagged']),
-          manualReviewReason ?? 'Auto-tagged using a live UPS Rating API quote for packed dimensions (+140 mm).',
+          manualReviewReason ?? (preferredServiceCode === aitServiceCode
+            ? `Auto-tagged for AIT freight shipping - flat ${aitPercentageOfPrice}% of item price.`
+            : 'Auto-tagged using a live UPS Rating API quote for packed dimensions (+140 mm).'),
           preferredCostAmount,
           preferredCostCurrency,
         ]

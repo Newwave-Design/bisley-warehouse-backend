@@ -61,6 +61,19 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     constraints: { required_packaging_type: 'freight', max_weight_kg: 500, max_length_mm: 3000, max_volume_litres: 5000 },
     metadata: { ready_for_api: false, category: 'freight' },
   },
+  {
+    // Bisley's real current shipping operation for anything that doesn't fit a standard
+    // carton (BOX-SMALL/MEDIUM/LARGE) — not a live-quoted courier, a flat percentage-of-price
+    // cost estimate. percentage_of_price is editable via the shipping-services settings UI.
+    courier_code: 'ait',
+    courier_name: 'AIT',
+    service_code: 'ait_freight',
+    service_name: 'AIT Freight (Oversized / Non-Parcel)',
+    service_level: 'standard',
+    shipment_mode: 'freight',
+    constraints: { required_packaging_type: 'freight' },
+    metadata: { ready_for_api: false, category: 'freight', integration_type: 'percentage', percentage_of_price: 10 },
+  },
 ];
 
 export const DEFAULT_PACKAGING_PROFILES: PackagingProfile[] = [
