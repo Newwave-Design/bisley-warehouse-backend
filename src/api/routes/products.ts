@@ -561,6 +561,10 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
     let aitServiceCode = 'ait_freight';
     let aitServiceName = 'AIT Freight (Oversized / Non-Parcel)';
     let aitPercentageOfPrice = 10;
+    // UPS's real large-parcel allowance already lets a package go oversized with surcharges (up to
+    // its published limits) — that's fine and reflected automatically in the live quote price. But
+    // if the resulting cost isn't worth it relative to the item's price, use AIT instead.
+    const MAX_UPS_COST_PERCENT_OF_PRICE = 12;
 
     try {
       const aitResult = await query(
@@ -744,6 +748,21 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
             // Genuinely too big for UPS parcel — fall back to AIT rather than a dead end.
             if (liveQuoteError || !liveQuotes?.length) {
               aitQuote = buildAitQuote();
+            } else {
+              // UPS would carry it (with surcharges, up to its published limits) but if the
+              // cheapest quote costs more than 12% of the item's price, it's not worth it — use
+              // AIT instead even though UPS technically accepted the package.
+              const priceGbp = asNumber(row.price_gbp);
+              const cheapest = liveQuotes.reduce((best, quote) => {
+                if (quote.totalChargesAmount == null) return best;
+                if (!best || (best.totalChargesAmount ?? Infinity) > quote.totalChargesAmount) return quote;
+                return best;
+              }, null as (typeof liveQuotes)[number] | null);
+              const tooExpensiveForUps = priceGbp != null && cheapest?.totalChargesAmount != null
+                && cheapest.totalChargesAmount > priceGbp * (MAX_UPS_COST_PERCENT_OF_PRICE / 100);
+              if (tooExpensiveForUps) {
+                aitQuote = buildAitQuote();
+              }
             }
           }
 

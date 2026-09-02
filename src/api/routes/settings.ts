@@ -432,6 +432,11 @@ async function runUpsAutoTagJob() {
     // configurable via the shipping-services settings UI (falls back to 10% if not set up yet).
     const aitServiceCode = aitServiceResult.rows[0]?.service_code ?? 'ait_freight';
     const aitPercentageOfPrice = asNumber(aitServiceResult.rows[0]?.metadata?.percentage_of_price) ?? 10;
+    // UPS's real large-parcel allowance already lets a package go oversized with surcharges (up to
+    // its published limits, encoded in the ups_standard/ups_express constraints) — that's fine and
+    // is reflected automatically in the live quote price. But if the resulting cost isn't worth it
+    // relative to the item's price, use AIT instead even though UPS would technically carry it.
+    const MAX_UPS_COST_PERCENT_OF_PRICE = 12;
 
     // Kit variants (e.g. MultiDesk) have no dims of their own — batch-load every component
     // SKU's dims once so kit dimensions can be computed as stacked-in-a-box totals.
@@ -609,11 +614,22 @@ async function runUpsAutoTagJob() {
               if (!best || (best.totalChargesAmount ?? Infinity) > quote.totalChargesAmount) return quote;
               return best;
             }, null as (typeof parcelQuotes)[number] | null);
-            preferredServiceCode = cheapest?.internalServiceCode ?? null;
-            preferredCostAmount = cheapest?.totalChargesAmount ?? null;
-            preferredCostCurrency = cheapest?.totalChargesCurrency ?? null;
-            if (!preferredServiceCode) {
+
+            if (!cheapest?.internalServiceCode) {
               manualReviewReason = 'Manual review required - UPS returned quotes but none matched a configured internal service code.';
+            } else {
+              const priceGbp = asNumber(row.price_gbp);
+              const tooExpensiveForUps = priceGbp != null && cheapest.totalChargesAmount != null
+                && cheapest.totalChargesAmount > priceGbp * (MAX_UPS_COST_PERCENT_OF_PRICE / 100);
+              if (tooExpensiveForUps) {
+                // UPS would carry it (with surcharges) but it costs more than 12% of the item's
+                // price — not worth it, use AIT instead even though UPS technically accepted it.
+                assignAit(priceGbp);
+              } else {
+                preferredServiceCode = cheapest.internalServiceCode;
+                preferredCostAmount = cheapest.totalChargesAmount ?? null;
+                preferredCostCurrency = cheapest.totalChargesCurrency ?? null;
+              }
             }
           }
         }
