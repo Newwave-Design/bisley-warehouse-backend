@@ -252,6 +252,26 @@ router.get('/packaging-profiles', authMiddleware, requireRole(['MANAGER','ADMIN'
   }
 });
 
+/** GET /api/settings/product-fulfillment-map — per-SKU real assigned service (or none), for grouping the product catalogue by actual courier option. */
+router.get('/product-fulfillment-map', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT DISTINCT wp.variant_sku AS sku,
+              pfp.preferred_service_code,
+              pfp.requires_manual_review,
+              pfp.packaging_profile_code
+       FROM wms_products wp
+       LEFT JOIN product_fulfillment_profiles pfp ON pfp.product_sku = wp.variant_sku
+       WHERE wp.variant_sku IS NOT NULL AND wp.variant_sku <> ''`
+    );
+    res.json({ items: result.rows });
+  } catch (err) {
+    if (isMissingRelationError(err)) return res.json({ items: [] });
+    console.error(err);
+    res.status(500).json({ error: 'Failed to load product fulfilment map' });
+  }
+});
+
 router.post('/shipping-services/ups-sync', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
   try {
     let upserted = 0;

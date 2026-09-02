@@ -544,13 +544,33 @@ router.get('/sync/status', authMiddleware, (_req: AuthRequest, res: Response) =>
 });
 
 // ── GET /api/products/:id/shipping-estimates ─────────────────────────────────
+// Reads dimensions/weight from the local wms_products cache (Neon) — no live Medusa login required.
 router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const products = await fetchAllProductsFromMedusa();
-    const product = products.find(p => p.id === req.params.id || p.handle === req.params.id);
-    if (!product) return res.status(404).json({ error: 'Product not found' });
+    const productRows = await query(
+      `SELECT medusa_product_id, product_title, product_handle,
+              medusa_variant_id, variant_sku, variant_title, colour_name,
+              COALESCE(variant_weight_grams, weight_grams) AS weight_grams,
+              COALESCE(variant_depth_mm, depth_mm) AS depth_mm,
+              COALESCE(variant_width_mm, width_mm) AS width_mm,
+              COALESCE(variant_height_mm, height_mm) AS height_mm
+       FROM wms_products
+       WHERE medusa_product_id = $1 OR product_handle = $1
+       ORDER BY variant_sku`,
+      [req.params.id]
+    );
+    if (!productRows.rows.length) {
+      return res.status(404).json({ error: 'Product not found in WMS cache. Run a product sync first.' });
+    }
 
-    const skuList = product.variants.map(v => v.sku).filter(Boolean);
+    const product = {
+      id: productRows.rows[0].medusa_product_id,
+      handle: productRows.rows[0].product_handle,
+      title: productRows.rows[0].product_title,
+    };
+    const variantRows = productRows.rows;
+
+    const skuList = variantRows.map((v: any) => v.variant_sku).filter(Boolean);
 
     let services: ShippingService[] = [];
     let packagingProfiles: PackagingProfile[] = [];
@@ -618,13 +638,13 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
       packagingProfiles = DEFAULT_PACKAGING_PROFILES.filter(p => p.package_type === 'parcel' || p.package_type === 'freight');
     }
 
-    const variants = await Promise.all(product.variants.map(async (variant) => {
-      const profile = fulfilmentBySku.get(variant.sku);
+    const variants = await Promise.all(variantRows.map(async (row: any) => {
+      const profile = fulfilmentBySku.get(row.variant_sku);
       const dims = {
-        weight_grams: asNumber(variant.weight_grams) ?? asNumber(product.weight_grams),
-        length_mm: asNumber(variant.depth_mm) ?? asNumber(product.depth_mm),
-        width_mm: asNumber(variant.width_mm) ?? asNumber(product.width_mm),
-        height_mm: asNumber(variant.height_mm) ?? asNumber(product.height_mm),
+        weight_grams: asNumber(row.weight_grams),
+        length_mm: asNumber(row.depth_mm),
+        width_mm: asNumber(row.width_mm),
+        height_mm: asNumber(row.height_mm),
       };
 
       const estimate = estimateShippingForServices({
@@ -662,10 +682,10 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
       }
 
       return {
-        variant_id: variant.id,
-        sku: variant.sku,
-        variant_title: variant.title,
-        colour_name: variant.colour_name,
+        variant_id: row.medusa_variant_id,
+        sku: row.variant_sku,
+        variant_title: row.variant_title,
+        colour_name: row.colour_name,
         raw_dimensions_mm: {
           length: dims.length_mm,
           width: dims.width_mm,
