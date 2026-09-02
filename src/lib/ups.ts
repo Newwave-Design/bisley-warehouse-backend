@@ -381,10 +381,12 @@ export async function getUpsRates(input: UpsRateRequestInput): Promise<UpsRateQu
     }
     const ratedPackagesRaw = rated.RatedPackage
     const ratedPackages = Array.isArray(ratedPackagesRaw) ? ratedPackagesRaw : ratedPackagesRaw ? [ratedPackagesRaw] : []
-    const itemizedCharges = [
-      ...parseItemized(rated),
-      ...ratedPackages.flatMap((p: any) => parseItemized(p)),
-    ]
+    // For a single-package shipment, UPS repeats the same charges at shipment and package
+    // level — prefer the per-package breakdown (the true source) and only fall back to the
+    // shipment-level list when no package-level detail is present, to avoid double-counting.
+    const itemizedCharges = ratedPackages.length
+      ? ratedPackages.flatMap((p: any) => parseItemized(p))
+      : parseItemized(rated)
 
     return {
       upsServiceCode,
