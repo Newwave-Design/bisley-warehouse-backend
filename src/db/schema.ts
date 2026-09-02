@@ -236,6 +236,7 @@ CREATE TABLE IF NOT EXISTS pick_lists (
   picked_by UUID REFERENCES warehouse_locations(id),
   packing_notes TEXT,
   notes TEXT,
+  is_sandbox BOOLEAN NOT NULL DEFAULT false,
   updated_at TIMESTAMP DEFAULT NOW()
 );
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS customer_name VARCHAR(255);
@@ -253,6 +254,7 @@ ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS packed_at TIMESTAMP;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS label_printed_at TIMESTAMP;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMP;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS packing_notes TEXT;
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_sandbox BOOLEAN NOT NULL DEFAULT false;
 
 -- ================================================================================
 -- PICK LIST ITEMS (Individual line items in a pick list)
@@ -269,10 +271,12 @@ CREATE TABLE IF NOT EXISTS pick_list_items (
   status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
   -- Statuses: PENDING, PICKING, PICKED, SHORT
   notes TEXT,
+  is_sandbox BOOLEAN NOT NULL DEFAULT false,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   CONSTRAINT unique_line_per_picklist UNIQUE(pick_list_id, line_number)
 );
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS is_sandbox BOOLEAN NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS pick_list_packages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -388,6 +392,27 @@ VALUES
   ('palletforce', 'Palletforce', 'palletforce_premium', 'Palletforce Premium', 'express', 'pallet', 'manual', '{"pallet_required": true}'::jsonb, '{"ready_for_api": false, "category": "pallet"}'::jsonb, 70),
   ('manual', 'Manual Selection', 'manual_pallet', 'Manual Pallet', 'economy', 'pallet', 'manual', '{}'::jsonb, '{"ready_for_api": false}'::jsonb, 80)
 ON CONFLICT (service_code) DO NOTHING;
+
+-- Default size/weight/volume rules used by the shipping estimator.
+UPDATE shipping_services
+SET constraints = constraints || '{"max_weight_kg":70,"max_length_mm":2740,"max_girth_plus_length_mm":4000,"max_volume_litres":1200}'::jsonb
+WHERE service_code IN ('ups_standard', 'ups_express');
+
+UPDATE shipping_services
+SET constraints = constraints || '{"max_weight_kg":30,"max_length_mm":1750,"max_girth_plus_length_mm":3000,"max_volume_litres":500}'::jsonb
+WHERE service_code = 'dpd_next_day';
+
+UPDATE shipping_services
+SET constraints = constraints || '{"max_weight_kg":25,"max_length_mm":1200,"max_girth_plus_length_mm":3000,"max_volume_litres":350}'::jsonb
+WHERE service_code = 'dhl_parcel_uk';
+
+UPDATE shipping_services
+SET constraints = constraints || '{"required_packaging_type":"pallet","max_weight_kg":700,"max_length_mm":1200,"max_width_mm":1000,"max_height_mm":2200,"max_volume_litres":2640}'::jsonb
+WHERE service_code = 'palletforce_premium';
+
+UPDATE shipping_services
+SET constraints = constraints || '{"required_packaging_type":"pallet","max_weight_kg":700,"max_length_mm":1200,"max_width_mm":1000,"max_height_mm":2200,"max_volume_litres":2640}'::jsonb
+WHERE service_code = 'palletways_economy';
 
 INSERT INTO packaging_profiles (code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm, max_weight_grams, tare_weight_grams, default_cost_gbp, notes)
 VALUES

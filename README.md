@@ -55,7 +55,13 @@ Auth accepts any valid JWT or demo token (payload: `{ sub, email, role }`).
 | `GET` | `/api/products/wms-cache` | Read from local `wms_products` table |
 | `POST` | `/api/products/sync` | Pull all Medusa products into WMS DB (async background job) |
 | `GET` | `/api/products/sync/status` | Poll sync job status and result |
+| `GET` | `/api/products/:id/shipping-estimates` | Per-variant shipping cost estimates + service eligibility + requirements |
 | `GET` | `/api/products/:id` | Single product from memory cache |
+
+`/api/products/:id/shipping-estimates` assumptions:
+- Packed dimensions include protective packaging allowance of +15 to +20 mm on each dimension.
+- Eligibility and costing use the conservative +20 mm values.
+- Service requirements are read from `shipping_services.constraints` (weight, size, girth+length, volume, package type).
 
 ### Mobile Scanner
 | Method | Path | Description |

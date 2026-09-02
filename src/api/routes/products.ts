@@ -11,6 +11,7 @@ import express, { Response } from 'express';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { getMedusaToken, MEDUSA_URL } from '../../lib/medusa-client.js';
 import { query } from '../../db/index.js';
+import { estimateShippingForServices, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 
 const router = express.Router();
 
@@ -53,6 +54,35 @@ interface WmsProduct {
   weight_grams: number | null; height_mm: number | null; width_mm: number | null; depth_mm: number | null
   variant_count: number; kit_variant_count: number
   variants: WmsVariant[]
+}
+
+interface FulfillmentProfileRow {
+  product_sku: string;
+  packaging_profile_code: string | null;
+  preferred_service_code: string | null;
+  requires_manual_review: boolean;
+  is_fragile: boolean;
+  is_multi_box: boolean;
+}
+
+function asNumber(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function withServiceConstraintDefaults(service: ShippingService): ShippingService {
+  const c = { ...(service.constraints ?? {}) };
+  if (service.courier_code.toLowerCase() === 'ups') {
+    // UPS small package defaults (used when admin constraints are incomplete)
+    if (c.max_weight_kg == null) c.max_weight_kg = 70;
+    if (c.max_length_mm == null) c.max_length_mm = 2740;
+    if (c.max_girth_plus_length_mm == null) c.max_girth_plus_length_mm = 4000;
+  }
+  return { ...service, constraints: c };
 }
 
 // ── 5-min in-memory cache (busted by /sync or ?refresh=true) ──────────────────
@@ -460,6 +490,150 @@ router.get('/sync/status', authMiddleware, (_req: AuthRequest, res: Response) =>
     result: syncState.result,
     error: syncState.error,
   });
+});
+
+// ── GET /api/products/:id/shipping-estimates ─────────────────────────────────
+router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const products = await fetchAllProductsFromMedusa();
+    const product = products.find(p => p.id === req.params.id || p.handle === req.params.id);
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+
+    const skuList = product.variants.map(v => v.sku).filter(Boolean);
+
+    const [servicesResult, profilesResult, fulfilmentResult] = await Promise.all([
+      query(
+        `SELECT service_code, service_name, courier_code, courier_name, service_level, shipment_mode, constraints, metadata
+         FROM shipping_services
+         WHERE is_active = true
+         ORDER BY sort_order ASC, service_name ASC`
+      ),
+      query(
+        `SELECT code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm,
+                max_weight_grams, tare_weight_grams, default_cost_gbp
+         FROM packaging_profiles
+         WHERE is_active = true
+         ORDER BY name ASC`
+      ),
+      skuList.length
+        ? query(
+            `SELECT product_sku, packaging_profile_code, preferred_service_code,
+                    requires_manual_review, is_fragile, is_multi_box
+             FROM product_fulfillment_profiles
+             WHERE product_sku = ANY($1::text[])`,
+            [skuList]
+          )
+        : Promise.resolve({ rows: [] as FulfillmentProfileRow[] }),
+    ]);
+
+    const services: ShippingService[] = servicesResult.rows.map((row: any) => withServiceConstraintDefaults({
+      service_code: row.service_code,
+      service_name: row.service_name,
+      courier_code: row.courier_code,
+      courier_name: row.courier_name,
+      service_level: row.service_level,
+      shipment_mode: row.shipment_mode,
+      constraints: row.constraints ?? {},
+      metadata: row.metadata ?? {},
+    }));
+
+    const packagingProfiles: PackagingProfile[] = profilesResult.rows.map((row: any) => ({
+      code: row.code,
+      name: row.name,
+      package_type: row.package_type,
+      inner_length_mm: row.inner_length_mm,
+      inner_width_mm: row.inner_width_mm,
+      inner_height_mm: row.inner_height_mm,
+      max_weight_grams: row.max_weight_grams,
+      tare_weight_grams: row.tare_weight_grams,
+      default_cost_gbp: row.default_cost_gbp,
+    }));
+
+    const fulfilmentBySku = new Map<string, FulfillmentProfileRow>();
+    for (const row of fulfilmentResult.rows as FulfillmentProfileRow[]) fulfilmentBySku.set(row.product_sku, row);
+
+    const variants = product.variants.map((variant) => {
+      const profile = fulfilmentBySku.get(variant.sku);
+      const dims = {
+        weight_grams: asNumber(variant.weight_grams) ?? asNumber(product.weight_grams),
+        length_mm: asNumber(variant.depth_mm) ?? asNumber(product.depth_mm),
+        width_mm: asNumber(variant.width_mm) ?? asNumber(product.width_mm),
+        height_mm: asNumber(variant.height_mm) ?? asNumber(product.height_mm),
+      };
+
+      const estimate = estimateShippingForServices({
+        dims,
+        services,
+        packagingProfiles,
+        preferredPackagingCode: profile?.packaging_profile_code ?? null,
+        packagingPaddingMinMm: 15,
+        packagingPaddingMaxMm: 20,
+      });
+
+      const preferredService = profile?.preferred_service_code
+        ? estimate.estimates.find(s => s.service_code === profile.preferred_service_code)
+        : null;
+
+      const cheapestEligible = estimate.estimates.find(s => s.eligible) ?? null;
+      const upsServices = estimate.estimates.filter(s => s.is_ups);
+      const isUpsEligible = upsServices.some(s => s.eligible);
+      const upsIneligibleReasons = upsServices.filter(s => !s.eligible).flatMap(s => s.reasons_not_eligible);
+
+      return {
+        variant_id: variant.id,
+        sku: variant.sku,
+        variant_title: variant.title,
+        colour_name: variant.colour_name,
+        raw_dimensions_mm: {
+          length: dims.length_mm,
+          width: dims.width_mm,
+          height: dims.height_mm,
+        },
+        packaged_dimensions_mm: estimate.packaged_dimensions,
+        product_weight_grams: dims.weight_grams,
+        package_weight_grams: estimate.package_weight_grams,
+        estimated_volume_litres: estimate.volume_litres,
+        packaging_profile_code: estimate.picked_packaging_profile?.code ?? null,
+        packaging_profile_name: estimate.picked_packaging_profile?.name ?? null,
+        fulfillment_profile: {
+          preferred_service_code: profile?.preferred_service_code ?? null,
+          requires_manual_review: profile?.requires_manual_review ?? false,
+          is_fragile: profile?.is_fragile ?? false,
+          is_multi_box: profile?.is_multi_box ?? false,
+        },
+        cheapest_eligible_service: cheapestEligible,
+        preferred_service_estimate: preferredService,
+        ups_eligibility: {
+          eligible: isUpsEligible,
+          reasons_not_eligible: Array.from(new Set(upsIneligibleReasons)),
+        },
+        service_estimates: estimate.estimates,
+      };
+    });
+
+    res.json({
+      product: {
+        id: product.id,
+        handle: product.handle,
+        title: product.title,
+      },
+      assumptions: {
+        packaging_dimension_allowance_mm: {
+          min: 15,
+          max: 20,
+          used_for_estimation: 20,
+        },
+        notes: [
+          'Estimated rates use internal fallback pricing unless a service metadata override exists.',
+          'Eligibility checks use shipping_services.constraints and conservative packed dimensions.',
+        ],
+      },
+      variants,
+    });
+  } catch (err) {
+    console.error('Shipping estimate error:', err);
+    res.status(500).json({ error: 'Failed to compute shipping estimates', detail: (err as Error).message });
+  }
 });
 
 // ── GET /api/products/:id ─────────────────────────────────────────────────────
