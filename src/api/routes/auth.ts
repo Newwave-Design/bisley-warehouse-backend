@@ -21,7 +21,7 @@ router.get('/debug-migrate', async (_req: Request, res: Response) => {
       await query(statements[i]);
     } catch (err: any) {
       if (err.code === '42P07') continue;
-      return res.json({ failedAtIndex: i, of: statements.length, statement: statements[i].slice(0, 300), error: err.message, code: err.code });
+      return res.json({ failedAtIndex: i, of: statements.length, prevStatement: i > 0 ? statements[i - 1] : null, statement: statements[i].slice(0, 300), error: err.message, code: err.code });
     }
   }
   res.json({ success: true, ranStatements: statements.length });
