@@ -377,9 +377,16 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 INSERT INTO shipping_services (courier_code, courier_name, service_code, service_name, service_level, shipment_mode, integration_type, constraints, metadata, sort_order)
 VALUES
+  ('ups', 'UPS', 'ups_standard', 'UPS Standard', 'standard', 'parcel', 'manual', '{"max_weight_kg": 70}'::jsonb, '{"ready_for_api": true, "category": "parcel"}'::jsonb, 5),
+  ('ups', 'UPS', 'ups_express', 'UPS Express Saver', 'express', 'parcel', 'manual', '{"max_weight_kg": 70}'::jsonb, '{"ready_for_api": true, "category": "parcel"}'::jsonb, 6),
   ('manual', 'Manual Selection', 'manual_standard', 'Manual Standard', 'standard', 'parcel', 'manual', '{}'::jsonb, '{"ready_for_api": false}'::jsonb, 10),
   ('manual', 'Manual Selection', 'manual_express', 'Manual Express', 'express', 'parcel', 'manual', '{}'::jsonb, '{"ready_for_api": false}'::jsonb, 20),
-  ('manual', 'Manual Selection', 'manual_pallet', 'Manual Pallet', 'economy', 'pallet', 'manual', '{}'::jsonb, '{"ready_for_api": false}'::jsonb, 30)
+  ('dpd', 'DPD', 'dpd_next_day', 'DPD Next Day', 'standard', 'parcel', 'manual', '{"max_weight_kg": 30}'::jsonb, '{"ready_for_api": false, "category": "parcel"}'::jsonb, 30),
+  ('dhl', 'DHL Parcel UK', 'dhl_parcel_uk', 'DHL Parcel UK', 'standard', 'parcel', 'manual', '{"max_weight_kg": 25}'::jsonb, '{"ready_for_api": false, "category": "parcel"}'::jsonb, 40),
+  ('dx', 'DX Freight', 'dx_freight_two_man', 'DX Freight Two-Man', 'standard', 'freight', 'manual', '{"oversized": true}'::jsonb, '{"ready_for_api": false, "category": "freight"}'::jsonb, 50),
+  ('palletways', 'Palletways', 'palletways_economy', 'Palletways Economy', 'economy', 'pallet', 'manual', '{"pallet_required": true}'::jsonb, '{"ready_for_api": false, "category": "pallet"}'::jsonb, 60),
+  ('palletforce', 'Palletforce', 'palletforce_premium', 'Palletforce Premium', 'express', 'pallet', 'manual', '{"pallet_required": true}'::jsonb, '{"ready_for_api": false, "category": "pallet"}'::jsonb, 70),
+  ('manual', 'Manual Selection', 'manual_pallet', 'Manual Pallet', 'economy', 'pallet', 'manual', '{}'::jsonb, '{"ready_for_api": false}'::jsonb, 80)
 ON CONFLICT (service_code) DO NOTHING;
 
 INSERT INTO packaging_profiles (code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm, max_weight_grams, tare_weight_grams, default_cost_gbp, notes)
