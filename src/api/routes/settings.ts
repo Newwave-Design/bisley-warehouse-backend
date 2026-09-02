@@ -5,7 +5,7 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 import { estimateShippingForServices, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 
@@ -21,7 +21,7 @@ function asNumber(v: unknown): number | null {
 }
 
 /** GET /api/settings/field-mappings — returns all mappings grouped by direction */
-router.get('/field-mappings', authMiddleware, async (_req: AuthRequest, res: Response) => {
+router.get('/field-mappings', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT * FROM field_mappings ORDER BY mapping_direction, created_at ASC`
@@ -36,7 +36,7 @@ router.get('/field-mappings', authMiddleware, async (_req: AuthRequest, res: Res
 });
 
 /** POST /api/settings/field-mappings — create a new mapping row */
-router.post('/field-mappings', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/field-mappings', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { mapping_direction, source_field, source_label, target_field, target_label, transform, notes } = req.body;
     if (!mapping_direction || !source_field || !source_label) {
@@ -60,7 +60,7 @@ router.post('/field-mappings', authMiddleware, async (req: AuthRequest, res: Res
 });
 
 /** PUT /api/settings/field-mappings/:id — update an existing mapping row */
-router.put('/field-mappings/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.put('/field-mappings/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { source_field, source_label, target_field, target_label, transform, notes, is_active } = req.body;
     const result = await query(
@@ -87,7 +87,7 @@ router.put('/field-mappings/:id', authMiddleware, async (req: AuthRequest, res: 
 });
 
 /** DELETE /api/settings/field-mappings/:id */
-router.delete('/field-mappings/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.delete('/field-mappings/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     await query('DELETE FROM field_mappings WHERE id = $1', [req.params.id]);
     res.json({ success: true });
@@ -97,7 +97,7 @@ router.delete('/field-mappings/:id', authMiddleware, async (req: AuthRequest, re
   }
 });
 
-router.get('/shipping-services', authMiddleware, async (_req: AuthRequest, res: Response) => {
+router.get('/shipping-services', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT id, courier_code, courier_name, service_code, service_name, service_level,
@@ -125,7 +125,7 @@ router.get('/shipping-services', authMiddleware, async (_req: AuthRequest, res: 
   }
 });
 
-router.post('/shipping-services', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/shipping-services', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const {
       courier_code,
@@ -174,7 +174,7 @@ router.post('/shipping-services', authMiddleware, async (req: AuthRequest, res: 
   }
 });
 
-router.put('/shipping-services/:serviceCode', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.put('/shipping-services/:serviceCode', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const {
       courier_code,
@@ -226,7 +226,7 @@ router.put('/shipping-services/:serviceCode', authMiddleware, async (req: AuthRe
   }
 });
 
-router.get('/packaging-profiles', authMiddleware, async (_req: AuthRequest, res: Response) => {
+router.get('/packaging-profiles', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm,
@@ -252,7 +252,7 @@ router.get('/packaging-profiles', authMiddleware, async (_req: AuthRequest, res:
   }
 });
 
-router.post('/shipping-services/ups-sync', authMiddleware, async (_req: AuthRequest, res: Response) => {
+router.post('/shipping-services/ups-sync', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
   try {
     let upserted = 0;
 
@@ -356,7 +356,7 @@ router.post('/shipping-services/ups-sync', authMiddleware, async (_req: AuthRequ
   }
 });
 
-router.post('/shipping-services/ups-auto-tag-products', authMiddleware, async (_req: AuthRequest, res: Response) => {
+router.post('/shipping-services/ups-auto-tag-products', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
   try {
     const [servicesResult, profilesResult, productsResult] = await Promise.all([
       query(

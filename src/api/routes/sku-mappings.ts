@@ -15,7 +15,7 @@
 
 import express, { Request, Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
 
@@ -31,7 +31,7 @@ const router = express.Router();
  * - limit: items per page (default 50)
  * - offset: pagination offset (default 0)
  */
-router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.get('/', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const {
       status = '',
@@ -134,7 +134,7 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
  * GET /api/sku-mappings/unmapped
  * Show only unmapped items
  */
-router.get('/unmapped', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.get('/unmapped', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { limit = '50', offset = '0', family = '', colour = '' } = req.query;
 
@@ -202,7 +202,7 @@ router.get('/unmapped', authMiddleware, async (req: AuthRequest, res: Response) 
  * GET /api/sku-mappings/conflicts
  * Show items with mapping conflicts
  */
-router.get('/conflicts', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.get('/conflicts', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     // One NW code -> multiple Medusa SKUs
     const multiMedusaResult = await query(`
@@ -236,7 +236,7 @@ router.get('/conflicts', authMiddleware, async (req: AuthRequest, res: Response)
 });
 
 /** GET /api/sku-mappings/stats — counts by status */
-router.get('/stats', authMiddleware, async (_req: AuthRequest, res: Response) => {
+router.get('/stats', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
   try {
     const result = await query(`
       SELECT
@@ -257,7 +257,7 @@ router.get('/stats', authMiddleware, async (_req: AuthRequest, res: Response) =>
  * GET /api/sku-mappings/:id
  * Get single mapping detail with linked items
  */
-router.get('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.get('/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
 
@@ -292,7 +292,7 @@ router.get('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
  * PATCH /api/sku-mappings/:id
  * Update mapping (medusa_sku, genero_code, status, notes, confidence)
  */
-router.patch('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.patch('/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
     const { medusa_sku, genero_code, status, notes, confidence } = req.body;
@@ -357,7 +357,7 @@ router.patch('/:id', authMiddleware, async (req: AuthRequest, res: Response) => 
  * POST /api/sku-mappings/:id/validate
  * Mark mapping as validated
  */
-router.post('/:id/validate', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/:id/validate', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
     const userId = (req as any).user?.email || 'unknown';
@@ -385,7 +385,7 @@ router.post('/:id/validate', authMiddleware, async (req: AuthRequest, res: Respo
  * POST /api/sku-mappings/:id/reject
  * Mark mapping as rejected
  */
-router.post('/:id/reject', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/:id/reject', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
     const { notes } = req.body;
@@ -420,7 +420,7 @@ router.post('/:id/reject', authMiddleware, async (req: AuthRequest, res: Respons
  * 
  * Algorithm: Match NW code prefix with Medusa SKU prefix
  */
-router.post('/auto-match', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/auto-match', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { min_confidence = 0.7 } = req.body;
 
@@ -479,7 +479,7 @@ router.post('/auto-match', authMiddleware, async (req: AuthRequest, res: Respons
  * Bulk import NW stocking items from parsed spreadsheet data
  * Body: { items: [{ nw_code, description, family, colour, quantity_ordered, unit_cost? }] }
  */
-router.post('/import', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/import', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { items } = req.body;
 
@@ -540,7 +540,7 @@ router.post('/import', authMiddleware, async (req: AuthRequest, res: Response) =
 });
 
 /** POST /api/sku-mappings/validate-assumed — bulk validate all ASSUMED mappings */
-router.post('/validate-assumed', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/validate-assumed', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const userId = (req as any).user?.email || 'system';
     const result = await query(
