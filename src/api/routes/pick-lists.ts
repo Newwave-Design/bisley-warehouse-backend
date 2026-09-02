@@ -161,6 +161,10 @@ router.get('/:pickListId/fulfilment-plan', authMiddleware, async (req: Request, 
 router.post('/:pickListId/packages/:packageNumber/ups-label', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { pickListId, packageNumber } = req.params;
+    const packageNum = parseInt(packageNumber, 10);
+    if (!Number.isInteger(packageNum)) {
+      return res.status(400).json({ error: 'Invalid package number' });
+    }
 
     const pickListResult = await query(
       `SELECT id, pick_list_number, customer_name, customer_email, shipping_address,
@@ -179,7 +183,7 @@ router.post('/:pickListId/packages/:packageNumber/ups-label', authMiddleware, as
        LEFT JOIN packaging_profiles pp ON pp.code = pkg.packaging_profile_code
        LEFT JOIN shipping_services ss ON ss.service_code = COALESCE(pkg.courier_service_code, $3)
        WHERE pkg.pick_list_id = $1 AND pkg.package_number = $2`,
-      [pickListId, parseInt(packageNumber, 10), pickList.selected_service_code ?? null]
+      [pickListId, packageNum, pickList.selected_service_code ?? null]
     );
     const pkg = packageResult.rows[0];
     if (!pkg) return res.status(400).json({ error: 'Package not found - save the packing plan first' });

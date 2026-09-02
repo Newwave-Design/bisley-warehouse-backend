@@ -11,7 +11,7 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
 import { runDiscrepancyCheck } from '../../lib/discrepancy-check.js';
 
 const router = express.Router();
@@ -98,7 +98,7 @@ router.patch('/:id/resolve', authMiddleware, async (req: AuthRequest, res: Respo
   }
 });
 
-router.post('/resolve-all', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/resolve-all', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { source, severity } = req.body;
     let sql = `UPDATE wms_error_log SET resolved=true, resolved_at=NOW(), resolved_by=$1 WHERE resolved=false`;
@@ -113,7 +113,7 @@ router.post('/resolve-all', authMiddleware, async (req: AuthRequest, res: Respon
   }
 });
 
-router.delete('/old', authMiddleware, async (_req: AuthRequest, res: Response) => {
+router.delete('/old', authMiddleware, requireRole(['ADMIN']), async (_req: AuthRequest, res: Response) => {
   try {
     const r = await query(`
       DELETE FROM wms_error_log

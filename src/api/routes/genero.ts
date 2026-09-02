@@ -21,6 +21,9 @@ const router = express.Router();
 
 const GENERO_API_URL = process.env.GENERO_API_URL ?? '';
 const GENERO_ACCOUNT = process.env.GENERO_ACCOUNT_NO ?? 'NW123';
+if (!GENERO_API_URL) {
+  console.warn('[genero] GENERO_API_URL not set — all Genero API calls will return simulated data');
+}
 
 /** Call the Genero API for one line item and return the response */
 async function callGeneroApi(payload: {

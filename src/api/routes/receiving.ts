@@ -16,7 +16,7 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 
 const router = express.Router();
@@ -237,9 +237,18 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
 });
 
 // Bulk-generate bay locations (e.g. rows A-C, bins 1-10 = 30 bays)
-router.post('/locations/generate', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/locations/generate', authMiddleware, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { aisles = ['A'], rows_per_aisle = 5, bays_per_row = 10 } = req.body;
+    if (!Array.isArray(aisles) || aisles.length === 0 || aisles.length > 10) {
+      return res.status(400).json({ error: 'aisles must be a non-empty array of at most 10' });
+    }
+    if (!Number.isInteger(rows_per_aisle) || rows_per_aisle < 1 || rows_per_aisle > 100) {
+      return res.status(400).json({ error: 'rows_per_aisle must be an integer between 1 and 100' });
+    }
+    if (!Number.isInteger(bays_per_row) || bays_per_row < 1 || bays_per_row > 100) {
+      return res.status(400).json({ error: 'bays_per_row must be an integer between 1 and 100' });
+    }
     let created = 0, skipped = 0;
 
     for (const aisle of aisles) {

@@ -6,13 +6,14 @@
 
 import express, { Request, Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
 
 const MEDUSA_URL = process.env.MEDUSA_API_BASE_URL || 'https://bisley-shop.medusajs.app';
 const MEDUSA_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || 'matt@ovara.co.uk';
-const MEDUSA_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || 'Drautsrab85!';
+const MEDUSA_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
+if (!MEDUSA_PASSWORD) throw new Error('MEDUSA_ADMIN_PASSWORD env var is not set');
 // Medusa has 2 stock locations (European Warehouse + an unused legacy "Ovara" location with
 // no sales channel). Every inventory lookup MUST filter to this one or quantities double-count.
 const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY792H831KT3TKH4CYPF7FT9';
@@ -112,7 +113,7 @@ router.get('/pre-sync', authMiddleware, async (req: AuthRequest, res: Response) 
 });
 
 // Sync WMS â†’ Medusa
-router.post('/sync', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/sync', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { skus } = req.body;
     const token = await getMedusaToken();
@@ -181,7 +182,7 @@ router.get('/all', authMiddleware, async (req: AuthRequest, res: Response) => {
 
 // Seed WMS from Medusa — use Medusa quantities as the WMS baseline
 // Creates a default location "MEDUSA-IMPORT" if none exists, then upserts inventory
-router.post('/seed-from-medusa', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/seed-from-medusa', authMiddleware, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     // Always fetch fresh from Medusa when seeding
     const medusaMap = await fetchMedusaInventory(true);
@@ -217,7 +218,7 @@ router.post('/seed-from-medusa', authMiddleware, async (req: AuthRequest, res: R
 });
 
 // Clear WMS inventory — wipe the IMPORT-01 baseline to start fresh
-router.delete('/wms-inventory', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.delete('/wms-inventory', authMiddleware, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(`
       DELETE FROM warehouse_inventory wi
@@ -233,7 +234,7 @@ router.delete('/wms-inventory', authMiddleware, async (req: AuthRequest, res: Re
 // Purge specific legacy/phantom SKUs from warehouse_inventory — used to clean up
 // old test data (renamed/typo'd product codes) that no longer has a Medusa counterpart.
 // Body: { skus: string[] }
-router.post('/purge-skus', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/purge-skus', authMiddleware, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { skus } = req.body as { skus?: string[] };
     if (!Array.isArray(skus) || skus.length === 0) {

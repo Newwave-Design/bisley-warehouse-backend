@@ -8,7 +8,7 @@
  */
 
 import express, { Response } from 'express';
-import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
 import { getMedusaToken, MEDUSA_URL } from '../../lib/medusa-client.js';
 import { query } from '../../db/index.js';
 import { estimateShippingForServices, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
@@ -510,7 +510,7 @@ async function runSyncJob() {
 }
 
 // ── POST /api/products/sync — responds immediately, runs in background ─────────
-router.post('/sync', authMiddleware, (req: AuthRequest, res: Response) => {
+router.post('/sync', authMiddleware, requireRole(['ADMIN']), (req: AuthRequest, res: Response) => {
   if (syncState.running) {
     return res.status(409).json({
       error: 'Sync already in progress',

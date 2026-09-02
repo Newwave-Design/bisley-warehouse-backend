@@ -18,10 +18,21 @@
  */
 
 import express, { Request, Response } from 'express';
+import crypto from 'crypto';
 import { query } from '../../db/index.js';
-import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
+
+// Shared secret for the inbound Genero dispatch webhook (Genero has no way to send a JWT).
+// Not yet configured anywhere -> fail closed rather than accept unauthenticated writes.
+const GENERO_WEBHOOK_SECRET = process.env.GENERO_WEBHOOK_SECRET ?? '';
+function verifyGeneroSecret(provided: string): boolean {
+  if (!GENERO_WEBHOOK_SECRET || !provided) return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(GENERO_WEBHOOK_SECRET);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 
 // ================================================================================
 // ORDERS
@@ -66,7 +77,7 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.post('/', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { notes, expected_delivery, line_items } = req.body;
 
@@ -115,7 +126,7 @@ router.get('/thresholds', authMiddleware, async (req: AuthRequest, res: Response
   }
 });
 
-router.patch('/thresholds/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.patch('/thresholds/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { min_quantity, reorder_quantity, is_active } = req.body;
     const result = await query(
@@ -130,7 +141,7 @@ router.patch('/thresholds/:id', authMiddleware, async (req: AuthRequest, res: Re
 });
 
 // Auto-create a draft order from the NW stocking programme items
-router.post('/from-nw', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/from-nw', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { notes, expected_delivery } = req.body;
 
@@ -184,7 +195,7 @@ router.get('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.patch('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.patch('/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { status, notes, expected_delivery, genero_dispatch_ref } = req.body;
     const fields: string[] = [];
@@ -211,7 +222,7 @@ router.patch('/:id', authMiddleware, async (req: AuthRequest, res: Response) => 
   }
 });
 
-router.delete('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.delete('/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const order = await query(`SELECT status FROM supplier_orders WHERE id=$1`, [req.params.id]);
     if (!order.rows[0]) return res.status(404).json({ error: 'Order not found' });
@@ -257,8 +268,12 @@ router.patch('/:orderId/items/:itemId', authMiddleware, async (req: AuthRequest,
   }
 });
 
-// Genero dispatch note webhook
+// Genero dispatch note webhook — authenticated via shared secret header (x-genero-secret),
+// since Genero cannot send a JWT. Set GENERO_WEBHOOK_SECRET on both sides to enable.
 router.post('/genero/dispatch', async (req: Request, res: Response) => {
+  if (!verifyGeneroSecret((req.headers['x-genero-secret'] as string) ?? '')) {
+    return res.status(401).json({ error: 'Invalid or missing webhook secret' });
+  }
   try {
     const { dispatch_ref, order_number, dispatch_date, expected_delivery, carrier, tracking_number } = req.body;
 
