@@ -8,6 +8,7 @@ import { query } from '../../db/index.js';
 import { authMiddleware } from '../../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
+import { createUpsShipmentLabel } from '../../lib/ups.js';
 
 const router = express.Router();
 
@@ -154,6 +155,122 @@ router.get('/:pickListId/fulfilment-plan', authMiddleware, async (req: Request, 
   } catch (error) {
     console.error('Fulfilment plan fetch error:', error);
     return res.status(500).json({ error: 'Failed to fetch fulfilment plan' });
+  }
+});
+
+router.post('/:pickListId/packages/:packageNumber/ups-label', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { pickListId, packageNumber } = req.params;
+
+    const pickListResult = await query(
+      `SELECT id, pick_list_number, customer_name, customer_email, shipping_address,
+              selected_service_code, selected_courier_code
+       FROM pick_lists
+       WHERE id = $1`,
+      [pickListId]
+    );
+    const pickList = pickListResult.rows[0];
+    if (!pickList) return res.status(404).json({ error: 'Pick list not found' });
+
+    const packageResult = await query(
+      `SELECT pkg.*, pp.name AS packaging_profile_name, pp.inner_length_mm, pp.inner_width_mm, pp.inner_height_mm,
+              ss.service_code, ss.service_name, ss.courier_code, ss.courier_name
+       FROM pick_list_packages pkg
+       LEFT JOIN packaging_profiles pp ON pp.code = pkg.packaging_profile_code
+       LEFT JOIN shipping_services ss ON ss.service_code = COALESCE(pkg.courier_service_code, $3)
+       WHERE pkg.pick_list_id = $1 AND pkg.package_number = $2`,
+      [pickListId, parseInt(packageNumber, 10), pickList.selected_service_code ?? null]
+    );
+    const pkg = packageResult.rows[0];
+    if (!pkg) return res.status(400).json({ error: 'Package not found - save the packing plan first' });
+
+    const courierCode = pkg.courier_code ?? pickList.selected_courier_code
+    if (courierCode !== 'ups') {
+      return res.status(400).json({ error: 'Selected package is not configured for UPS' });
+    }
+
+    const shippingAddress = pickList.shipping_address ?? {}
+    const shipToName = pickList.customer_name || pickList.customer_email || 'Customer'
+    const packageWeightGrams = Number(pkg.package_weight_grams ?? 0)
+    const weightKg = packageWeightGrams > 0 ? packageWeightGrams / 1000 : 1
+    const lengthCm = Number(pkg.package_length_mm ?? pkg.inner_length_mm ?? 0) / 10 || null
+    const widthCm = Number(pkg.package_width_mm ?? pkg.inner_width_mm ?? 0) / 10 || null
+    const heightCm = Number(pkg.package_height_mm ?? pkg.inner_height_mm ?? 0) / 10 || null
+
+    if (!shippingAddress.address_1 || !shippingAddress.city || !shippingAddress.postal_code || !shippingAddress.country_code) {
+      return res.status(400).json({ error: 'Shipping address is incomplete for UPS label generation' });
+    }
+
+    const label = await createUpsShipmentLabel({
+      serviceCode: pkg.service_code ?? pickList.selected_service_code,
+      serviceDescription: pkg.service_name ?? 'UPS Service',
+      customerContext: `${pickList.pick_list_number} pkg ${pkg.package_number}`,
+      shipTo: {
+        name: shipToName,
+        attentionName: shipToName,
+        phone: shippingAddress.phone ?? null,
+        email: pickList.customer_email ?? null,
+        addressLine1: shippingAddress.address_1,
+        addressLine2: shippingAddress.address_2 ?? null,
+        city: shippingAddress.city,
+        stateProvinceCode: shippingAddress.province ?? null,
+        postalCode: shippingAddress.postal_code,
+        countryCode: shippingAddress.country_code,
+      },
+      package: {
+        description: pkg.contents_summary || `${pickList.pick_list_number} package ${pkg.package_number}`,
+        weightKg,
+        lengthCm,
+        widthCm,
+        heightCm,
+      },
+    })
+
+    const packageMetadata = {
+      ...(pkg.metadata ?? {}),
+      ups: {
+        tracking_number: label.trackingNumber,
+        label_format: label.labelFormat,
+        graphic_image_base64: label.graphicImage,
+        html_image_base64: label.htmlImage,
+        alerts: label.alerts,
+        generated_at: new Date().toISOString(),
+      },
+    }
+
+    await query(
+      `UPDATE pick_list_packages
+       SET tracking_number = $1,
+           label_status = 'PRINTED',
+           courier_service_code = COALESCE(courier_service_code, $2),
+           metadata = $3::jsonb,
+           updated_at = NOW()
+       WHERE id = $4`,
+      [label.trackingNumber, pkg.service_code ?? pickList.selected_service_code, JSON.stringify(packageMetadata), pkg.id]
+    )
+
+    await query(
+      `UPDATE pick_lists
+       SET selected_courier_code = 'ups',
+           selected_service_code = COALESCE(selected_service_code, $1),
+           label_printed_at = COALESCE(label_printed_at, NOW()),
+           status = CASE WHEN status IN ('PICKED', 'PACKING', 'PACKED') THEN 'LABEL_PRINTED' ELSE status END,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [pkg.service_code ?? pickList.selected_service_code, pickListId]
+    )
+
+    return res.json({
+      success: true,
+      tracking_number: label.trackingNumber,
+      label_format: label.labelFormat,
+      graphic_image_base64: label.graphicImage,
+      html_image_base64: label.htmlImage,
+      alerts: label.alerts,
+    })
+  } catch (error) {
+    console.error('UPS label generation error:', error)
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to generate UPS label' })
   }
 });
 

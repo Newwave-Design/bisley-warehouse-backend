@@ -28,6 +28,11 @@ npm run dev                   # http://localhost:3001
 | `GENERO_API_URL` | ⚠️ | Bisley New Wave API endpoint. When unset: **simulation mode** (no real calls) |
 | `GENERO_ACCOUNT_NO` | ⚠️ | NW account number e.g. `NW123` |
 | `MEDUSA_WEBHOOK_SECRET` | ⚠️ | HMAC secret for Medusa webhook signature verification |
+| `UPS_CLIENT_ID` | ⚠️ | UPS app client ID for OAuth client credentials |
+| `UPS_CLIENT_SECRET` | ⚠️ | UPS app client secret for OAuth client credentials |
+| `UPS_ACCOUNT_NUMBER` | ⚠️ | UPS shipper account number |
+| `UPS_ENVIRONMENT` | ⚠️ | `test` or `production` |
+| `UPS_SHIP_API_VERSION` | ⚠️ | UPS ship endpoint version, default `v2403` |
 | `PORT` | — | Server port (Railway sets this; defaults to 3001) |
 | `NODE_ENV` | — | `production` enables strict JWT and Genero auto-poll |
 
@@ -151,6 +156,7 @@ Returns: `status`, `bisley_order`, `Est_delivery` — poll periodically as deliv
 | `PATCH` | `/api/pick-lists/:pickListId/packing/start` | Move a picked order into packing |
 | `PATCH` | `/api/pick-lists/:pickListId/packing/complete` | Mark packing complete and store packaging totals |
 | `PATCH` | `/api/pick-lists/:pickListId/label-printed` | Mark labels printed before dispatch |
+| `POST` | `/api/pick-lists/:pickListId/packages/:packageNumber/ups-label` | Generate a UPS label for a saved package |
 | `PATCH` | `/api/pick-lists/:pickListId/dispatch` | Final outbound stock decrement and dispatch completion |
 
 ### Fulfilment Data Model
