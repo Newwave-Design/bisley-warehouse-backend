@@ -2,13 +2,14 @@
 
 const MEDUSA_URL = process.env.MEDUSA_API_BASE_URL || 'https://bisley-shop.medusajs.app';
 const MEDUSA_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || 'matt@ovara.co.uk';
-const MEDUSA_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || 'Drautsrab85!';
+const MEDUSA_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
 
 let _token: string | null = null;
 let _tokenExpiry = 0;
 
 export async function getMedusaToken(): Promise<string> {
   if (_token && Date.now() < _tokenExpiry) return _token;
+  if (!MEDUSA_PASSWORD) throw new Error('MEDUSA_ADMIN_PASSWORD env var is not set');
   const res = await fetch(`${MEDUSA_URL}/auth/user/emailpass`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
