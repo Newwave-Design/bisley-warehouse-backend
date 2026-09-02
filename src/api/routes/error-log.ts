@@ -6,11 +6,13 @@
  * PATCH /api/error-log/:id/resolve — mark as resolved
  * POST /api/error-log/resolve-all  — resolve all matching a filter
  * DELETE /api/error-log/old        — purge INFO logs older than 7 days
+ * POST /api/error-log/check-discrepancies — run WMS-vs-Medusa qty check now
  */
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { runDiscrepancyCheck } from '../../lib/discrepancy-check.js';
 
 const router = express.Router();
 
@@ -121,6 +123,15 @@ router.delete('/old', authMiddleware, async (_req: AuthRequest, res: Response) =
     res.json({ deleted: r.rowCount ?? 0 });
   } catch (err) {
     res.status(500).json({ error: 'Cleanup failed' });
+  }
+});
+
+router.post('/check-discrepancies', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    const result = await runDiscrepancyCheck();
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message ?? 'Discrepancy check failed' });
   }
 });
 

@@ -27,6 +27,7 @@ import errorLogRoutes from './api/routes/error-log.js';
 import notificationsRoutes from './api/routes/notifications.js';
 import deliveriesRoutes from './api/routes/deliveries.js';
 import { createNotificationOnce } from './lib/notifications.js';
+import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
 import { query as dbQueryUtil } from './db/index.js';
 
 const app = express();
@@ -145,6 +146,25 @@ async function start() {
         } catch (err) { console.warn('[scheduler] Genero poll error:', err); }
       }, TWO_HOURS);
       console.log('✓ Genero auto-poll scheduled (every 2h, business hours)');
+    }
+
+    // Scheduled inventory discrepancy check — every 30 minutes in production, any time of day
+    if (process.env.NODE_ENV === 'production') {
+      const THIRTY_MIN = 30 * 60 * 1000;
+      setInterval(async () => {
+        try {
+          const result = await runDiscrepancyCheck();
+          console.log(`[scheduler] Discrepancy check: ${result.checked} SKUs, ${result.mismatches} mismatches (${result.newlyLogged} newly logged, ${result.autoResolved} auto-resolved)`);
+          if (result.newlyLogged > 0) {
+            await createNotificationOnce('INVENTORY_DISCREPANCY',
+              `${result.newlyLogged} new inventory discrepanc${result.newlyLogged === 1 ? 'y' : 'ies'} found`,
+              'WMS physical stock and Medusa quantities disagree for one or more SKUs — check the Error Log.',
+              { link: '/error-log', severity: 'warning', metadata: { newly_logged: result.newlyLogged } }
+            );
+          }
+        } catch (err) { console.warn('[scheduler] Discrepancy check error:', err); }
+      }, THIRTY_MIN);
+      console.log('✓ Inventory discrepancy check scheduled (every 30 min)');
     }
   } catch (error) {
     console.error('❌ Startup failed:', error);
