@@ -723,9 +723,15 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
             liveQuoteError = 'Missing weight or dimensions — cannot request a live UPS rate.';
           } else {
             const result = await getCachedUpsRates({ lengthMm, widthMm, heightMm, weightGrams: estimate.package_weight_grams });
+            // Only surface genuine UPS parcel services (not UPS's own freight/pallet-tier service) —
+            // Bisley uses AIT for freight, not UPS Express Freight.
+            const parcelQuotes = (result.quotes ?? []).filter((quote) => {
+              const matchedService = quote.internalServiceCode ? services.find(s => s.service_code === quote.internalServiceCode) : null;
+              return matchedService?.shipment_mode === 'parcel';
+            });
             // UPS's Rating API often omits Service.Description for this account — fall back to our own
             // configured service name (same catalogue shown in Settings > Shipping & Packing) for the same code.
-            liveQuotes = result.quotes?.map((quote) => {
+            liveQuotes = parcelQuotes.length ? parcelQuotes.map((quote) => {
               const matchedService = quote.internalServiceCode
                 ? services.find(s => s.service_code === quote.internalServiceCode)
                 : null;
@@ -733,9 +739,9 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
                 ...quote,
                 serviceName: matchedService?.service_name ?? quote.serviceName ?? `UPS service ${quote.upsServiceCode}`,
               };
-            }) ?? null;
-            liveQuoteError = result.error;
-            // Genuinely too big for UPS to carry at all — fall back to AIT rather than a dead end.
+            }) : null;
+            liveQuoteError = result.error ?? (result.quotes?.length && !parcelQuotes.length ? 'UPS only offered freight-tier services for this package.' : null);
+            // Genuinely too big for UPS parcel — fall back to AIT rather than a dead end.
             if (liveQuoteError || !liveQuotes?.length) {
               aitQuote = buildAitQuote();
             }

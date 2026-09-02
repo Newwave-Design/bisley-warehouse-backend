@@ -591,17 +591,24 @@ async function runUpsAutoTagJob() {
           }
         } else {
           const result = await getCachedUpsRates({ lengthMm, widthMm, heightMm, weightGrams: packageWeightGrams });
-          if (result.error || !result.quotes?.length) {
-            // Genuinely too big for UPS to carry at all — fall back to AIT rather than leaving it unassigned.
+          // Only accept genuine UPS parcel services (not UPS's own freight/pallet-tier service) —
+          // Bisley uses AIT for freight, not UPS Express Freight, so treat a freight-tier-only quote
+          // the same as a rejection and fall back to AIT.
+          const parcelQuotes = (result.quotes ?? []).filter((quote) => {
+            const matchedService = quote.internalServiceCode ? services.find(s => s.service_code === quote.internalServiceCode) : null;
+            return matchedService?.shipment_mode === 'parcel';
+          });
+          if (result.error || !parcelQuotes.length) {
+            // Genuinely too big for UPS parcel — fall back to AIT rather than leaving it unassigned.
             if (!assignAit(asNumber(row.price_gbp))) {
-              manualReviewReason = `Manual review required - UPS rejected this package (${result.error ?? 'no services were returned'}) and no price is recorded to fall back to AIT.`;
+              manualReviewReason = `Manual review required - UPS ${result.error ? 'rejected this package' : 'only offered freight-tier services'} (${result.error ?? 'no parcel services were returned'}) and no price is recorded to fall back to AIT.`;
             }
           } else {
-            const cheapest = result.quotes.reduce((best, quote) => {
+            const cheapest = parcelQuotes.reduce((best, quote) => {
               if (quote.totalChargesAmount == null || !quote.internalServiceCode) return best;
               if (!best || (best.totalChargesAmount ?? Infinity) > quote.totalChargesAmount) return quote;
               return best;
-            }, null as (typeof result.quotes)[number] | null);
+            }, null as (typeof parcelQuotes)[number] | null);
             preferredServiceCode = cheapest?.internalServiceCode ?? null;
             preferredCostAmount = cheapest?.totalChargesAmount ?? null;
             preferredCostCurrency = cheapest?.totalChargesCurrency ?? null;
