@@ -44,6 +44,30 @@ const UPS_SERVICE_CODE_MAP: Record<string, string> = {
   ups_express_freight: '96',
 }
 
+const UPS_SERVICE_CODE_REVERSE_MAP: Record<string, string> = Object.fromEntries(
+  Object.entries(UPS_SERVICE_CODE_MAP).map(([internalCode, upsCode]) => [upsCode, internalCode])
+)
+
+export type UpsRateQuote = {
+  upsServiceCode: string
+  internalServiceCode: string | null
+  serviceName: string
+  totalChargesAmount: number | null
+  totalChargesCurrency: string | null
+  negotiatedChargesAmount: number | null
+  negotiatedChargesCurrency: string | null
+  billedWeightValue: number | null
+  billedWeightUnit: string | null
+  guaranteedDaysInTransit: string | null
+  warnings: string[]
+}
+
+export type UpsRateRequestInput = {
+  package: UpsPackage
+  shipTo: UpsAddress
+  shipFrom?: Partial<UpsAddress>
+}
+
 function requireEnv(name: string): string {
   const value = process.env[name]
   if (!value) throw new Error(`Missing required UPS env var: ${name}`)
@@ -235,4 +259,120 @@ export async function createUpsShipmentLabel(input: UpsShipmentInput) {
     htmlImage: packageResults.ShippingLabel?.HTMLImage as string | undefined,
     alerts: shipmentResponse?.Response?.Alert ?? [],
   }
+}
+
+/** Live quote from UPS's own Rating API — "Shop" returns every service UPS will actually sell for this package. */
+export async function getUpsRates(input: UpsRateRequestInput): Promise<UpsRateQuote[]> {
+  const accountNumber = requireEnv('UPS_ACCOUNT_NUMBER')
+  const token = await getUpsAccessToken()
+  const shipperName = requireEnv('UPS_SHIPPER_NAME')
+  const shipperAttention = process.env.UPS_SHIPPER_ATTENTION_NAME ?? shipperName
+  const shipperPhone = cleanPhone(requireEnv('UPS_SHIPPER_PHONE'))
+  const shipperEmail = process.env.UPS_SHIPPER_EMAIL ?? undefined
+  const ratingVersion = process.env.UPS_RATING_API_VERSION ?? 'v2403'
+
+  const shipFrom: UpsAddress = {
+    name: input.shipFrom?.name ?? shipperName,
+    attentionName: input.shipFrom?.attentionName ?? shipperAttention,
+    phone: cleanPhone(input.shipFrom?.phone ?? shipperPhone),
+    email: input.shipFrom?.email ?? shipperEmail,
+    addressLine1: input.shipFrom?.addressLine1 ?? requireEnv('UPS_SHIPPER_ADDRESS_1'),
+    addressLine2: input.shipFrom?.addressLine2 ?? process.env.UPS_SHIPPER_ADDRESS_2 ?? undefined,
+    city: input.shipFrom?.city ?? requireEnv('UPS_SHIPPER_CITY'),
+    stateProvinceCode: input.shipFrom?.stateProvinceCode ?? process.env.UPS_SHIPPER_STATE_PROVINCE_CODE ?? undefined,
+    postalCode: input.shipFrom?.postalCode ?? requireEnv('UPS_SHIPPER_POSTAL_CODE'),
+    countryCode: input.shipFrom?.countryCode ?? requireEnv('UPS_SHIPPER_COUNTRY_CODE'),
+  }
+
+  const response = await fetch(`${getUpsBaseUrl()}/api/rating/${ratingVersion}/Shop`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      transId: crypto.randomUUID().replace(/-/g, '').slice(0, 32),
+      transactionSrc: 'bisley-wms',
+    },
+    body: JSON.stringify({
+      RateRequest: {
+        Request: {
+          TransactionReference: { CustomerContext: 'Bisley WMS live rate lookup' },
+        },
+        Shipment: {
+          Shipper: {
+            ...toAddressPayload(shipFrom),
+            ShipperNumber: accountNumber,
+          },
+          ShipFrom: toAddressPayload(shipFrom),
+          ShipTo: toAddressPayload({
+            ...input.shipTo,
+            phone: cleanPhone(input.shipTo.phone),
+          }),
+          PaymentDetails: {
+            ShipmentCharge: {
+              Type: '01',
+              BillShipper: {
+                AccountNumber: accountNumber,
+              },
+            },
+          },
+          Package: [
+            {
+              PackagingType: { Code: '02' },
+              Dimensions: input.package.lengthCm && input.package.widthCm && input.package.heightCm
+                ? {
+                    UnitOfMeasurement: { Code: 'CM' },
+                    Length: String(Math.max(1, Math.round(input.package.lengthCm))),
+                    Width: String(Math.max(1, Math.round(input.package.widthCm))),
+                    Height: String(Math.max(1, Math.round(input.package.heightCm))),
+                  }
+                : undefined,
+              PackageWeight: {
+                UnitOfMeasurement: { Code: 'KGS' },
+                Weight: input.package.weightKg.toFixed(2),
+              },
+            },
+          ],
+        },
+      },
+    }),
+  })
+
+  const data: any = await response.json().catch(() => ({}))
+  const rateResponse = data?.RateResponse
+  const ratedShipmentsRaw = rateResponse?.RatedShipment
+  const ratedShipments = Array.isArray(ratedShipmentsRaw) ? ratedShipmentsRaw : ratedShipmentsRaw ? [ratedShipmentsRaw] : []
+
+  if (!response.ok || !ratedShipments.length) {
+    const alerts = rateResponse?.Response?.Alert ?? data?.response?.errors ?? []
+    const alertMessages = Array.isArray(alerts)
+      ? alerts.map((alert: { Description?: string; message?: string }) => alert.Description ?? alert.message).filter(Boolean)
+      : []
+    throw new Error(alertMessages.join('; ') || `UPS rating failed with status ${response.status}`)
+  }
+
+  return ratedShipments.map((rated: any): UpsRateQuote => {
+    const warningsRaw = rated.RatedShipmentWarning
+    const warnings = Array.isArray(warningsRaw)
+      ? warningsRaw.map((w: any) => w?.Description ?? w).filter(Boolean)
+      : warningsRaw
+        ? [typeof warningsRaw === 'string' ? warningsRaw : warningsRaw?.Description].filter(Boolean)
+        : []
+    const upsServiceCode: string = rated.Service?.Code ?? ''
+
+    return {
+      upsServiceCode,
+      internalServiceCode: UPS_SERVICE_CODE_REVERSE_MAP[upsServiceCode] ?? null,
+      serviceName: rated.Service?.Description ?? upsServiceCode,
+      totalChargesAmount: rated.TotalCharges?.MonetaryValue ? Number(rated.TotalCharges.MonetaryValue) : null,
+      totalChargesCurrency: rated.TotalCharges?.CurrencyCode ?? null,
+      negotiatedChargesAmount: rated.NegotiatedRateCharges?.TotalCharge?.MonetaryValue
+        ? Number(rated.NegotiatedRateCharges.TotalCharge.MonetaryValue)
+        : null,
+      negotiatedChargesCurrency: rated.NegotiatedRateCharges?.TotalCharge?.CurrencyCode ?? null,
+      billedWeightValue: rated.BillingWeight?.Weight ? Number(rated.BillingWeight.Weight) : null,
+      billedWeightUnit: rated.BillingWeight?.UnitOfMeasurement?.Code ?? null,
+      guaranteedDaysInTransit: rated.GuaranteedDelivery?.BusinessDaysInTransit ?? null,
+      warnings,
+    }
+  })
 }

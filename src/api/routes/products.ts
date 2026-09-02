@@ -13,8 +13,58 @@ import { getMedusaToken, MEDUSA_URL } from '../../lib/medusa-client.js';
 import { query } from '../../db/index.js';
 import { estimateShippingForServices, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
+import { getUpsRates, type UpsRateQuote } from '../../lib/ups.js';
 
 const router = express.Router();
+
+// ── Live UPS rate quote cache ──────────────────────────────────────────────
+// Keyed by packed dimensions + weight so identical-size colour variants share one live call.
+const liveRateCache = new Map<string, { expiresAt: number; quotes: UpsRateQuote[] | null; error: string | null }>();
+const LIVE_RATE_CACHE_OK_MS = 10 * 60 * 1000;
+const LIVE_RATE_CACHE_ERROR_MS = 60 * 1000;
+
+function upsReferenceDestinationConfigured(): boolean {
+  return Boolean(
+    process.env.UPS_REFERENCE_DESTINATION_ADDRESS_1 &&
+    process.env.UPS_REFERENCE_DESTINATION_CITY &&
+    process.env.UPS_REFERENCE_DESTINATION_POSTAL_CODE &&
+    process.env.UPS_REFERENCE_DESTINATION_COUNTRY_CODE
+  );
+}
+
+async function getLiveUpsQuotesForPackage(params: {
+  lengthMm: number; widthMm: number; heightMm: number; weightGrams: number;
+}): Promise<{ quotes: UpsRateQuote[] | null; error: string | null }> {
+  const cacheKey = `${Math.round(params.lengthMm)}x${Math.round(params.widthMm)}x${Math.round(params.heightMm)}@${Math.round(params.weightGrams)}`;
+  const cached = liveRateCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return { quotes: cached.quotes, error: cached.error };
+
+  try {
+    const quotes = await getUpsRates({
+      package: {
+        description: 'Bisley product',
+        weightKg: Math.max(0.1, params.weightGrams / 1000),
+        lengthCm: params.lengthMm / 10,
+        widthCm: params.widthMm / 10,
+        heightCm: params.heightMm / 10,
+      },
+      shipTo: {
+        name: process.env.UPS_REFERENCE_DESTINATION_NAME || 'Reference Customer',
+        addressLine1: process.env.UPS_REFERENCE_DESTINATION_ADDRESS_1!,
+        city: process.env.UPS_REFERENCE_DESTINATION_CITY!,
+        postalCode: process.env.UPS_REFERENCE_DESTINATION_POSTAL_CODE!,
+        countryCode: process.env.UPS_REFERENCE_DESTINATION_COUNTRY_CODE!,
+      },
+    });
+    liveRateCache.set(cacheKey, { expiresAt: Date.now() + LIVE_RATE_CACHE_OK_MS, quotes, error: null });
+    return { quotes, error: null };
+  } catch (err: any) {
+    const message = err?.message || 'UPS rating request failed';
+    liveRateCache.set(cacheKey, { expiresAt: Date.now() + LIVE_RATE_CACHE_ERROR_MS, quotes: null, error: message });
+    return { quotes: null, error: message };
+  }
+}
+
 
 // Medusa has 2 stock locations (European Warehouse + an unused legacy "Ovara" location with
 // no sales channel). Every inventory lookup MUST filter to this one or quantities double-count.
@@ -568,7 +618,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
       packagingProfiles = DEFAULT_PACKAGING_PROFILES.filter(p => p.package_type === 'parcel' || p.package_type === 'freight');
     }
 
-    const variants = product.variants.map((variant) => {
+    const variants = await Promise.all(product.variants.map(async (variant) => {
       const profile = fulfilmentBySku.get(variant.sku);
       const dims = {
         weight_grams: asNumber(variant.weight_grams) ?? asNumber(product.weight_grams),
@@ -586,14 +636,30 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
         packagingPaddingMaxMm: 20,
       });
 
-      const preferredService = profile?.preferred_service_code
-        ? estimate.estimates.find(s => s.service_code === profile.preferred_service_code)
-        : null;
-
-      const cheapestEligible = estimate.estimates.find(s => s.eligible) ?? null;
       const upsServices = estimate.estimates.filter(s => s.is_ups);
       const isUpsEligible = upsServices.some(s => s.eligible);
       const upsIneligibleReasons = upsServices.filter(s => !s.eligible).flatMap(s => s.reasons_not_eligible);
+
+      const packed = estimate.packaged_dimensions;
+      const lengthMm = packed.used_length_mm ?? 0;
+      const widthMm = packed.used_width_mm ?? 0;
+      const heightMm = packed.used_height_mm ?? 0;
+      const hasCompletePackedDims = lengthMm > 0 && widthMm > 0 && heightMm > 0 && estimate.package_weight_grams > 0;
+
+      let liveQuotes: UpsRateQuote[] | null = null;
+      let liveQuoteError: string | null = null;
+      let liveQuoteConfigRequired = false;
+
+      if (!upsReferenceDestinationConfigured()) {
+        liveQuoteConfigRequired = true;
+        liveQuoteError = 'Live UPS rates are not configured. Set UPS_REFERENCE_DESTINATION_* env vars on the backend.';
+      } else if (!hasCompletePackedDims) {
+        liveQuoteError = 'Missing weight or dimensions — cannot request a live UPS rate.';
+      } else {
+        const result = await getLiveUpsQuotesForPackage({ lengthMm, widthMm, heightMm, weightGrams: estimate.package_weight_grams });
+        liveQuotes = result.quotes;
+        liveQuoteError = result.error;
+      }
 
       return {
         variant_id: variant.id,
@@ -617,15 +683,15 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
           is_fragile: profile?.is_fragile ?? false,
           is_multi_box: profile?.is_multi_box ?? false,
         },
-        cheapest_eligible_service: cheapestEligible,
-        preferred_service_estimate: preferredService,
         ups_eligibility: {
           eligible: isUpsEligible,
           reasons_not_eligible: Array.from(new Set(upsIneligibleReasons)),
         },
-        service_estimates: estimate.estimates,
+        ups_live_quotes: liveQuotes,
+        ups_live_quote_error: liveQuoteError,
+        ups_live_quote_configuration_required: liveQuoteConfigRequired,
       };
-    });
+    }));
 
     res.json({
       product: {
@@ -640,9 +706,21 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
           max: 20,
           used_for_estimation: 20,
         },
+        live_rates: {
+          source: 'ups_rating_api',
+          environment: process.env.UPS_ENVIRONMENT ?? 'test',
+          reference_destination: upsReferenceDestinationConfigured()
+            ? {
+                city: process.env.UPS_REFERENCE_DESTINATION_CITY,
+                postal_code: process.env.UPS_REFERENCE_DESTINATION_POSTAL_CODE,
+                country_code: process.env.UPS_REFERENCE_DESTINATION_COUNTRY_CODE,
+              }
+            : null,
+          retrieved_at: new Date().toISOString(),
+        },
         notes: [
-          'Estimated rates use internal fallback pricing unless a service metadata override exists.',
-          'Eligibility checks use shipping_services.constraints and conservative packed dimensions.',
+          'ups_live_quotes is a real-time quote from the UPS Rating API, priced to the single reference destination above — not a per-customer price.',
+          'ups_eligibility is a physical fit/weight pre-check against published UPS parcel/freight limits; the live quote response is the final word on availability.',
         ],
       },
       variants,
