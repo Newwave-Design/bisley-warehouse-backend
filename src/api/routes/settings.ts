@@ -413,7 +413,7 @@ async function runUpsAutoTagJob() {
          ORDER BY inner_length_mm ASC, inner_width_mm ASC, inner_height_mm ASC`
       ),
       query(
-        `SELECT variant_sku, variant_title, colour_name, is_kit, COALESCE(kit_components::text, '[]') AS kit_components,
+        `SELECT medusa_product_id, variant_sku, variant_title, colour_name, is_kit, COALESCE(kit_components::text, '[]') AS kit_components,
                 COALESCE(variant_weight_grams, weight_grams) AS weight_grams,
                 COALESCE(variant_depth_mm, depth_mm) AS depth_mm,
                 COALESCE(variant_width_mm, width_mm) AS width_mm,
@@ -493,6 +493,19 @@ async function runUpsAutoTagJob() {
     let missingDims = 0;
     const total = productsResult.rows.length;
 
+    // Colour variants of the same physical product share identical dims — cache the computed
+    // decision per (product, dims) so they inherit one parent result instead of re-running the
+    // packaging/UPS/AIT logic (and issuing redundant live UPS calls) for every colour.
+    interface AutoTagDecision {
+      estimate: ReturnType<typeof estimateShippingForServices> | null;
+      isFreightPackaging: boolean;
+      preferredServiceCode: string | null;
+      preferredCostAmount: number | null;
+      preferredCostCurrency: string | null;
+      manualReviewReason: string | null;
+    }
+    const groupDecisionCache = new Map<string, AutoTagDecision>();
+
     for (const [idx, row] of (productsResult.rows as any[]).entries()) {
       if (idx % 200 === 0) autoTagState.progress = `Tagging ${idx}/${total} SKUs…`;
 
@@ -517,68 +530,84 @@ async function runUpsAutoTagJob() {
       }
       if (!hasCompleteDimensions) missingDims++;
 
-      // Packaging profile pick is a real physical-packing decision (which Bisley carton/pallet
-      // fits) — kept from the padded-dimension geometry check, independent of courier eligibility.
-      const estimate = hasCompleteDimensions
-        ? estimateShippingForServices({
-            dims: effectiveDims,
-            services,
-            packagingProfiles: profiles,
-            packagingPaddingMinMm: 140,
-            packagingPaddingMaxMm: 140,
-          })
+      // Width/height variants have different dims and therefore a different group key — they always
+      // get their own computation (and, for AIT, their own price). Colour-only variants (identical
+      // dims within the same product) share a group key and reuse the first-computed decision.
+      const groupKey = hasCompleteDimensions
+        ? `${row.medusa_product_id}|${effectiveDims.weight_grams}|${effectiveDims.length_mm}|${effectiveDims.width_mm}|${effectiveDims.height_mm}`
         : null;
 
-      const packed = estimate?.packaged_dimensions;
-      const lengthMm = packed?.used_length_mm ?? 0;
-      const widthMm = packed?.used_width_mm ?? 0;
-      const heightMm = packed?.used_height_mm ?? 0;
-      const packageWeightGrams = estimate?.package_weight_grams ?? 0;
-      const hasCompletePackedDims = lengthMm > 0 && widthMm > 0 && heightMm > 0 && packageWeightGrams > 0;
+      let decision = groupKey ? groupDecisionCache.get(groupKey) : undefined;
 
-      // Courier eligibility and service choice come from a REAL live UPS Rating API quote for
-      // this exact packed size/weight — not a static constraint table. Whatever UPS actually
-      // accepts (or rejects) is the final word.
-      let preferredServiceCode: string | null = null;
-      let preferredCostAmount: number | null = null;
-      let preferredCostCurrency: string | null = null;
-      let manualReviewReason: string | null = null;
+      if (!decision) {
+        // Packaging profile pick is a real physical-packing decision (which Bisley carton/pallet
+        // fits) — kept from the padded-dimension geometry check, independent of courier eligibility.
+        const estimate = hasCompleteDimensions
+          ? estimateShippingForServices({
+              dims: effectiveDims,
+              services,
+              packagingProfiles: profiles,
+              packagingPaddingMinMm: 140,
+              packagingPaddingMaxMm: 140,
+            })
+          : null;
 
-      const isFreightPackaging = estimate?.picked_packaging_profile?.package_type === 'freight';
+        const packed = estimate?.packaged_dimensions;
+        const lengthMm = packed?.used_length_mm ?? 0;
+        const widthMm = packed?.used_width_mm ?? 0;
+        const heightMm = packed?.used_height_mm ?? 0;
+        const packageWeightGrams = estimate?.package_weight_grams ?? 0;
+        const hasCompletePackedDims = lengthMm > 0 && widthMm > 0 && heightMm > 0 && packageWeightGrams > 0;
 
-      if (!hasCompleteDimensions) {
-        manualReviewReason = 'Manual review required - product weight and all dimensions must be recorded before a shipping service can be assigned.';
-      } else if (!hasCompletePackedDims) {
-        manualReviewReason = 'Manual review required - no packaging profile could be resolved for this item\'s dimensions.';
-      } else if (isFreightPackaging) {
-        // Doesn't fit a standard Bisley carton (BOX-SMALL/MEDIUM/LARGE) — Bisley ships these via
-        // AIT today, not UPS parcel, so skip the live UPS quote entirely and use a flat percentage.
-        const priceGbp = asNumber(row.price_gbp);
-        if (priceGbp == null) {
-          manualReviewReason = 'Manual review required - no price recorded to calculate AIT percentage-based shipping cost.';
+        // Courier eligibility and service choice come from a REAL live UPS Rating API quote for
+        // this exact packed size/weight — not a static constraint table. Whatever UPS actually
+        // accepts (or rejects) is the final word.
+        let preferredServiceCode: string | null = null;
+        let preferredCostAmount: number | null = null;
+        let preferredCostCurrency: string | null = null;
+        let manualReviewReason: string | null = null;
+
+        const isFreightPackaging = estimate?.picked_packaging_profile?.package_type === 'freight';
+
+        if (!hasCompleteDimensions) {
+          manualReviewReason = 'Manual review required - product weight and all dimensions must be recorded before a shipping service can be assigned.';
+        } else if (!hasCompletePackedDims) {
+          manualReviewReason = 'Manual review required - no packaging profile could be resolved for this item\'s dimensions.';
+        } else if (isFreightPackaging) {
+          // Doesn't fit a standard Bisley carton (BOX-SMALL/MEDIUM/LARGE) — Bisley ships these via
+          // AIT today, not UPS parcel, so skip the live UPS quote entirely and use a flat percentage.
+          const priceGbp = asNumber(row.price_gbp);
+          if (priceGbp == null) {
+            manualReviewReason = 'Manual review required - no price recorded to calculate AIT percentage-based shipping cost.';
+          } else {
+            preferredServiceCode = aitServiceCode;
+            preferredCostAmount = Math.round(priceGbp * (aitPercentageOfPrice / 100) * 100) / 100;
+            preferredCostCurrency = 'GBP';
+          }
         } else {
-          preferredServiceCode = aitServiceCode;
-          preferredCostAmount = Math.round(priceGbp * (aitPercentageOfPrice / 100) * 100) / 100;
-          preferredCostCurrency = 'GBP';
-        }
-      } else {
-        const result = await getCachedUpsRates({ lengthMm, widthMm, heightMm, weightGrams: packageWeightGrams });
-        if (result.error || !result.quotes?.length) {
-          manualReviewReason = `Manual review required - UPS rejected this package: ${result.error ?? 'no services were returned'}.`;
-        } else {
-          const cheapest = result.quotes.reduce((best, quote) => {
-            if (quote.totalChargesAmount == null || !quote.internalServiceCode) return best;
-            if (!best || (best.totalChargesAmount ?? Infinity) > quote.totalChargesAmount) return quote;
-            return best;
-          }, null as (typeof result.quotes)[number] | null);
-          preferredServiceCode = cheapest?.internalServiceCode ?? null;
-          preferredCostAmount = cheapest?.totalChargesAmount ?? null;
-          preferredCostCurrency = cheapest?.totalChargesCurrency ?? null;
-          if (!preferredServiceCode) {
-            manualReviewReason = 'Manual review required - UPS returned quotes but none matched a configured internal service code.';
+          const result = await getCachedUpsRates({ lengthMm, widthMm, heightMm, weightGrams: packageWeightGrams });
+          if (result.error || !result.quotes?.length) {
+            manualReviewReason = `Manual review required - UPS rejected this package: ${result.error ?? 'no services were returned'}.`;
+          } else {
+            const cheapest = result.quotes.reduce((best, quote) => {
+              if (quote.totalChargesAmount == null || !quote.internalServiceCode) return best;
+              if (!best || (best.totalChargesAmount ?? Infinity) > quote.totalChargesAmount) return quote;
+              return best;
+            }, null as (typeof result.quotes)[number] | null);
+            preferredServiceCode = cheapest?.internalServiceCode ?? null;
+            preferredCostAmount = cheapest?.totalChargesAmount ?? null;
+            preferredCostCurrency = cheapest?.totalChargesCurrency ?? null;
+            if (!preferredServiceCode) {
+              manualReviewReason = 'Manual review required - UPS returned quotes but none matched a configured internal service code.';
+            }
           }
         }
+
+        decision = { estimate, isFreightPackaging, preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason };
+        if (groupKey) groupDecisionCache.set(groupKey, decision);
       }
+
+      const { estimate, isFreightPackaging, preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason } = decision;
 
       if (!preferredServiceCode) noEligible++;
       const needsManual = Boolean(manualReviewReason);

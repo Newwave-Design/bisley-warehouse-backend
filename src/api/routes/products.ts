@@ -636,6 +636,21 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
       packagingProfiles = DEFAULT_PACKAGING_PROFILES.filter(p => p.package_type === 'parcel' || p.package_type === 'freight');
     }
 
+    interface VariantShippingGroup {
+      estimate: ReturnType<typeof estimateShippingForServices>;
+      isUpsEligible: boolean;
+      upsIneligibleReasons: string[];
+      liveQuotes: UpsRateQuote[] | null;
+      liveQuoteError: string | null;
+      liveQuoteConfigRequired: boolean;
+      aitQuote: { service_code: string; service_name: string; percentage_of_price: number; price_gbp: number | null; estimated_cost_gbp: number | null } | null;
+    }
+
+    // Colour variants share identical dims within a product — compute the shipping decision once
+    // per unique dims group so they inherit one parent result; width/height variants (different
+    // dims) get their own group key, so they're still computed individually with their own price.
+    const groupPromiseCache = new Map<string, Promise<VariantShippingGroup>>();
+
     const variants = await Promise.all(variantRows.map(async (row: any) => {
       const profile = fulfilmentBySku.get(row.variant_sku);
       let dims = {
@@ -652,62 +667,76 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
         if (kitDims.complete) dims = kitDims;
       }
 
-      const estimate = estimateShippingForServices({
-        dims,
-        services,
-        packagingProfiles,
-        preferredPackagingCode: profile?.packaging_profile_code ?? null,
-        packagingPaddingMinMm: 140,
-        packagingPaddingMaxMm: 140,
-      });
+      const groupKey = (dims.weight_grams && dims.length_mm && dims.width_mm && dims.height_mm)
+        ? `${dims.weight_grams}|${dims.length_mm}|${dims.width_mm}|${dims.height_mm}`
+        : `sku:${row.variant_sku}`;
 
-      const upsServices = estimate.estimates.filter(s => s.is_ups);
-      const isUpsEligible = upsServices.some(s => s.eligible);
-      const upsIneligibleReasons = upsServices.filter(s => !s.eligible).flatMap(s => s.reasons_not_eligible);
+      let groupPromise = groupPromiseCache.get(groupKey);
+      if (!groupPromise) {
+        groupPromise = (async (): Promise<VariantShippingGroup> => {
+          const estimate = estimateShippingForServices({
+            dims,
+            services,
+            packagingProfiles,
+            preferredPackagingCode: profile?.packaging_profile_code ?? null,
+            packagingPaddingMinMm: 140,
+            packagingPaddingMaxMm: 140,
+          });
 
-      const packed = estimate.packaged_dimensions;
-      const lengthMm = packed.used_length_mm ?? 0;
-      const widthMm = packed.used_width_mm ?? 0;
-      const heightMm = packed.used_height_mm ?? 0;
-      const hasCompletePackedDims = lengthMm > 0 && widthMm > 0 && heightMm > 0 && estimate.package_weight_grams > 0;
-      const isFreightPackaging = estimate.picked_packaging_profile?.package_type === 'freight';
+          const upsServices = estimate.estimates.filter(s => s.is_ups);
+          const isUpsEligible = upsServices.some(s => s.eligible);
+          const upsIneligibleReasons = upsServices.filter(s => !s.eligible).flatMap(s => s.reasons_not_eligible);
 
-      let liveQuotes: UpsRateQuote[] | null = null;
-      let liveQuoteError: string | null = null;
-      let liveQuoteConfigRequired = false;
-      let aitQuote: { service_code: string; service_name: string; percentage_of_price: number; price_gbp: number | null; estimated_cost_gbp: number | null } | null = null;
+          const packed = estimate.packaged_dimensions;
+          const lengthMm = packed.used_length_mm ?? 0;
+          const widthMm = packed.used_width_mm ?? 0;
+          const heightMm = packed.used_height_mm ?? 0;
+          const hasCompletePackedDims = lengthMm > 0 && widthMm > 0 && heightMm > 0 && estimate.package_weight_grams > 0;
+          const isFreightPackaging = estimate.picked_packaging_profile?.package_type === 'freight';
 
-      if (isFreightPackaging) {
-        // Doesn't fit a standard Bisley carton — Bisley ships these via AIT today, not UPS parcel,
-        // so skip the live UPS Rating API call entirely and use a flat percentage-of-price quote.
-        const priceGbp = asNumber(row.price_gbp);
-        aitQuote = {
-          service_code: aitServiceCode,
-          service_name: aitServiceName,
-          percentage_of_price: aitPercentageOfPrice,
-          price_gbp: priceGbp,
-          estimated_cost_gbp: priceGbp != null ? Math.round(priceGbp * (aitPercentageOfPrice / 100) * 100) / 100 : null,
-        };
-      } else if (!upsReferenceDestinationConfigured()) {
-        liveQuoteConfigRequired = true;
-        liveQuoteError = 'Live UPS rates are not configured. Set UPS_REFERENCE_DESTINATION_* env vars on the backend.';
-      } else if (!hasCompletePackedDims) {
-        liveQuoteError = 'Missing weight or dimensions — cannot request a live UPS rate.';
-      } else {
-        const result = await getCachedUpsRates({ lengthMm, widthMm, heightMm, weightGrams: estimate.package_weight_grams });
-        // UPS's Rating API often omits Service.Description for this account — fall back to our own
-        // configured service name (same catalogue shown in Settings > Shipping & Packing) for the same code.
-        liveQuotes = result.quotes?.map((quote) => {
-          const matchedService = quote.internalServiceCode
-            ? services.find(s => s.service_code === quote.internalServiceCode)
-            : null;
-          return {
-            ...quote,
-            serviceName: matchedService?.service_name ?? quote.serviceName ?? `UPS service ${quote.upsServiceCode}`,
-          };
-        }) ?? null;
-        liveQuoteError = result.error;
+          let liveQuotes: UpsRateQuote[] | null = null;
+          let liveQuoteError: string | null = null;
+          let liveQuoteConfigRequired = false;
+          let aitQuote: VariantShippingGroup['aitQuote'] = null;
+
+          if (isFreightPackaging) {
+            // Doesn't fit a standard Bisley carton — Bisley ships these via AIT today, not UPS
+            // parcel, so skip the live UPS Rating API call entirely and use a flat percentage.
+            const priceGbp = asNumber(row.price_gbp);
+            aitQuote = {
+              service_code: aitServiceCode,
+              service_name: aitServiceName,
+              percentage_of_price: aitPercentageOfPrice,
+              price_gbp: priceGbp,
+              estimated_cost_gbp: priceGbp != null ? Math.round(priceGbp * (aitPercentageOfPrice / 100) * 100) / 100 : null,
+            };
+          } else if (!upsReferenceDestinationConfigured()) {
+            liveQuoteConfigRequired = true;
+            liveQuoteError = 'Live UPS rates are not configured. Set UPS_REFERENCE_DESTINATION_* env vars on the backend.';
+          } else if (!hasCompletePackedDims) {
+            liveQuoteError = 'Missing weight or dimensions — cannot request a live UPS rate.';
+          } else {
+            const result = await getCachedUpsRates({ lengthMm, widthMm, heightMm, weightGrams: estimate.package_weight_grams });
+            // UPS's Rating API often omits Service.Description for this account — fall back to our own
+            // configured service name (same catalogue shown in Settings > Shipping & Packing) for the same code.
+            liveQuotes = result.quotes?.map((quote) => {
+              const matchedService = quote.internalServiceCode
+                ? services.find(s => s.service_code === quote.internalServiceCode)
+                : null;
+              return {
+                ...quote,
+                serviceName: matchedService?.service_name ?? quote.serviceName ?? `UPS service ${quote.upsServiceCode}`,
+              };
+            }) ?? null;
+            liveQuoteError = result.error;
+          }
+
+          return { estimate, isUpsEligible, upsIneligibleReasons, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote };
+        })();
+        groupPromiseCache.set(groupKey, groupPromise);
       }
+
+      const group = await groupPromise;
 
       return {
         variant_id: row.medusa_variant_id,
@@ -719,12 +748,12 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
           width: dims.width_mm,
           height: dims.height_mm,
         },
-        packaged_dimensions_mm: estimate.packaged_dimensions,
+        packaged_dimensions_mm: group.estimate.packaged_dimensions,
         product_weight_grams: dims.weight_grams,
-        package_weight_grams: estimate.package_weight_grams,
-        estimated_volume_litres: estimate.volume_litres,
-        packaging_profile_code: estimate.picked_packaging_profile?.code ?? null,
-        packaging_profile_name: estimate.picked_packaging_profile?.name ?? null,
+        package_weight_grams: group.estimate.package_weight_grams,
+        estimated_volume_litres: group.estimate.volume_litres,
+        packaging_profile_code: group.estimate.picked_packaging_profile?.code ?? null,
+        packaging_profile_name: group.estimate.picked_packaging_profile?.name ?? null,
         fulfillment_profile: {
           preferred_service_code: profile?.preferred_service_code ?? null,
           requires_manual_review: profile?.requires_manual_review ?? false,
@@ -732,13 +761,13 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
           is_multi_box: profile?.is_multi_box ?? false,
         },
         ups_eligibility: {
-          eligible: isUpsEligible,
-          reasons_not_eligible: Array.from(new Set(upsIneligibleReasons)),
+          eligible: group.isUpsEligible,
+          reasons_not_eligible: Array.from(new Set(group.upsIneligibleReasons)),
         },
-        ups_live_quotes: liveQuotes,
-        ups_live_quote_error: liveQuoteError,
-        ups_live_quote_configuration_required: liveQuoteConfigRequired,
-        ait_quote: aitQuote,
+        ups_live_quotes: group.liveQuotes,
+        ups_live_quote_error: group.liveQuoteError,
+        ups_live_quote_configuration_required: group.liveQuoteConfigRequired,
+        ait_quote: group.aitQuote,
       };
     }));
 
