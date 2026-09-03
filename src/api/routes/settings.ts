@@ -628,8 +628,7 @@ async function runUpsAutoTagJob() {
            pack_instructions = EXCLUDED.pack_instructions,
            estimated_shipping_cost_gbp = EXCLUDED.estimated_shipping_cost_gbp,
            estimated_shipping_currency = EXCLUDED.estimated_shipping_currency,
-           updated_at = NOW()
-         WHERE product_fulfillment_profiles.fulfilment_tags @> '["ups-auto-tagged"]'::jsonb`,
+           updated_at = NOW()`,
         [
           row.variant_sku,
           estimate?.picked_packaging_profile?.code ?? null,
