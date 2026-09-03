@@ -49,7 +49,7 @@ router.get('/', authMiddleware, async (_req: AuthRequest, res: Response) => {
                COUNT(*) FILTER (WHERE status = 'VALIDATED')::int AS validated,
                COUNT(*) FILTER (WHERE status = 'UNMAPPED')::int  AS unmapped,
                COUNT(*)::int                                      AS total
-             FROM sku_mappings`),
+             FROM sku_mappings`), // LEGACY/PAUSED (2026-09-03) - table wiped, stats will read 0
       query(`SELECT
                COUNT(*)::int          AS locations_in_use,
                COALESCE(SUM(quantity), 0)::int AS total_units
@@ -63,7 +63,7 @@ router.get('/', authMiddleware, async (_req: AuthRequest, res: Response) => {
       checkin: checkin.rows[0],
       requires_location: requiresLocation.rows[0],
       pick_lists: pickLists.rows[0],
-      sku_mappings: skuMappings.rows[0],
+      sku_mappings: skuMappings.rows[0], // LEGACY/PAUSED (2026-09-03)
       inventory: inventory.rows[0],
     });
   } catch (err) {
