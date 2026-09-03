@@ -28,7 +28,7 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
     // 1. Check barcode_mappings (EAN / Supercode barcode → product)
     const barcode = await query(
       `SELECT bm.product_sku as nw_code, bm.colour_name as colour, bm.product_name, bm.colour_code,
-              wp.metadata, wp.product_handle,
+              wp.metadata, wp.product_handle, wp.variant_thumbnail, wp.variant_sku AS medusa_sku,
               COALESCE(wp.variant_width_mm, wp.width_mm) AS width_mm,
               COALESCE(wp.variant_height_mm, wp.height_mm) AS height_mm,
               COALESCE(wp.variant_depth_mm, wp.depth_mm) AS depth_mm
@@ -44,7 +44,7 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
     // 2. Check sku_mappings by NW code
     const mapping = await query(
       `SELECT sm.nw_code, sm.product_name, sm.family, sm.colour, sm.medusa_sku,
-              wp.metadata, wp.product_handle,
+              wp.metadata, wp.product_handle, wp.variant_thumbnail,
               COALESCE(wp.variant_width_mm, wp.width_mm) AS width_mm,
               COALESCE(wp.variant_height_mm, wp.height_mm) AS height_mm,
               COALESCE(wp.variant_depth_mm, wp.depth_mm) AS depth_mm
