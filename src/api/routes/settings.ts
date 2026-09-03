@@ -707,4 +707,36 @@ router.get('/shipping-services/ups-auto-tag-status', authMiddleware, requireRole
   });
 });
 
+/**
+ * Bisley/Ovara stock liability (Phase 6: Financials)
+ * GET   /api/settings/liability-default   — current default owner applied to newly received stock
+ * PATCH /api/settings/liability-default   — manually flip the default (Bisley -> Ovara)
+ */
+router.get('/liability-default', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(`SELECT value, updated_at FROM wms_settings WHERE key = 'default_liability_status'`);
+    res.json({ default_liability_status: result.rows[0]?.value ?? 'Bisley', updated_at: result.rows[0]?.updated_at ?? null });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch liability default' });
+  }
+});
+
+router.patch('/liability-default', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+  try {
+    const { default_liability_status } = req.body;
+    if (!['Bisley', 'Ovara'].includes(default_liability_status)) {
+      return res.status(400).json({ error: "default_liability_status must be 'Bisley' or 'Ovara'" });
+    }
+    const result = await query(
+      `INSERT INTO wms_settings (key, value, updated_at) VALUES ('default_liability_status', $1, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()
+       RETURNING value, updated_at`,
+      [default_liability_status]
+    );
+    res.json({ default_liability_status: result.rows[0].value, updated_at: result.rows[0].updated_at });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update liability default' });
+  }
+});
+
 export default router;

@@ -103,6 +103,9 @@ ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS variant_weight_grams INTEGER;
 ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS variant_height_mm INTEGER;
 ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS variant_width_mm INTEGER;
 ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS variant_depth_mm INTEGER;
+-- Per-SKU cost (Phase 6: Financials) — wms_products is the live 1:1 Medusa product cache,
+-- so this is the correct place for cost (sku_mappings is paused/only for external supplier codes).
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS unit_cost_gbp DECIMAL(10,2);
 
 -- ================================================================================
 -- WAREHOUSE INVENTORY (Current stock levels by location)
@@ -616,17 +619,6 @@ CREATE TABLE IF NOT EXISTS sku_mappings (
 );
 -- Per-SKU cost (Phase 6: Financials) — single cost basis per SKU, editable in the SKU Mapping view
 ALTER TABLE sku_mappings ADD COLUMN IF NOT EXISTS unit_cost_gbp DECIMAL(10,2);
-
--- ================================================================================
--- PRODUCT COSTS (per-SKU cost basis for gross margin / COGS / stock valuation)
--- Split out from sku_mappings (2026-09-03): cost basis is a live requirement keyed
--- directly on Medusa SKU, unrelated to translating external NW/Genero supplier codes.
--- ================================================================================
-CREATE TABLE IF NOT EXISTS product_costs (
-  medusa_sku VARCHAR PRIMARY KEY,
-  unit_cost_gbp DECIMAL(10,2),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
 
 -- ================================================================================
 -- NW STOCKING ITEMS (Phase 1: Inventory items from NW stocking programme)

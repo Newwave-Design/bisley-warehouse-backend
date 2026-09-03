@@ -275,11 +275,10 @@ router.get('/inventory-value', authMiddleware, async (req: AuthRequest, res: Res
           COALESCE(wp.colour_name, sm.colour, wi.colour_code) AS colour,
           wi.liability_status                                  AS liability_status,
           SUM(wi.quantity)::int                                AS qty_on_hand,
-          ROUND(AVG(pc.unit_cost_gbp), 2)                      AS unit_cost_gbp,
-          ROUND(SUM(wi.quantity * COALESCE(pc.unit_cost_gbp, 0)), 2) AS stock_value_gbp
+          ROUND(AVG(wp.unit_cost_gbp), 2)                      AS unit_cost_gbp,
+          ROUND(SUM(wi.quantity * COALESCE(wp.unit_cost_gbp, 0)), 2) AS stock_value_gbp
         FROM warehouse_inventory wi
         LEFT JOIN wms_products wp ON wp.variant_sku = wi.product_sku
-        LEFT JOIN product_costs pc ON pc.medusa_sku = wi.product_sku
         -- sku_mappings is LEGACY/PAUSED (empty) - product_name/colour fall back to wp.* anyway
         LEFT JOIN sku_mappings sm ON sm.medusa_sku = wi.product_sku
         WHERE wi.quantity > 0
@@ -289,17 +288,17 @@ router.get('/inventory-value', authMiddleware, async (req: AuthRequest, res: Res
       `, [liability]),
       query(`
         SELECT wi.liability_status, SUM(wi.quantity)::int AS qty_on_hand,
-               ROUND(SUM(wi.quantity * COALESCE(pc.unit_cost_gbp, 0)), 2) AS stock_value_gbp
+               ROUND(SUM(wi.quantity * COALESCE(wp.unit_cost_gbp, 0)), 2) AS stock_value_gbp
         FROM warehouse_inventory wi
-        LEFT JOIN product_costs pc ON pc.medusa_sku = wi.product_sku
+        LEFT JOIN wms_products wp ON wp.variant_sku = wi.product_sku
         WHERE wi.quantity > 0
         GROUP BY wi.liability_status
       `),
       query(`
         SELECT SUM(wi.quantity)::int AS qty_on_hand,
-               ROUND(SUM(wi.quantity * COALESCE(pc.unit_cost_gbp, 0)), 2) AS stock_value_gbp
+               ROUND(SUM(wi.quantity * COALESCE(wp.unit_cost_gbp, 0)), 2) AS stock_value_gbp
         FROM warehouse_inventory wi
-        LEFT JOIN product_costs pc ON pc.medusa_sku = wi.product_sku
+        LEFT JOIN wms_products wp ON wp.variant_sku = wi.product_sku
         WHERE wi.quantity > 0
       `),
     ]);

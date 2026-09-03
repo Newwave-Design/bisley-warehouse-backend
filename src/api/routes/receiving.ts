@@ -21,6 +21,12 @@ import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 
 const router = express.Router();
 
+/** Current default liability owner applied to newly received stock (Bisley by default). */
+async function getDefaultLiabilityStatus(): Promise<string> {
+  const result = await query(`SELECT value FROM wms_settings WHERE key = 'default_liability_status'`);
+  return result.rows[0]?.value ?? 'Bisley';
+}
+
 // ================================================================================
 // PHASE 4: DISCREPANCIES
 // ================================================================================
@@ -163,14 +169,15 @@ router.post('/queue/:id/stock', authMiddleware, async (req: AuthRequest, res: Re
     if (!item.rows[0].location_id) return res.status(400).json({ error: 'Must assign a location first' });
 
     const { location_id, nw_code, colour, medusa_sku, quantity } = item.rows[0];
+    const defaultLiability = await getDefaultLiabilityStatus();
 
     // Upsert into warehouse_inventory
     await query(`
-      INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, NOW(), NOW())
+      INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
       ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
       DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
-    `, [location_id, medusa_sku || nw_code, colour || '', quantity]);
+    `, [location_id, medusa_sku || nw_code, colour || '', quantity, defaultLiability]);
 
     await query(
       `UPDATE requires_location_queue SET status='STOCKED', stocked_at=NOW(), updated_at=NOW() WHERE id=$1`,
@@ -202,14 +209,15 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
     const assigned = await query(`SELECT * FROM requires_location_queue WHERE status = 'ASSIGNED'`);
     let stocked = 0;
     const syncedSkus = new Set<string>();
+    const defaultLiability = await getDefaultLiabilityStatus();
 
     for (const item of assigned.rows) {
       await query(`
-        INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, NOW(), NOW())
+        INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
         ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
         DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
-      `, [item.location_id, item.medusa_sku || item.nw_code, item.colour || '', item.quantity]);
+      `, [item.location_id, item.medusa_sku || item.nw_code, item.colour || '', item.quantity, defaultLiability]);
 
       await query(
         `UPDATE requires_location_queue SET status='STOCKED', stocked_at=NOW(), updated_at=NOW() WHERE id=$1`,
@@ -291,5 +299,27 @@ router.delete('/queue/:id', authMiddleware, async (req: AuthRequest, res: Respon
     res.status(500).json({ error: 'Failed to remove queue item' });
   }
 });
+
+/**
+ * PATCH /api/receiving/inventory/liability — manually correct/reassign the liability owner
+ * for existing stock (e.g. after the 3-month Bisley period ends and you tell us to switch a SKU).
+ * Body: { product_sku, liability_status: 'Bisley' | 'Ovara' }
+ */
+router.patch('/inventory/liability', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+  try {
+    const { product_sku, liability_status } = req.body;
+    if (!product_sku || !['Bisley', 'Ovara'].includes(liability_status)) {
+      return res.status(400).json({ error: "product_sku and liability_status ('Bisley' or 'Ovara') are required" });
+    }
+    const result = await query(
+      `UPDATE warehouse_inventory SET liability_status = $1, updated_at = NOW() WHERE product_sku = $2 RETURNING id`,
+      [liability_status, product_sku]
+    );
+    res.json({ success: true, updated_rows: result.rowCount ?? 0 });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update liability status' });
+  }
+});
+
 
 export default router;

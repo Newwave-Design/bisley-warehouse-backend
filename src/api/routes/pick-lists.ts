@@ -717,13 +717,12 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: Request, res: 
     const items = await query(
       `SELECT pli.*, wi.location_id as inv_location_id,
               wi.liability_status AS inv_liability_status,
-              pc.unit_cost_gbp AS sku_unit_cost_gbp, wp.price_gbp AS product_price_gbp
+              wp.unit_cost_gbp AS sku_unit_cost_gbp, wp.price_gbp AS product_price_gbp
        FROM pick_list_items pli
        LEFT JOIN warehouse_inventory wi
          ON wi.product_sku = pli.product_sku
          AND wi.location_id = pli.picked_from_location_id
        LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
-       LEFT JOIN product_costs pc ON pc.medusa_sku = pli.product_sku
        WHERE pli.pick_list_id = $1 AND pli.quantity_picked > 0`,
       [pickListId]
     );

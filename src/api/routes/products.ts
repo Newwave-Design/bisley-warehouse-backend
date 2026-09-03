@@ -50,6 +50,7 @@ interface WmsVariant {
   inventory_qty: number; colour_code: string | null; colour_name: string | null
   allow_backorder: boolean; price_gbp: number | null; barcode: string | null
   weight_grams: number | null; height_mm: number | null; width_mm: number | null; depth_mm: number | null
+  unit_cost_gbp?: number | null
 }
 interface WmsProduct {
   id: string; title: string; subtitle: string | null; handle: string; status: string
@@ -255,6 +256,7 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
           'manage_inventory', manage_inventory,
           'allow_backorder', COALESCE(allow_backorder, false),
           'price_gbp',       price_gbp,
+          'unit_cost_gbp',   unit_cost_gbp,
           'barcode',         variant_barcode,
           'weight_grams',    COALESCE(variant_weight_grams, weight_grams),
           'is_kit',          is_kit,
@@ -309,6 +311,28 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
   } catch (err) {
     console.error('WMS cache read error:', err);
     res.status(500).json({ error: 'Failed to read WMS product cache', detail: (err as Error).message });
+  }
+});
+
+/**
+ * PATCH /api/products/:variantSku/cost — set the unit cost (£) for a variant.
+ * Not touched by /sync, so it persists across re-syncs from Medusa.
+ */
+router.patch('/:variantSku/cost', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+  try {
+    const { variantSku } = req.params;
+    const { unit_cost_gbp } = req.body;
+    if (unit_cost_gbp !== null && (typeof unit_cost_gbp !== 'number' || !Number.isFinite(unit_cost_gbp) || unit_cost_gbp < 0)) {
+      return res.status(400).json({ error: 'unit_cost_gbp must be a non-negative number or null' });
+    }
+    const result = await query(
+      `UPDATE wms_products SET unit_cost_gbp = $1, updated_at = NOW() WHERE variant_sku = $2 RETURNING variant_sku, unit_cost_gbp`,
+      [unit_cost_gbp, variantSku]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Variant not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update unit cost' });
   }
 });
 
