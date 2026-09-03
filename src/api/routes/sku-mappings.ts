@@ -11,6 +11,7 @@
  * - POST /api/sku-mappings/:id/validate - Mark as validated
  * - POST /api/sku-mappings/:id/reject - Mark as rejected
  * - POST /api/sku-mappings/auto-match - Run fuzzy matching
+ * - DELETE /api/sku-mappings?confirm=WIPE - Delete every mapping (ADMIN only)
  */
 
 import express, { Request, Response } from 'express';
@@ -18,6 +19,15 @@ import { query } from '../../db/index.js';
 import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
+
+// Bulk wipe — nw_stocking_items.mapping_id is ON DELETE SET NULL, so order history is preserved.
+router.delete('/', authMiddleware, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
+  if (req.query.confirm !== 'WIPE') {
+    return res.status(400).json({ error: "Pass ?confirm=WIPE to delete every sku_mappings row" });
+  }
+  const result = await query(`DELETE FROM sku_mappings`);
+  res.json({ success: true, deleted: result.rowCount ?? 0 });
+});
 
 /**
  * GET /api/sku-mappings
@@ -46,7 +56,7 @@ router.get('/', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: Au
       SELECT 
         s.id, s.nw_code, s.product_name, s.family, s.colour,
         s.medusa_sku, s.genero_code, s.status, s.confidence,
-        s.mapped_by, s.mapped_at, s.notes,
+        s.mapped_by, s.mapped_at, s.notes, s.unit_cost_gbp,
         COUNT(*) OVER() as total_count,
         COALESCE(SUM(n.quantity_ordered), 0) as total_quantity,
         w.variant_thumbnail, w.product_title as wms_title
@@ -92,7 +102,7 @@ router.get('/', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: Au
 
     sql += ` GROUP BY s.id, s.nw_code, s.product_name, s.family, s.colour,
              s.medusa_sku, s.genero_code, s.status, s.confidence,
-             s.mapped_by, s.mapped_at, s.notes, w.variant_thumbnail, w.product_title`;
+             s.mapped_by, s.mapped_at, s.notes, s.unit_cost_gbp, w.variant_thumbnail, w.product_title`;
 
     sql += ` ORDER BY s.created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
     params.push(parseInt(limit as string, 10));
@@ -117,6 +127,7 @@ router.get('/', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: Au
         mapped_by: row.mapped_by,
         mapped_at: row.mapped_at,
         notes: row.notes,
+        unit_cost_gbp: row.unit_cost_gbp,
         thumbnail: row.variant_thumbnail ?? null,
         wms_title: row.wms_title ?? null,
       })),
@@ -295,7 +306,7 @@ router.get('/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req:
 router.patch('/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const { medusa_sku, genero_code, status, notes, confidence } = req.body;
+    const { medusa_sku, genero_code, status, notes, confidence, unit_cost_gbp } = req.body;
 
     const updates: string[] = [];
     const params: any[] = [];
@@ -328,6 +339,12 @@ router.patch('/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (re
     if (confidence !== undefined) {
       updates.push(`confidence = $${paramIndex}`);
       params.push(confidence);
+      paramIndex++;
+    }
+
+    if (unit_cost_gbp !== undefined) {
+      updates.push(`unit_cost_gbp = $${paramIndex}`);
+      params.push(unit_cost_gbp === null ? null : Number(unit_cost_gbp));
       paramIndex++;
     }
 
