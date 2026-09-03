@@ -111,8 +111,12 @@ export const DEFAULT_PACKAGING_PROFILES: PackagingProfile[] = [
     default_cost_gbp: 3.8,
   },
   {
+    // Anything too big for BOX-SMALL/MEDIUM/LARGE. Not a pallet or freight decision by itself —
+    // the real courier (real UPS parcel quote, or AIT) is decided independently in
+    // src/lib/shipping-decision.ts. Kept as a large catch-all bin footprint for packaging-profile
+    // (physical box) selection purposes only.
     code: 'UPS-FREIGHT-CUSTOM-PALLET',
-    name: 'UPS Freight Custom Pallet',
+    name: 'Oversized / Non-Standard',
     package_type: 'freight',
     inner_length_mm: 3000,
     inner_width_mm: 2000,

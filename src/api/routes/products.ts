@@ -14,6 +14,7 @@ import { query } from '../../db/index.js';
 import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured, type UpsRateQuote } from '../../lib/ups.js';
+import { decideShippingForPackedItem, type AitAssignment } from '../../lib/shipping-decision.js';
 
 const router = express.Router();
 
@@ -561,10 +562,6 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
     let aitServiceCode = 'ait_freight';
     let aitServiceName = 'AIT Freight (Oversized / Non-Parcel)';
     let aitPercentageOfPrice = 10;
-    // UPS's real large-parcel allowance already lets a package go oversized with surcharges (up to
-    // its published limits) — that's fine and reflected automatically in the live quote price. But
-    // if the resulting cost isn't worth it relative to the item's price, use AIT instead.
-    const MAX_UPS_COST_PERCENT_OF_PRICE = 12;
 
     try {
       const aitResult = await query(
@@ -647,7 +644,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
       liveQuotes: UpsRateQuote[] | null;
       liveQuoteError: string | null;
       liveQuoteConfigRequired: boolean;
-      aitQuote: { service_code: string; service_name: string; percentage_of_price: number; price_gbp: number | null; estimated_cost_gbp: number | null } | null;
+      aitQuote: AitAssignment | null;
     }
 
     // Colour variants share identical dims within a product — compute the shipping decision once
@@ -696,77 +693,34 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
           const widthMm = packed.used_width_mm ?? 0;
           const heightMm = packed.used_height_mm ?? 0;
           const hasCompletePackedDims = lengthMm > 0 && widthMm > 0 && heightMm > 0 && estimate.package_weight_grams > 0;
-          const isFreightPackaging = estimate.picked_packaging_profile?.package_type === 'freight';
-          // MultiDesk kit bundles always ship via AIT regardless of whether UPS would technically
-          // accept them — everything else tries real UPS first, and only falls back to AIT if UPS
-          // itself rejects the package (i.e. it's genuinely too big for a courier parcel/freight service).
-          const isMultidesk = Boolean(row.is_kit);
 
-          let liveQuotes: UpsRateQuote[] | null = null;
-          let liveQuoteError: string | null = null;
-          let liveQuoteConfigRequired = false;
-          let aitQuote: VariantShippingGroup['aitQuote'] = null;
-
-          const buildAitQuote = (): VariantShippingGroup['aitQuote'] => {
-            const priceGbp = asNumber(row.price_gbp);
+          if (!hasCompletePackedDims) {
             return {
-              service_code: aitServiceCode,
-              service_name: aitServiceName,
-              percentage_of_price: aitPercentageOfPrice,
-              price_gbp: priceGbp,
-              estimated_cost_gbp: priceGbp != null ? Math.round(priceGbp * (aitPercentageOfPrice / 100) * 100) / 100 : null,
+              estimate, isUpsEligible, upsIneligibleReasons,
+              liveQuotes: null,
+              liveQuoteError: 'Missing weight or dimensions — cannot request a live UPS rate.',
+              liveQuoteConfigRequired: false,
+              aitQuote: null,
             };
-          };
-
-          if (isMultidesk) {
-            aitQuote = buildAitQuote();
-          } else if (!upsReferenceDestinationConfigured()) {
-            liveQuoteConfigRequired = true;
-            liveQuoteError = 'Live UPS rates are not configured. Set UPS_REFERENCE_DESTINATION_* env vars on the backend.';
-          } else if (!hasCompletePackedDims) {
-            liveQuoteError = 'Missing weight or dimensions — cannot request a live UPS rate.';
-          } else {
-            const result = await getCachedUpsRates({ lengthMm, widthMm, heightMm, weightGrams: estimate.package_weight_grams });
-            // Only surface genuine UPS parcel services (not UPS's own freight/pallet-tier service) —
-            // Bisley uses AIT for freight, not UPS Express Freight.
-            const parcelQuotes = (result.quotes ?? []).filter((quote) => {
-              const matchedService = quote.internalServiceCode ? services.find(s => s.service_code === quote.internalServiceCode) : null;
-              return matchedService?.shipment_mode === 'parcel';
-            });
-            // UPS's Rating API often omits Service.Description for this account — fall back to our own
-            // configured service name (same catalogue shown in Settings > Shipping & Packing) for the same code.
-            liveQuotes = parcelQuotes.length ? parcelQuotes.map((quote) => {
-              const matchedService = quote.internalServiceCode
-                ? services.find(s => s.service_code === quote.internalServiceCode)
-                : null;
-              return {
-                ...quote,
-                serviceName: matchedService?.service_name ?? quote.serviceName ?? `UPS service ${quote.upsServiceCode}`,
-              };
-            }) : null;
-            liveQuoteError = result.error ?? (result.quotes?.length && !parcelQuotes.length ? 'UPS only offered freight-tier services for this package.' : null);
-            // Genuinely too big for UPS parcel — fall back to AIT rather than a dead end.
-            if (liveQuoteError || !liveQuotes?.length) {
-              aitQuote = buildAitQuote();
-            } else {
-              // UPS would carry it (with surcharges, up to its published limits) but if the
-              // cheapest quote costs more than 12% of the item's price, it's not worth it — use
-              // AIT instead even though UPS technically accepted the package.
-              const priceGbp = asNumber(row.price_gbp);
-              const cheapest = liveQuotes.reduce((best, quote) => {
-                if (quote.totalChargesAmount == null) return best;
-                if (!best || (best.totalChargesAmount ?? Infinity) > quote.totalChargesAmount) return quote;
-                return best;
-              }, null as (typeof liveQuotes)[number] | null);
-              const tooExpensiveForUps = priceGbp != null && cheapest?.totalChargesAmount != null
-                && cheapest.totalChargesAmount > priceGbp * (MAX_UPS_COST_PERCENT_OF_PRICE / 100);
-              if (tooExpensiveForUps) {
-                aitQuote = buildAitQuote();
-              }
-            }
           }
 
-          return { estimate, isUpsEligible, upsIneligibleReasons, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote };
+          const decisionResult = await decideShippingForPackedItem({
+            lengthMm, widthMm, heightMm, weightGrams: estimate.package_weight_grams,
+            priceGbp: asNumber(row.price_gbp),
+            isMultidesk: Boolean(row.is_kit),
+            upsServices: services,
+            aitServiceCode, aitServiceName, aitPercentageOfPrice,
+            upsConfigured: upsReferenceDestinationConfigured(),
+            getUpsQuotes: getCachedUpsRates,
+          });
+
+          return {
+            estimate, isUpsEligible, upsIneligibleReasons,
+            liveQuotes: decisionResult.liveQuotes,
+            liveQuoteError: decisionResult.liveQuoteError,
+            liveQuoteConfigRequired: decisionResult.liveQuoteConfigRequired,
+            aitQuote: decisionResult.aitQuote,
+          };
         })();
         groupPromiseCache.set(groupKey, groupPromise);
       }

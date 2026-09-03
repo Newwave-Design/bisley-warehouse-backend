@@ -9,6 +9,7 @@ import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured } from '../../lib/ups.js';
+import { decideShippingForPackedItem } from '../../lib/shipping-decision.js';
 
 const router = express.Router();
 
@@ -349,7 +350,7 @@ router.post('/shipping-services/ups-sync', authMiddleware, requireRole(['MANAGER
           profile.tare_weight_grams,
           profile.default_cost_gbp,
           profile.code === 'UPS-FREIGHT-CUSTOM-PALLET'
-            ? 'Oversize or heavy items. Freight and packaging pricing require a quote.'
+            ? "Doesn't fit a standard carton. Real courier (UPS parcel or AIT) is decided per item from a live quote, not from this profile."
             : null,
         ]
       );
@@ -423,7 +424,7 @@ async function runUpsAutoTagJob() {
          WHERE variant_sku IS NOT NULL AND variant_sku <> ''`
       ),
       query(
-        `SELECT service_code, metadata FROM shipping_services WHERE service_code = 'ait_freight' AND is_active = true LIMIT 1`
+        `SELECT service_code, service_name, metadata FROM shipping_services WHERE service_code = 'ait_freight' AND is_active = true LIMIT 1`
       ),
     ]);
 
@@ -431,12 +432,8 @@ async function runUpsAutoTagJob() {
     // carton — a flat percentage-of-price cost estimate, not a live-quoted courier. Percentage is
     // configurable via the shipping-services settings UI (falls back to 10% if not set up yet).
     const aitServiceCode = aitServiceResult.rows[0]?.service_code ?? 'ait_freight';
+    const aitServiceName = aitServiceResult.rows[0]?.service_name ?? 'AIT Freight (Oversized / Non-Parcel)';
     const aitPercentageOfPrice = asNumber(aitServiceResult.rows[0]?.metadata?.percentage_of_price) ?? 10;
-    // UPS's real large-parcel allowance already lets a package go oversized with surcharges (up to
-    // its published limits, encoded in the ups_standard/ups_express constraints) — that's fine and
-    // is reflected automatically in the live quote price. But if the resulting cost isn't worth it
-    // relative to the item's price, use AIT instead even though UPS would technically carry it.
-    const MAX_UPS_COST_PERCENT_OF_PRICE = 12;
 
     // Kit variants (e.g. MultiDesk) have no dims of their own — batch-load every component
     // SKU's dims once so kit dimensions can be computed as stacked-in-a-box totals.
@@ -503,7 +500,6 @@ async function runUpsAutoTagJob() {
     // packaging/UPS/AIT logic (and issuing redundant live UPS calls) for every colour.
     interface AutoTagDecision {
       estimate: ReturnType<typeof estimateShippingForServices> | null;
-      isFreightPackaging: boolean;
       preferredServiceCode: string | null;
       preferredCostAmount: number | null;
       preferredCostCurrency: string | null;
@@ -572,77 +568,39 @@ async function runUpsAutoTagJob() {
         let preferredCostCurrency: string | null = null;
         let manualReviewReason: string | null = null;
 
-        const isFreightPackaging = estimate?.picked_packaging_profile?.package_type === 'freight';
-        // MultiDesk kit bundles always ship via AIT regardless of whether UPS would technically
-        // accept them — everything else tries real UPS first, and only falls back to AIT if UPS
-        // itself rejects the package (i.e. it's genuinely too big for a courier parcel/freight service).
-        const isMultidesk = Boolean(row.is_kit);
-
-        function assignAit(priceGbp: number | null): boolean {
-          if (priceGbp == null) return false;
-          preferredServiceCode = aitServiceCode;
-          preferredCostAmount = Math.round(priceGbp * (aitPercentageOfPrice / 100) * 100) / 100;
-          preferredCostCurrency = 'GBP';
-          return true;
-        }
-
         if (!hasCompleteDimensions) {
           manualReviewReason = 'Manual review required - product weight and all dimensions must be recorded before a shipping service can be assigned.';
         } else if (!hasCompletePackedDims) {
           manualReviewReason = 'Manual review required - no packaging profile could be resolved for this item\'s dimensions.';
-        } else if (isMultidesk) {
-          if (!assignAit(asNumber(row.price_gbp))) {
-            manualReviewReason = 'Manual review required - no price recorded to calculate AIT percentage-based shipping cost.';
-          }
         } else {
-          const result = await getCachedUpsRates({ lengthMm, widthMm, heightMm, weightGrams: packageWeightGrams });
-          // Only accept genuine UPS parcel services (not UPS's own freight/pallet-tier service) —
-          // Bisley uses AIT for freight, not UPS Express Freight, so treat a freight-tier-only quote
-          // the same as a rejection and fall back to AIT.
-          const parcelQuotes = (result.quotes ?? []).filter((quote) => {
-            const matchedService = quote.internalServiceCode ? services.find(s => s.service_code === quote.internalServiceCode) : null;
-            return matchedService?.shipment_mode === 'parcel';
+          const decisionResult = await decideShippingForPackedItem({
+            lengthMm, widthMm, heightMm, weightGrams: packageWeightGrams,
+            priceGbp: asNumber(row.price_gbp),
+            isMultidesk: Boolean(row.is_kit),
+            upsServices: services,
+            aitServiceCode, aitServiceName, aitPercentageOfPrice,
+            upsConfigured: true,
+            getUpsQuotes: getCachedUpsRates,
           });
-          if (result.error || !parcelQuotes.length) {
-            // Genuinely too big for UPS parcel — fall back to AIT rather than leaving it unassigned.
-            if (!assignAit(asNumber(row.price_gbp))) {
-              manualReviewReason = `Manual review required - UPS ${result.error ? 'rejected this package' : 'only offered freight-tier services'} (${result.error ?? 'no parcel services were returned'}) and no price is recorded to fall back to AIT.`;
-            }
-          } else {
-            const cheapest = parcelQuotes.reduce((best, quote) => {
-              if (quote.totalChargesAmount == null || !quote.internalServiceCode) return best;
-              if (!best || (best.totalChargesAmount ?? Infinity) > quote.totalChargesAmount) return quote;
-              return best;
-            }, null as (typeof parcelQuotes)[number] | null);
-
-            if (!cheapest?.internalServiceCode) {
-              manualReviewReason = 'Manual review required - UPS returned quotes but none matched a configured internal service code.';
-            } else {
-              const priceGbp = asNumber(row.price_gbp);
-              const tooExpensiveForUps = priceGbp != null && cheapest.totalChargesAmount != null
-                && cheapest.totalChargesAmount > priceGbp * (MAX_UPS_COST_PERCENT_OF_PRICE / 100);
-              if (tooExpensiveForUps) {
-                // UPS would carry it (with surcharges) but it costs more than 12% of the item's
-                // price — not worth it, use AIT instead even though UPS technically accepted it.
-                assignAit(priceGbp);
-              } else {
-                preferredServiceCode = cheapest.internalServiceCode;
-                preferredCostAmount = cheapest.totalChargesAmount ?? null;
-                preferredCostCurrency = cheapest.totalChargesCurrency ?? null;
-              }
-            }
-          }
+          preferredServiceCode = decisionResult.preferredServiceCode;
+          preferredCostAmount = decisionResult.preferredCostAmount;
+          preferredCostCurrency = decisionResult.preferredCostCurrency;
+          manualReviewReason = decisionResult.manualReviewReason;
         }
 
-        decision = { estimate, isFreightPackaging, preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason };
+        decision = { estimate, preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason };
         if (groupKey) groupDecisionCache.set(groupKey, decision);
       }
 
-      const { estimate, isFreightPackaging, preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason } = decision;
+      const { estimate, preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason } = decision;
 
       if (!preferredServiceCode) noEligible++;
       const needsManual = Boolean(manualReviewReason);
       if (needsManual) manualReview++;
+      // Checklist template follows the REAL assigned courier, not the packaging-profile-fit
+      // heuristic (which is just a physical box-size check and can flag a small item as "doesn't
+      // fit a standard carton" without it actually shipping via freight).
+      const checklistTemplateCode = preferredServiceCode === aitServiceCode ? 'PALLET-FREIGHT' : 'STD-PARCEL';
 
       await query(
         `INSERT INTO product_fulfillment_profiles (
@@ -674,7 +632,7 @@ async function runUpsAutoTagJob() {
         [
           row.variant_sku,
           estimate?.picked_packaging_profile?.code ?? null,
-          isFreightPackaging ? 'PALLET-FREIGHT' : 'STD-PARCEL',
+          checklistTemplateCode,
           preferredServiceCode,
           needsManual,
           JSON.stringify(needsManual ? ['ups-manual-review'] : ['ups-auto-tagged']),
