@@ -617,8 +617,6 @@ CREATE TABLE IF NOT EXISTS sku_mappings (
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
--- Per-SKU cost (Phase 6: Financials) — single cost basis per SKU, editable in the SKU Mapping view
-ALTER TABLE sku_mappings ADD COLUMN IF NOT EXISTS unit_cost_gbp DECIMAL(10,2);
 
 -- ================================================================================
 -- NW STOCKING ITEMS (Phase 1: Inventory items from NW stocking programme)
