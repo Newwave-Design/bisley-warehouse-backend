@@ -713,13 +713,17 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: Request, res: 
       return res.status(400).json({ error: 'Pick list must be picked or packed before dispatch' });
     }
 
-    // Get all picked items
+    // Get all picked items, plus the cost/liability/price to stamp onto them at the point of sale
     const items = await query(
-      `SELECT pli.*, wi.location_id as inv_location_id
+      `SELECT pli.*, wi.location_id as inv_location_id,
+              wi.liability_status AS inv_liability_status,
+              pc.unit_cost_gbp AS sku_unit_cost_gbp, wp.price_gbp AS product_price_gbp
        FROM pick_list_items pli
        LEFT JOIN warehouse_inventory wi
          ON wi.product_sku = pli.product_sku
          AND wi.location_id = pli.picked_from_location_id
+       LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
+       LEFT JOIN product_costs pc ON pc.medusa_sku = pli.product_sku
        WHERE pli.pick_list_id = $1 AND pli.quantity_picked > 0`,
       [pickListId]
     );
@@ -742,6 +746,15 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: Request, res: 
         [qty, sku, locationId]
       );
       syncSkus.add(sku);
+
+      // Stamp cost/price/liability onto this sale line — fixed at dispatch time so it
+      // stays correct in historical reports even if the liability default later flips.
+      await query(
+        `UPDATE pick_list_items
+         SET unit_cost_gbp = $1, unit_price_gbp = $2, liability_status = $3, updated_at = NOW()
+         WHERE id = $4`,
+        [item.sku_unit_cost_gbp ?? null, item.product_price_gbp ?? null, item.inv_liability_status ?? 'Bisley', item.id]
+      );
     }
 
     // Mark pick list as dispatched

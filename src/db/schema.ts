@@ -127,6 +127,20 @@ ALTER TABLE warehouse_inventory DROP CONSTRAINT IF EXISTS unique_location_sku_co
 CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_sku_loc_coalesce
   ON warehouse_inventory(location_id, product_sku, COALESCE(colour_code, ''));
 
+-- Bisley/Ovara stock liability tracking (Phase 6: Financials)
+ALTER TABLE warehouse_inventory ADD COLUMN IF NOT EXISTS liability_status VARCHAR(20) NOT NULL DEFAULT 'Bisley';
+CREATE INDEX IF NOT EXISTS idx_inventory_liability ON warehouse_inventory(liability_status);
+
+-- ================================================================================
+-- WMS SETTINGS (Phase 6: single key/value store for global toggles)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS wms_settings (
+  key VARCHAR(100) PRIMARY KEY,
+  value TEXT,
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+INSERT INTO wms_settings (key, value) VALUES ('default_liability_status', 'Bisley') ON CONFLICT (key) DO NOTHING;
+
 -- ================================================================================
 -- WAREHOUSE MOVEMENTS (Audit trail: receives, picks, adjustments)
 -- ================================================================================
@@ -279,6 +293,10 @@ CREATE TABLE IF NOT EXISTS pick_list_items (
   CONSTRAINT unique_line_per_picklist UNIQUE(pick_list_id, line_number)
 );
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS is_sandbox BOOLEAN NOT NULL DEFAULT false;
+-- Stamped at dispatch time so sales history stays fixed even if the liability default later flips
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS liability_status VARCHAR(20);
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS unit_price_gbp DECIMAL(10,2);
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS unit_cost_gbp DECIMAL(10,2);
 
 -- ================================================================================
 -- PICK SCANS (Individual scan history — supports partial-quantity picking,
@@ -596,6 +614,19 @@ CREATE TABLE IF NOT EXISTS sku_mappings (
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
+-- Per-SKU cost (Phase 6: Financials) — single cost basis per SKU, editable in the SKU Mapping view
+ALTER TABLE sku_mappings ADD COLUMN IF NOT EXISTS unit_cost_gbp DECIMAL(10,2);
+
+-- ================================================================================
+-- PRODUCT COSTS (per-SKU cost basis for gross margin / COGS / stock valuation)
+-- Split out from sku_mappings (2026-09-03): cost basis is a live requirement keyed
+-- directly on Medusa SKU, unrelated to translating external NW/Genero supplier codes.
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS product_costs (
+  medusa_sku VARCHAR PRIMARY KEY,
+  unit_cost_gbp DECIMAL(10,2),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
 
 -- ================================================================================
 -- NW STOCKING ITEMS (Phase 1: Inventory items from NW stocking programme)
@@ -635,7 +666,10 @@ CREATE INDEX IF NOT EXISTS idx_movements_sku ON warehouse_movements(product_sku)
 CREATE INDEX IF NOT EXISTS idx_movements_date ON warehouse_movements(movement_date);
 CREATE INDEX IF NOT EXISTS idx_pick_lists_status ON pick_lists(status);
 CREATE INDEX IF NOT EXISTS idx_pick_lists_medusa_id ON pick_lists(medusa_order_id);
+CREATE INDEX IF NOT EXISTS idx_pick_lists_dispatched_at ON pick_lists(dispatched_at);
 CREATE INDEX IF NOT EXISTS idx_pick_items_status ON pick_list_items(status);
+CREATE INDEX IF NOT EXISTS idx_pick_items_sku ON pick_list_items(product_sku);
+CREATE INDEX IF NOT EXISTS idx_pick_items_liability ON pick_list_items(liability_status);
 CREATE INDEX IF NOT EXISTS idx_supplier_orders_status ON supplier_orders(status);
 CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_line_items(order_id);
 CREATE INDEX IF NOT EXISTS idx_order_items_nw_code ON order_line_items(nw_code);

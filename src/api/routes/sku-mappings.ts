@@ -1,7 +1,14 @@
 /**
  * SKU Mapping API Routes
  * Phase 1: Inventory Intake & SKU Mapping
- * 
+ *
+ * ⚠️ LEGACY / PAUSED (2026-09-03): WMS and Medusa SKUs are confirmed 1:1 aligned already
+ * (0 discrepancies across all stocked SKUs) — this table is NOT part of any live WMS
+ * flow right now. Its only real purpose is translating external NW/Genero supplier
+ * codes to Medusa SKUs, which isn't needed until Genero is actually connected. The
+ * table was wiped clean and the UI nav link removed; routes below still work but the
+ * table is expected to be empty. Do not treat an empty/near-empty table as a bug.
+ *
  * Endpoints:
  * - GET /api/sku-mappings - List all mappings with filters
  * - GET /api/sku-mappings/unmapped - Show only unmapped items

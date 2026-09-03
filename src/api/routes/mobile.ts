@@ -39,7 +39,8 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
       return res.json({ found: true, source: 'barcode', ...bm.rows[0], stock });
     }
 
-    // 2. NW code in sku_mappings
+    // 2. NW code in sku_mappings (LEGACY/PAUSED - table is expected to be empty until
+    // Genero is connected; barcode_mappings above is the live path)
     const sm = await query(
       `SELECT s.nw_code AS sku, s.colour AS colour_name, s.product_name,
               w.variant_thumbnail AS thumbnail, w.colour_code

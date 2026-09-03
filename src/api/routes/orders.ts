@@ -114,6 +114,8 @@ router.post('/', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: A
 
 router.get('/thresholds', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
+    // sm.product_name/medusa_sku will be null while sku_mappings is LEGACY/PAUSED (empty) -
+    // thresholds still work fine keyed on nw_code alone.
     const result = await query(`
       SELECT t.*, s.product_name, s.family, s.medusa_sku
       FROM inventory_thresholds t
@@ -153,6 +155,8 @@ router.post('/from-nw', authMiddleware, requireRole(['MANAGER','ADMIN']), async 
       WHERE n.quantity_ordered > 0
       ORDER BY n.family, n.nw_code, n.colour
     `);
+    // sku_mappings is LEGACY/PAUSED (empty) - s.medusa_sku/product_name will be null below,
+    // handled with fallbacks; order_line_items still keys on nw_code+colour for check-in compare.
 
     if (items.rows.length === 0) {
       return res.status(400).json({ error: 'No NW stocking items found' });

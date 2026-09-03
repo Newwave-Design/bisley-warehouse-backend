@@ -82,7 +82,8 @@ router.get('/', authMiddleware, async (_req: AuthRequest, res: Response) => {
         FROM genero_order_lines
       `),
 
-      // SKU mapping coverage
+      // SKU mapping coverage — sku_mappings is LEGACY/PAUSED (expected to be empty until
+      // Genero is connected); the Reports UI already renders a "paused" message for this.
       query(`
         SELECT
           COUNT(*) FILTER (WHERE status = 'VALIDATED')::int  AS validated,
@@ -148,6 +149,170 @@ router.get('/movements', authMiddleware, async (req: AuthRequest, res: Response)
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch movements' });
+  }
+});
+
+/** Escapes a value for a CSV cell (quotes if it contains a comma, quote or newline). */
+function toCsvCell(value: unknown): string {
+  const s = value === null || value === undefined ? '' : String(value);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+function toCsv(rows: Record<string, unknown>[], columns: string[]): string {
+  const header = columns.join(',');
+  const body = rows.map(r => columns.map(c => toCsvCell(r[c])).join(','));
+  return [header, ...body].join('\n');
+}
+
+/** Default to the last 7 days when no date range is given. */
+function resolveDateRange(from?: string, to?: string): { from: string; to: string } {
+  const toDate = to ? new Date(to) : new Date();
+  const fromDate = from ? new Date(from) : new Date(toDate.getTime() - 7 * 24 * 60 * 60 * 1000);
+  return { from: fromDate.toISOString().split('T')[0], to: toDate.toISOString().split('T')[0] };
+}
+
+/**
+ * GET /api/reports/weekly-sku-summary?from=&to=&liability=Bisley|Ovara&format=csv|json
+ * SKU-level breakdown of what was sold (dispatched) in the date range, for the weekly
+ * reconciliation/invoicing report sent to Bisley. Liability status is the value stamped
+ * on each pick_list_item at dispatch time — not the current default.
+ */
+router.get('/weekly-sku-summary', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { from, to } = resolveDateRange(req.query.from as string, req.query.to as string);
+    const liability = (req.query.liability as string) || null;
+    const format = (req.query.format as string) || 'json';
+
+    const result = await query(`
+      SELECT
+        pli.product_sku AS sku,
+        COALESCE(wp.product_title, sm.product_name)         AS product_name,
+        COALESCE(wp.colour_name, sm.colour, pli.colour_code) AS colour,
+        pli.liability_status                                 AS liability_status,
+        SUM(pli.quantity_picked)::int                        AS qty_sold,
+        ROUND(AVG(pli.unit_cost_gbp), 2)                     AS unit_cost_gbp,
+        ROUND(AVG(pli.unit_price_gbp), 2)                    AS unit_price_gbp,
+        ROUND(SUM(pli.quantity_picked * COALESCE(pli.unit_cost_gbp, 0)), 2)  AS total_cost_gbp,
+        ROUND(SUM(pli.quantity_picked * COALESCE(pli.unit_price_gbp, 0)), 2) AS total_sales_value_gbp,
+        ROUND(SUM(pli.quantity_picked * COALESCE(pli.unit_price_gbp, 0))
+            - SUM(pli.quantity_picked * COALESCE(pli.unit_cost_gbp, 0)), 2)  AS gross_margin_gbp
+      FROM pick_list_items pli
+      JOIN pick_lists pl ON pl.id = pli.pick_list_id
+      LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
+      -- sku_mappings is LEGACY/PAUSED (empty) - product_name/colour fall back to wp.* anyway
+      LEFT JOIN sku_mappings sm ON sm.medusa_sku = pli.product_sku
+      WHERE pl.status = 'DISPATCHED'
+        AND pl.dispatched_at::date BETWEEN $1 AND $2
+        AND pli.is_sandbox = false
+        AND ($3::varchar IS NULL OR pli.liability_status = $3)
+      GROUP BY pli.product_sku, wp.product_title, sm.product_name, wp.colour_name, sm.colour, pli.colour_code, pli.liability_status
+      ORDER BY sku
+    `, [from, to, liability]);
+
+    if (format === 'csv') {
+      const csv = toCsv(result.rows, ['sku', 'product_name', 'colour', 'liability_status', 'qty_sold',
+        'unit_cost_gbp', 'unit_price_gbp', 'total_cost_gbp', 'total_sales_value_gbp', 'gross_margin_gbp']);
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="weekly-sku-summary-${from}-to-${to}.csv"`);
+      return res.send(csv);
+    }
+
+    res.json({ from, to, liability: liability ?? 'ALL', rows: result.rows });
+  } catch (err) {
+    console.error('Weekly SKU summary error:', err);
+    res.status(500).json({ error: 'Failed to generate weekly SKU summary' });
+  }
+});
+
+/**
+ * GET /api/reports/financials?group=day|week|month&from=&to=&liability=
+ * Sales rolled up by period for the internal financials view (Sales tab).
+ */
+router.get('/financials', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { from, to } = resolveDateRange(req.query.from as string, req.query.to as string);
+    const liability = (req.query.liability as string) || null;
+    const group = (['day', 'week', 'month'].includes(req.query.group as string) ? req.query.group : 'day') as string;
+
+    const result = await query(`
+      SELECT
+        date_trunc($4, pl.dispatched_at)::date                              AS period,
+        SUM(pli.quantity_picked)::int                                       AS units_sold,
+        ROUND(SUM(pli.quantity_picked * COALESCE(pli.unit_price_gbp, 0)), 2) AS sales_value_gbp,
+        ROUND(SUM(pli.quantity_picked * COALESCE(pli.unit_cost_gbp, 0)), 2)  AS cogs_gbp,
+        ROUND(SUM(pli.quantity_picked * COALESCE(pli.unit_price_gbp, 0))
+            - SUM(pli.quantity_picked * COALESCE(pli.unit_cost_gbp, 0)), 2)  AS gross_margin_gbp
+      FROM pick_list_items pli
+      JOIN pick_lists pl ON pl.id = pli.pick_list_id
+      WHERE pl.status = 'DISPATCHED'
+        AND pl.dispatched_at::date BETWEEN $1 AND $2
+        AND pli.is_sandbox = false
+        AND ($3::varchar IS NULL OR pli.liability_status = $3)
+      GROUP BY period
+      ORDER BY period
+    `, [from, to, liability, group]);
+
+    res.json({ from, to, group, liability: liability ?? 'ALL', rows: result.rows });
+  } catch (err) {
+    console.error('Financials report error:', err);
+    res.status(500).json({ error: 'Failed to generate financials report' });
+  }
+});
+
+/**
+ * GET /api/reports/inventory-value?liability=
+ * Current stock value (qty x unit cost), split by liability status, for the
+ * financials view's Inventory tab.
+ */
+router.get('/inventory-value', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const liability = (req.query.liability as string) || null;
+
+    const [bySku, byLiability, total] = await Promise.all([
+      query(`
+        SELECT
+          wi.product_sku AS sku,
+          COALESCE(wp.product_title, sm.product_name)         AS product_name,
+          COALESCE(wp.colour_name, sm.colour, wi.colour_code) AS colour,
+          wi.liability_status                                  AS liability_status,
+          SUM(wi.quantity)::int                                AS qty_on_hand,
+          ROUND(AVG(pc.unit_cost_gbp), 2)                      AS unit_cost_gbp,
+          ROUND(SUM(wi.quantity * COALESCE(pc.unit_cost_gbp, 0)), 2) AS stock_value_gbp
+        FROM warehouse_inventory wi
+        LEFT JOIN wms_products wp ON wp.variant_sku = wi.product_sku
+        LEFT JOIN product_costs pc ON pc.medusa_sku = wi.product_sku
+        -- sku_mappings is LEGACY/PAUSED (empty) - product_name/colour fall back to wp.* anyway
+        LEFT JOIN sku_mappings sm ON sm.medusa_sku = wi.product_sku
+        WHERE wi.quantity > 0
+          AND ($1::varchar IS NULL OR wi.liability_status = $1)
+        GROUP BY wi.product_sku, wp.product_title, sm.product_name, wp.colour_name, sm.colour, wi.colour_code, wi.liability_status
+        ORDER BY stock_value_gbp DESC NULLS LAST
+      `, [liability]),
+      query(`
+        SELECT wi.liability_status, SUM(wi.quantity)::int AS qty_on_hand,
+               ROUND(SUM(wi.quantity * COALESCE(pc.unit_cost_gbp, 0)), 2) AS stock_value_gbp
+        FROM warehouse_inventory wi
+        LEFT JOIN product_costs pc ON pc.medusa_sku = wi.product_sku
+        WHERE wi.quantity > 0
+        GROUP BY wi.liability_status
+      `),
+      query(`
+        SELECT SUM(wi.quantity)::int AS qty_on_hand,
+               ROUND(SUM(wi.quantity * COALESCE(pc.unit_cost_gbp, 0)), 2) AS stock_value_gbp
+        FROM warehouse_inventory wi
+        LEFT JOIN product_costs pc ON pc.medusa_sku = wi.product_sku
+        WHERE wi.quantity > 0
+      `),
+    ]);
+
+    res.json({
+      liability: liability ?? 'ALL',
+      total: total.rows[0],
+      by_liability: byLiability.rows,
+      by_sku: bySku.rows,
+    });
+  } catch (err) {
+    console.error('Inventory value report error:', err);
+    res.status(500).json({ error: 'Failed to generate inventory value report' });
   }
 });
 

@@ -41,7 +41,8 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
       return res.json({ source: 'barcode', ...barcode.rows[0] });
     }
 
-    // 2. Check sku_mappings by NW code
+    // 2. Check sku_mappings by NW code (LEGACY/PAUSED - table is expected to be empty
+    // until Genero is connected; barcode_mappings above is the live path)
     const mapping = await query(
       `SELECT sm.nw_code, sm.product_name, sm.family, sm.colour, sm.medusa_sku,
               wp.metadata, wp.product_handle, wp.variant_thumbnail,
@@ -176,7 +177,7 @@ router.post('/sessions/:id/scan', authMiddleware, async (req: AuthRequest, res: 
     if (!session.rows[0]) return res.status(404).json({ error: 'Session not found' });
     if (session.rows[0].status === 'COMPLETE') return res.status(400).json({ error: 'Session is complete' });
 
-    // Lookup medusa_sku from mappings
+    // Lookup medusa_sku from mappings (LEGACY/PAUSED table - usually empty, resolves to null)
     const mapping = await query(`SELECT medusa_sku FROM sku_mappings WHERE nw_code = $1`, [nw_code]);
     const medusa_sku = mapping.rows[0]?.medusa_sku || null;
 
