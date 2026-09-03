@@ -714,8 +714,13 @@ router.get('/shipping-services/ups-auto-tag-status', authMiddleware, requireRole
  */
 router.get('/liability-default', authMiddleware, async (_req: AuthRequest, res: Response) => {
   try {
-    const result = await query(`SELECT value, updated_at FROM wms_settings WHERE key = 'default_liability_status'`);
-    res.json({ default_liability_status: result.rows[0]?.value ?? 'Bisley', updated_at: result.rows[0]?.updated_at ?? null });
+    const result = await query(`SELECT key, value, updated_at FROM wms_settings WHERE key IN ('default_liability_status', 'liability_review_date')`);
+    const byKey = Object.fromEntries(result.rows.map(r => [r.key, r]));
+    res.json({
+      default_liability_status: byKey.default_liability_status?.value ?? 'Bisley',
+      updated_at: byKey.default_liability_status?.updated_at ?? null,
+      liability_review_date: byKey.liability_review_date?.value ?? null,
+    });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch liability default' });
   }

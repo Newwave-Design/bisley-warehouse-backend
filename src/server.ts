@@ -20,7 +20,7 @@ import productsRoutes from './api/routes/products.js';
 import settingsRoutes from './api/routes/settings.js';
 import dashboardRoutes from './api/routes/dashboard.js';
 import generoRoutes from './api/routes/genero.js';
-import reportsRoutes from './api/routes/reports.js';
+import reportsRoutes, { generateAndStoreWeeklyReport } from './api/routes/reports.js';
 import mobileRoutes from './api/routes/mobile.js';
 import webhooksRoutes from './api/routes/webhooks.js';
 import reorderRulesRoutes, { pendingRouter as pendingReordersRouter, runReorderCheck } from './api/routes/reorder-rules.js';
@@ -180,6 +180,14 @@ async function start() {
       }, THIRTY_MIN);
       console.log('✓ Inventory discrepancy check scheduled (every 30 min)');
     }
+
+    // Daily checks unconditional of Genero config: weekly report + liability review reminder
+    if (process.env.NODE_ENV === 'production') {
+      const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
+      setInterval(() => { void runDailyChecks(); }, TWENTY_FOUR_HOURS);
+      void runDailyChecks(); // also run once on boot rather than waiting a full day
+      console.log('✓ Daily checks scheduled (weekly report + liability review, every 24h)');
+    }
   } catch (error) {
     console.error('❌ Startup failed:', error);
     process.exit(1);
@@ -211,6 +219,28 @@ async function runDailyChecks() {
         'Check the Deliveries page to see what to expect and start a check-in when stock arrives.',
         { link: '/deliveries', severity: 'warning' }
       );
+    }
+
+    // Weekly SKU summary report — generates + archives once per rolling 7-day period
+    try {
+      const weeklyResult = await generateAndStoreWeeklyReport();
+      if (weeklyResult.generated) {
+        console.log(`[daily-checks] Weekly report generated: ${weeklyResult.period_start} to ${weeklyResult.period_end}, ${weeklyResult.row_count} rows`);
+      }
+    } catch (err) { console.warn('[daily-checks] Weekly report generation error:', err); }
+
+    // Bisley/Ovara liability review reminder — fires once the review date has passed,
+    // repeats daily (via createNotificationOnce's 24h dedup) until the default is switched.
+    const reviewDate = await dbQueryUtil(`SELECT value FROM wms_settings WHERE key = 'liability_review_date'`);
+    if (reviewDate.rows[0]?.value && today >= reviewDate.rows[0].value) {
+      const currentDefault = await dbQueryUtil(`SELECT value FROM wms_settings WHERE key = 'default_liability_status'`);
+      if (currentDefault.rows[0]?.value !== 'Ovara') {
+        await createNotificationOnce('LIABILITY_REVIEW_DUE',
+          'Time to review the Bisley/Ovara stock liability default',
+          `The 3-month review date (${reviewDate.rows[0].value}) has passed. Confirm with Bisley whether to switch the default to Ovara in Settings.`,
+          { link: '/settings', severity: 'warning' }
+        );
+      }
     }
   } catch (err) { console.warn('[daily-checks] error:', err); }
 }

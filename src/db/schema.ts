@@ -143,6 +143,23 @@ CREATE TABLE IF NOT EXISTS wms_settings (
   updated_at TIMESTAMP DEFAULT NOW()
 );
 INSERT INTO wms_settings (key, value) VALUES ('default_liability_status', 'Bisley') ON CONFLICT (key) DO NOTHING;
+-- One-time reminder date, set 3 months from first go-live, to review switching the default
+-- from Bisley to Ovara. Seeded once; not re-seeded on every deploy (ON CONFLICT DO NOTHING).
+INSERT INTO wms_settings (key, value) VALUES ('liability_review_date', (CURRENT_DATE + INTERVAL '3 months')::date::text) ON CONFLICT (key) DO NOTHING;
+
+-- ================================================================================
+-- GENERATED REPORTS (Phase 6: archive of auto-generated weekly SKU summary CSVs)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS generated_reports (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  report_type VARCHAR(50) NOT NULL DEFAULT 'weekly_sku_summary',
+  period_start DATE NOT NULL,
+  period_end DATE NOT NULL,
+  csv_content TEXT NOT NULL,
+  row_count INT NOT NULL DEFAULT 0,
+  generated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_generated_reports_period ON generated_reports(report_type, period_end DESC);
 
 -- ================================================================================
 -- WAREHOUSE MOVEMENTS (Audit trail: receives, picks, adjustments)

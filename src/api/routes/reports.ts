@@ -7,6 +7,7 @@
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { createNotificationOnce } from '../../lib/notifications.js';
 
 const router = express.Router();
 
@@ -170,6 +171,71 @@ function resolveDateRange(from?: string, to?: string): { from: string; to: strin
   return { from: fromDate.toISOString().split('T')[0], to: toDate.toISOString().split('T')[0] };
 }
 
+const WEEKLY_SKU_SUMMARY_CSV_COLUMNS = ['sku', 'product_name', 'colour', 'liability_status', 'qty_sold',
+  'unit_cost_gbp', 'unit_price_gbp', 'total_cost_gbp', 'total_sales_value_gbp', 'gross_margin_gbp'];
+
+/** Shared row-fetch for the weekly SKU summary — used by the HTTP route and the weekly scheduler. */
+async function fetchWeeklySkuSummaryRows(from: string, to: string, liability: string | null) {
+  const result = await query(`
+    SELECT
+      pli.product_sku AS sku,
+      COALESCE(wp.product_title, sm.product_name)         AS product_name,
+      COALESCE(wp.colour_name, sm.colour, pli.colour_code) AS colour,
+      pli.liability_status                                 AS liability_status,
+      SUM(pli.quantity_picked)::int                        AS qty_sold,
+      ROUND(AVG(pli.unit_cost_gbp), 2)                     AS unit_cost_gbp,
+      ROUND(AVG(pli.unit_price_gbp), 2)                    AS unit_price_gbp,
+      ROUND(SUM(pli.quantity_picked * COALESCE(pli.unit_cost_gbp, 0)), 2)  AS total_cost_gbp,
+      ROUND(SUM(pli.quantity_picked * COALESCE(pli.unit_price_gbp, 0)), 2) AS total_sales_value_gbp,
+      ROUND(SUM(pli.quantity_picked * COALESCE(pli.unit_price_gbp, 0))
+          - SUM(pli.quantity_picked * COALESCE(pli.unit_cost_gbp, 0)), 2)  AS gross_margin_gbp
+    FROM pick_list_items pli
+    JOIN pick_lists pl ON pl.id = pli.pick_list_id
+    LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
+    -- sku_mappings is LEGACY/PAUSED (empty) - product_name/colour fall back to wp.* anyway
+    LEFT JOIN sku_mappings sm ON sm.medusa_sku = pli.product_sku
+    WHERE pl.status = 'DISPATCHED'
+      AND pl.dispatched_at::date BETWEEN $1 AND $2
+      AND pli.is_sandbox = false
+      AND ($3::varchar IS NULL OR pli.liability_status = $3)
+    GROUP BY pli.product_sku, wp.product_title, sm.product_name, wp.colour_name, sm.colour, pli.colour_code, pli.liability_status
+    ORDER BY sku
+  `, [from, to, liability]);
+  return result.rows;
+}
+
+/**
+ * Generate this week's SKU summary CSV and store it in the archive, if one for the current
+ * rolling 7-day period doesn't already exist. Called by the daily scheduler in server.ts.
+ * Safe to call more than once — skips if a report already covers today's period_end.
+ */
+export async function generateAndStoreWeeklyReport(): Promise<
+  { generated: boolean; id?: string; period_start?: string; period_end?: string; row_count?: number }
+> {
+  const { from, to } = resolveDateRange();
+  const existing = await query(
+    `SELECT id FROM generated_reports WHERE report_type = 'weekly_sku_summary' AND period_end = $1`,
+    [to]
+  );
+  if (existing.rows[0]) return { generated: false };
+
+  const rows = await fetchWeeklySkuSummaryRows(from, to, null);
+  const csv = toCsv(rows, WEEKLY_SKU_SUMMARY_CSV_COLUMNS);
+  const inserted = await query(
+    `INSERT INTO generated_reports (report_type, period_start, period_end, csv_content, row_count)
+     VALUES ('weekly_sku_summary', $1, $2, $3, $4) RETURNING id`,
+    [from, to, csv, rows.length]
+  );
+
+  await createNotificationOnce('WEEKLY_REPORT_READY',
+    `Weekly SKU report ready (${from} to ${to})`,
+    `${rows.length} SKU line${rows.length === 1 ? '' : 's'} sold this period — download from Financials for Bisley reconciliation/invoicing.`,
+    { link: '/financials', severity: 'info', metadata: { report_id: inserted.rows[0].id } }
+  );
+
+  return { generated: true, id: inserted.rows[0].id, period_start: from, period_end: to, row_count: rows.length };
+}
+
 /**
  * GET /api/reports/weekly-sku-summary?from=&to=&liability=Bisley|Ovara&format=csv|json
  * SKU-level breakdown of what was sold (dispatched) in the date range, for the weekly
@@ -182,44 +248,50 @@ router.get('/weekly-sku-summary', authMiddleware, async (req: AuthRequest, res: 
     const liability = (req.query.liability as string) || null;
     const format = (req.query.format as string) || 'json';
 
-    const result = await query(`
-      SELECT
-        pli.product_sku AS sku,
-        COALESCE(wp.product_title, sm.product_name)         AS product_name,
-        COALESCE(wp.colour_name, sm.colour, pli.colour_code) AS colour,
-        pli.liability_status                                 AS liability_status,
-        SUM(pli.quantity_picked)::int                        AS qty_sold,
-        ROUND(AVG(pli.unit_cost_gbp), 2)                     AS unit_cost_gbp,
-        ROUND(AVG(pli.unit_price_gbp), 2)                    AS unit_price_gbp,
-        ROUND(SUM(pli.quantity_picked * COALESCE(pli.unit_cost_gbp, 0)), 2)  AS total_cost_gbp,
-        ROUND(SUM(pli.quantity_picked * COALESCE(pli.unit_price_gbp, 0)), 2) AS total_sales_value_gbp,
-        ROUND(SUM(pli.quantity_picked * COALESCE(pli.unit_price_gbp, 0))
-            - SUM(pli.quantity_picked * COALESCE(pli.unit_cost_gbp, 0)), 2)  AS gross_margin_gbp
-      FROM pick_list_items pli
-      JOIN pick_lists pl ON pl.id = pli.pick_list_id
-      LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
-      -- sku_mappings is LEGACY/PAUSED (empty) - product_name/colour fall back to wp.* anyway
-      LEFT JOIN sku_mappings sm ON sm.medusa_sku = pli.product_sku
-      WHERE pl.status = 'DISPATCHED'
-        AND pl.dispatched_at::date BETWEEN $1 AND $2
-        AND pli.is_sandbox = false
-        AND ($3::varchar IS NULL OR pli.liability_status = $3)
-      GROUP BY pli.product_sku, wp.product_title, sm.product_name, wp.colour_name, sm.colour, pli.colour_code, pli.liability_status
-      ORDER BY sku
-    `, [from, to, liability]);
+    const rows = await fetchWeeklySkuSummaryRows(from, to, liability);
 
     if (format === 'csv') {
-      const csv = toCsv(result.rows, ['sku', 'product_name', 'colour', 'liability_status', 'qty_sold',
-        'unit_cost_gbp', 'unit_price_gbp', 'total_cost_gbp', 'total_sales_value_gbp', 'gross_margin_gbp']);
+      const csv = toCsv(rows, WEEKLY_SKU_SUMMARY_CSV_COLUMNS);
       res.setHeader('Content-Type', 'text/csv');
       res.setHeader('Content-Disposition', `attachment; filename="weekly-sku-summary-${from}-to-${to}.csv"`);
       return res.send(csv);
     }
 
-    res.json({ from, to, liability: liability ?? 'ALL', rows: result.rows });
+    res.json({ from, to, liability: liability ?? 'ALL', rows });
   } catch (err) {
     console.error('Weekly SKU summary error:', err);
     res.status(500).json({ error: 'Failed to generate weekly SKU summary' });
+  }
+});
+
+/** GET /api/reports/weekly-archive — list previously auto-generated weekly reports */
+router.get('/weekly-archive', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT id, period_start, period_end, row_count, generated_at
+       FROM generated_reports WHERE report_type = 'weekly_sku_summary'
+       ORDER BY period_end DESC LIMIT 52`
+    );
+    res.json({ reports: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch report archive' });
+  }
+});
+
+/** GET /api/reports/weekly-archive/:id/download — download a stored weekly CSV */
+router.get('/weekly-archive/:id/download', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT period_start, period_end, csv_content FROM generated_reports WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Report not found' });
+    const { period_start, period_end, csv_content } = result.rows[0];
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="weekly-sku-summary-${period_start}-to-${period_end}.csv"`);
+    res.send(csv_content);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to download report' });
   }
 });
 
