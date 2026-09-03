@@ -21,7 +21,7 @@ import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.
 const router = express.Router();
 
 // Bulk wipe — nw_stocking_items.mapping_id is ON DELETE SET NULL, so order history is preserved.
-router.delete('/', authMiddleware, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
+router.delete('/', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
   if (req.query.confirm !== 'WIPE') {
     return res.status(400).json({ error: "Pass ?confirm=WIPE to delete every sku_mappings row" });
   }
