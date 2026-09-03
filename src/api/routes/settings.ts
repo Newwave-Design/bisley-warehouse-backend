@@ -337,6 +337,7 @@ router.post('/shipping-services/ups-sync', authMiddleware, requireRole(['MANAGER
            max_weight_grams = EXCLUDED.max_weight_grams,
            tare_weight_grams = EXCLUDED.tare_weight_grams,
            default_cost_gbp = EXCLUDED.default_cost_gbp,
+           notes = EXCLUDED.notes,
            is_active = true,
            updated_at = NOW()`,
         [
