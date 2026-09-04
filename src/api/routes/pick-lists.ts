@@ -5,7 +5,7 @@
 
 import express, { Request, Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware } from '../../middleware/auth.js';
+import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { createUpsShipmentLabel } from '../../lib/ups.js';
@@ -787,7 +787,7 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: Request, res: 
 });
 
 /** DELETE /api/pick-lists/:pickListId — cancel a pending or in-progress pick list */
-router.delete('/:pickListId', authMiddleware, async (req: Request, res: Response) => {
+router.delete('/:pickListId', authMiddleware, requirePermission('manage_operations'), async (req: Request, res: Response) => {
   try {
     const { pickListId } = req.params;
     const existing = await query(`SELECT status FROM pick_lists WHERE id = $1`, [pickListId]);

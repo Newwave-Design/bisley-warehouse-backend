@@ -435,7 +435,7 @@ SELECT g.id, p.key, true
 FROM user_groups g
 CROSS JOIN (VALUES
   ('system_admin'), ('manage_orders'), ('manage_reorder_rules'), ('manage_settings'),
-  ('manage_sku_mappings'), ('manage_financials'), ('manage_error_log'), ('manage_users')
+  ('manage_sku_mappings'), ('manage_financials'), ('manage_error_log'), ('manage_operations'), ('manage_users')
 ) AS p(key)
 WHERE g.name = 'Admin'
 ON CONFLICT (group_id, permission_key) DO NOTHING;
@@ -445,7 +445,7 @@ SELECT g.id, p.key, true
 FROM user_groups g
 CROSS JOIN (VALUES
   ('manage_orders'), ('manage_reorder_rules'), ('manage_settings'),
-  ('manage_sku_mappings'), ('manage_financials'), ('manage_error_log')
+  ('manage_sku_mappings'), ('manage_financials'), ('manage_error_log'), ('manage_operations')
 ) AS p(key)
 WHERE g.name = 'WMS'
 ON CONFLICT (group_id, permission_key) DO NOTHING;

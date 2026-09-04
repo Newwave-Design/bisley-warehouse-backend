@@ -15,7 +15,7 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
 
@@ -374,7 +374,7 @@ router.post('/sessions/:id/complete', authMiddleware, async (req: AuthRequest, r
 });
 
 /** DELETE /api/checkin/sessions/:id — abandon/cancel an open session */
-router.delete('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.delete('/sessions/:id', authMiddleware, requirePermission('manage_operations'), async (req: AuthRequest, res: Response) => {
   try {
     const session = await query(`SELECT status FROM checkin_sessions WHERE id = $1`, [req.params.id]);
     if (!session.rows[0]) return res.status(404).json({ error: 'Session not found' });

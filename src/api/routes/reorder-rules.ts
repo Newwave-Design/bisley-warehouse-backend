@@ -228,9 +228,30 @@ pendingRouter.post('/:id/delay', authMiddleware, requirePermission('manage_reord
   } catch (err) { res.status(500).json({ error: 'Delay failed' }); }
 });
 
-pendingRouter.post('/:id/cancel', authMiddleware, requirePermission('manage_reorder_rules'), async (_req: AuthRequest, res: Response) => {
+pendingRouter.post('/:id/cancel', authMiddleware, requirePermission('manage_reorder_rules'), async (req: AuthRequest, res: Response) => {
   try {
-    await query("UPDATE pending_reorders SET status='CANCELLED', updated_at=NOW() WHERE id=$1", [_req.params.id]);
+    const pr = await query('SELECT * FROM pending_reorders WHERE id=$1', [req.params.id]);
+    if (!pr.rows[0]) return res.status(404).json({ error: 'Not found' });
+    const item = pr.rows[0];
+
+    // Already approved — undo its contribution to the draft supplier order line
+    // so the order doesn't silently retain quantity for a reorder that's been cancelled.
+    if (item.status === 'APPROVED' && item.supplier_order_id) {
+      const line = await query(
+        'SELECT id, quantity_ordered FROM order_line_items WHERE order_id=$1 AND medusa_sku=$2',
+        [item.supplier_order_id, item.sku]
+      );
+      if (line.rows[0]) {
+        const remaining = line.rows[0].quantity_ordered - item.qty_to_order;
+        if (remaining > 0) {
+          await query('UPDATE order_line_items SET quantity_ordered=$1, updated_at=NOW() WHERE id=$2', [remaining, line.rows[0].id]);
+        } else {
+          await query('DELETE FROM order_line_items WHERE id=$1', [line.rows[0].id]);
+        }
+      }
+    }
+
+    await query("UPDATE pending_reorders SET status='CANCELLED', updated_at=NOW() WHERE id=$1", [req.params.id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Cancel failed' }); }
 });
