@@ -8,7 +8,7 @@
  */
 
 import express, { Response } from 'express';
-import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { getMedusaToken, MEDUSA_URL } from '../../lib/medusa-client.js';
 import { query } from '../../db/index.js';
 import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
@@ -318,7 +318,7 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
  * PATCH /api/products/:variantSku/cost — set the unit cost (£) for a variant.
  * Not touched by /sync, so it persists across re-syncs from Medusa.
  */
-router.patch('/:variantSku/cost', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.patch('/:variantSku/cost', authMiddleware, requirePermission('manage_financials'), async (req: AuthRequest, res: Response) => {
   try {
     const { variantSku } = req.params;
     const { unit_cost_gbp } = req.body;
@@ -488,7 +488,7 @@ async function runSyncJob() {
 
 // ── POST /api/products/sync — responds immediately, runs in background ─────────
 // Idempotent read-only-from-Medusa + upsert — safe for MANAGER, unlike destructive purge/wipe routes.
-router.post('/sync', authMiddleware, requireRole(['ADMIN']), (req: AuthRequest, res: Response) => {
+router.post('/sync', authMiddleware, requirePermission('system_admin'), (req: AuthRequest, res: Response) => {
   if (syncState.running) {
     return res.status(409).json({
       error: 'Sync already in progress',

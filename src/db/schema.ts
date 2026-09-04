@@ -367,15 +367,48 @@ CREATE TABLE IF NOT EXISTS pick_list_package_items (
 );
 
 -- ================================================================================
+-- USER GROUPS & PERMISSIONS (tick-box access control, per-user overrides)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS user_groups (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(100) NOT NULL UNIQUE,
+  description TEXT,
+  is_system BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS group_permissions (
+  group_id UUID NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+  permission_key VARCHAR(50) NOT NULL,
+  allowed BOOLEAN NOT NULL DEFAULT false,
+  PRIMARY KEY (group_id, permission_key)
+);
+
+CREATE TABLE IF NOT EXISTS user_permission_overrides (
+  user_id UUID NOT NULL REFERENCES warehouse_users(id) ON DELETE CASCADE,
+  permission_key VARCHAR(50) NOT NULL,
+  allowed BOOLEAN NOT NULL,
+  PRIMARY KEY (user_id, permission_key)
+);
+
+-- ================================================================================
 -- WAREHOUSE USERS (Staff with warehouse access)
 -- ================================================================================
 CREATE TABLE IF NOT EXISTS warehouse_users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  medusa_user_id VARCHAR(100) NOT NULL UNIQUE,
+  medusa_user_id VARCHAR(100) UNIQUE,
   name VARCHAR(255) NOT NULL,
   email VARCHAR(255) NOT NULL UNIQUE,
   role VARCHAR(50) NOT NULL DEFAULT 'PICKER',
-  -- Roles: ADMIN, MANAGER, PICKER, RECEIVER
+  -- Legacy display field, kept in sync with the user's group name — access control
+  -- itself now runs on group_id + group_permissions + user_permission_overrides.
+  group_id UUID REFERENCES user_groups(id),
+  status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+  -- Statuses: INVITED (no password yet), ACTIVE, DISABLED
+  invite_token VARCHAR(100),
+  invite_token_expires_at TIMESTAMP,
+  invited_by UUID REFERENCES warehouse_users(id),
   password_hash VARCHAR(255),
   is_active BOOLEAN DEFAULT true,
   last_login_at TIMESTAMP,
@@ -383,6 +416,51 @@ CREATE TABLE IF NOT EXISTS warehouse_users (
   updated_at TIMESTAMP DEFAULT NOW()
 );
 ALTER TABLE warehouse_users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
+ALTER TABLE warehouse_users ALTER COLUMN medusa_user_id DROP NOT NULL;
+ALTER TABLE warehouse_users ADD COLUMN IF NOT EXISTS group_id UUID REFERENCES user_groups(id);
+ALTER TABLE warehouse_users ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE';
+ALTER TABLE warehouse_users ADD COLUMN IF NOT EXISTS invite_token VARCHAR(100);
+ALTER TABLE warehouse_users ADD COLUMN IF NOT EXISTS invite_token_expires_at TIMESTAMP;
+ALTER TABLE warehouse_users ADD COLUMN IF NOT EXISTS invited_by UUID REFERENCES warehouse_users(id);
+
+-- Seed the two system groups (idempotent) and migrate any existing users onto them.
+INSERT INTO user_groups (name, description, is_system)
+VALUES
+  ('Admin', 'Full access, including Medusa/UPS sync and system maintenance.', true),
+  ('WMS', 'Full warehouse operations access, excluding Medusa/UPS sync and system maintenance.', true)
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO group_permissions (group_id, permission_key, allowed)
+SELECT g.id, p.key, true
+FROM user_groups g
+CROSS JOIN (VALUES
+  ('system_admin'), ('manage_orders'), ('manage_reorder_rules'), ('manage_settings'),
+  ('manage_sku_mappings'), ('manage_financials'), ('manage_error_log'), ('manage_users')
+) AS p(key)
+WHERE g.name = 'Admin'
+ON CONFLICT (group_id, permission_key) DO NOTHING;
+
+INSERT INTO group_permissions (group_id, permission_key, allowed)
+SELECT g.id, p.key, true
+FROM user_groups g
+CROSS JOIN (VALUES
+  ('manage_orders'), ('manage_reorder_rules'), ('manage_settings'),
+  ('manage_sku_mappings'), ('manage_financials'), ('manage_error_log')
+) AS p(key)
+WHERE g.name = 'WMS'
+ON CONFLICT (group_id, permission_key) DO NOTHING;
+INSERT INTO group_permissions (group_id, permission_key, allowed)
+SELECT g.id, 'system_admin', false FROM user_groups g WHERE g.name = 'WMS'
+ON CONFLICT (group_id, permission_key) DO NOTHING;
+INSERT INTO group_permissions (group_id, permission_key, allowed)
+SELECT g.id, 'manage_users', false FROM user_groups g WHERE g.name = 'WMS'
+ON CONFLICT (group_id, permission_key) DO NOTHING;
+
+-- Existing accounts: ADMIN role -> Admin group, everyone else -> WMS group.
+UPDATE warehouse_users SET group_id = (SELECT id FROM user_groups WHERE name = 'Admin')
+WHERE group_id IS NULL AND role = 'ADMIN';
+UPDATE warehouse_users SET group_id = (SELECT id FROM user_groups WHERE name = 'WMS')
+WHERE group_id IS NULL;
 
 -- ================================================================================
 -- SUPPLIER ORDERS / REPLENISHMENT REQUESTS (Integration with Genero)

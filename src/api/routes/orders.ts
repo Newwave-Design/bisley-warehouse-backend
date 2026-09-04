@@ -20,7 +20,7 @@
 import express, { Request, Response } from 'express';
 import crypto from 'crypto';
 import { query } from '../../db/index.js';
-import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
 
@@ -77,7 +77,7 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.post('/', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.post('/', authMiddleware, requirePermission('manage_orders'), async (req: AuthRequest, res: Response) => {
   try {
     const { notes, expected_delivery, line_items } = req.body;
 
@@ -128,7 +128,7 @@ router.get('/thresholds', authMiddleware, async (req: AuthRequest, res: Response
   }
 });
 
-router.patch('/thresholds/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.patch('/thresholds/:id', authMiddleware, requirePermission('manage_orders'), async (req: AuthRequest, res: Response) => {
   try {
     const { min_quantity, reorder_quantity, is_active } = req.body;
     const result = await query(
@@ -143,7 +143,7 @@ router.patch('/thresholds/:id', authMiddleware, requireRole(['MANAGER','ADMIN'])
 });
 
 // Auto-create a draft order from the NW stocking programme items
-router.post('/from-nw', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.post('/from-nw', authMiddleware, requirePermission('manage_orders'), async (req: AuthRequest, res: Response) => {
   try {
     const { notes, expected_delivery } = req.body;
 
@@ -199,7 +199,7 @@ router.get('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.patch('/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.patch('/:id', authMiddleware, requirePermission('manage_orders'), async (req: AuthRequest, res: Response) => {
   try {
     const { status, notes, expected_delivery, genero_dispatch_ref } = req.body;
     const fields: string[] = [];
@@ -226,7 +226,7 @@ router.patch('/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (re
   }
 });
 
-router.delete('/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.delete('/:id', authMiddleware, requirePermission('manage_orders'), async (req: AuthRequest, res: Response) => {
   try {
     const order = await query(`SELECT status FROM supplier_orders WHERE id=$1`, [req.params.id]);
     if (!order.rows[0]) return res.status(404).json({ error: 'Order not found' });

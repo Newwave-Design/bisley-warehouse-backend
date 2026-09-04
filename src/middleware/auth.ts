@@ -5,6 +5,7 @@
 
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { getEffectivePermission } from '../lib/permissions.js';
 
 export interface AuthRequest extends Request {
   user?: {
@@ -63,14 +64,18 @@ export function authMiddleware(req: AuthRequest, res: Response, next: NextFuncti
 }
 
 /**
- * Role-based access control middleware
- * Restricts endpoints to specific user roles
+ * Permission-based access control — looks up the caller's effective permission
+ * (their group's default, overridden per-user if an override row exists) fresh
+ * on every request, so changes made in Settings → Users take effect immediately.
  */
-export function requireRole(allowedRoles: string[]) {
-  return (req: AuthRequest, res: Response, next: NextFunction) => {
-    if (!req.user?.role || !allowedRoles.includes(req.user.role)) {
-      return res.status(403).json({ error: 'Insufficient permissions' });
+export function requirePermission(key: string) {
+  return async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const allowed = await getEffectivePermission(req.user?.id, key);
+      if (!allowed) return res.status(403).json({ error: 'Insufficient permissions' });
+      next();
+    } catch (err) {
+      res.status(500).json({ error: 'Permission check failed' });
     }
-    next();
   };
 }

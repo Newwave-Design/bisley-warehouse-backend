@@ -9,7 +9,7 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
 
@@ -62,7 +62,7 @@ router.post('/read-all', authMiddleware, async (_req: AuthRequest, res: Response
   } catch { res.status(500).json({ error: 'Failed to mark all read' }); }
 });
 
-router.delete('/old', authMiddleware, requireRole(['ADMIN']), async (_req: AuthRequest, res: Response) => {
+router.delete('/old', authMiddleware, requirePermission('system_admin'), async (_req: AuthRequest, res: Response) => {
   try {
     const r = await query(`DELETE FROM wms_notifications WHERE is_dismissed=true AND created_at < NOW() - INTERVAL '30 days'`);
     res.json({ deleted: r.rowCount ?? 0 });

@@ -6,7 +6,7 @@
 
 import express, { Request, Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
 
@@ -113,7 +113,7 @@ router.get('/pre-sync', authMiddleware, async (req: AuthRequest, res: Response) 
 });
 
 // Sync WMS â†’ Medusa
-router.post('/sync', authMiddleware, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
+router.post('/sync', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
   try {
     const { skus } = req.body;
     const token = await getMedusaToken();
@@ -182,7 +182,7 @@ router.get('/all', authMiddleware, async (req: AuthRequest, res: Response) => {
 
 // Seed WMS from Medusa — use Medusa quantities as the WMS baseline
 // Creates a default location "MEDUSA-IMPORT" if none exists, then upserts inventory
-router.post('/seed-from-medusa', authMiddleware, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
+router.post('/seed-from-medusa', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
   try {
     // Always fetch fresh from Medusa when seeding
     const medusaMap = await fetchMedusaInventory(true);
@@ -218,7 +218,7 @@ router.post('/seed-from-medusa', authMiddleware, requireRole(['ADMIN']), async (
 });
 
 // Clear WMS inventory — wipe the IMPORT-01 baseline to start fresh
-router.delete('/wms-inventory', authMiddleware, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
+router.delete('/wms-inventory', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(`
       DELETE FROM warehouse_inventory wi
@@ -234,7 +234,7 @@ router.delete('/wms-inventory', authMiddleware, requireRole(['ADMIN']), async (r
 // Purge specific legacy/phantom SKUs from warehouse_inventory — used to clean up
 // old test data (renamed/typo'd product codes) that no longer has a Medusa counterpart.
 // Body: { skus: string[] }
-router.post('/purge-skus', authMiddleware, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
+router.post('/purge-skus', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
   try {
     const { skus } = req.body as { skus?: string[] };
     if (!Array.isArray(skus) || skus.length === 0) {

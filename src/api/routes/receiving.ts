@@ -16,7 +16,7 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 
 const router = express.Router();
@@ -245,7 +245,7 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
 });
 
 // Bulk-generate bay locations (e.g. rows A-C, bins 1-10 = 30 bays)
-router.post('/locations/generate', authMiddleware, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
+router.post('/locations/generate', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
   try {
     const { aisles = ['A'], rows_per_aisle = 5, bays_per_row = 10 } = req.body;
     if (!Array.isArray(aisles) || aisles.length === 0 || aisles.length > 10) {
@@ -305,7 +305,7 @@ router.delete('/queue/:id', authMiddleware, async (req: AuthRequest, res: Respon
  * for existing stock (e.g. after the 3-month Bisley period ends and you tell us to switch a SKU).
  * Body: { product_sku, liability_status: 'Bisley' | 'Ovara' }
  */
-router.patch('/inventory/liability', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.patch('/inventory/liability', authMiddleware, requirePermission('manage_settings'), async (req: AuthRequest, res: Response) => {
   try {
     const { product_sku, liability_status } = req.body;
     if (!product_sku || !['Bisley', 'Ovara'].includes(liability_status)) {

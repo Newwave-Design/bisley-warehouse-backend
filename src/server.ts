@@ -28,6 +28,8 @@ import errorLogRoutes from './api/routes/error-log.js';
 import notificationsRoutes from './api/routes/notifications.js';
 import deliveriesRoutes from './api/routes/deliveries.js';
 import authRoutes from './api/routes/auth.js';
+import usersRoutes from './api/routes/users.js';
+import groupsRoutes from './api/routes/groups.js';
 import { createNotificationOnce } from './lib/notifications.js';
 import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
 import { query as dbQueryUtil } from './db/index.js';
@@ -77,6 +79,8 @@ app.use('/api/pending-reorders', pendingReordersRouter);
 app.use('/api/error-log', errorLogRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/deliveries', deliveriesRoutes);
+app.use('/api/users', usersRoutes);
+app.use('/api/groups', groupsRoutes);
 
 // 404 handler
 app.use((req, res) => {

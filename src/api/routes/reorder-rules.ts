@@ -15,13 +15,13 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
 
 // ── Reorder Rules ────────────────────────────────────────────────────────────
 
-router.get('/', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
+router.get('/', authMiddleware, requirePermission('manage_reorder_rules'), async (_req: AuthRequest, res: Response) => {
   try {
     const r = await query(`
       SELECT rr.*,
@@ -38,7 +38,7 @@ router.get('/', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: A
 });
 
 /** POST /api/reorder-rules/init — generate rules from an order's line items */
-router.post('/init', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.post('/init', authMiddleware, requirePermission('manage_reorder_rules'), async (req: AuthRequest, res: Response) => {
   try {
     const { order_id, months_of_stock = 2 } = req.body;
     if (!order_id) return res.status(400).json({ error: 'order_id required' });
@@ -80,7 +80,7 @@ router.post('/init', authMiddleware, requireRole(['MANAGER','ADMIN']), async (re
   }
 });
 
-router.put('/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.put('/:id', authMiddleware, requirePermission('manage_reorder_rules'), async (req: AuthRequest, res: Response) => {
   try {
     const { reorder_point, reorder_qty, lead_time_weeks, is_active, notes } = req.body;
     const r = await query(`
@@ -99,7 +99,7 @@ router.put('/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req:
 });
 
 /** POST /api/reorder-rules/check — compare WMS stock vs reorder points, create pending reorders */
-router.post('/check', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.post('/check', authMiddleware, requirePermission('manage_reorder_rules'), async (req: AuthRequest, res: Response) => {
   try {
     const triggered = await runReorderCheck();
     res.json({ triggered: triggered.length, items: triggered });
@@ -151,7 +151,7 @@ export async function runReorderCheck(): Promise<string[]> {
 
 const pendingRouter = express.Router();
 
-pendingRouter.get('/', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+pendingRouter.get('/', authMiddleware, requirePermission('manage_reorder_rules'), async (req: AuthRequest, res: Response) => {
   try {
     const statusFilter = (req.query.status as string) ?? 'PENDING,DELAYED';
     const statuses = statusFilter.split(',').map(s => s.trim());
@@ -170,7 +170,7 @@ pendingRouter.get('/', authMiddleware, requireRole(['MANAGER','ADMIN']), async (
   } catch (err) { res.status(500).json({ error: 'Failed to load pending reorders' }); }
 });
 
-pendingRouter.post('/:id/approve', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+pendingRouter.post('/:id/approve', authMiddleware, requirePermission('manage_reorder_rules'), async (req: AuthRequest, res: Response) => {
   try {
     const pr = await query('SELECT * FROM pending_reorders WHERE id=$1', [req.params.id]);
     if (!pr.rows[0]) return res.status(404).json({ error: 'Not found' });
@@ -216,7 +216,7 @@ pendingRouter.post('/:id/approve', authMiddleware, requireRole(['MANAGER','ADMIN
   }
 });
 
-pendingRouter.post('/:id/delay', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+pendingRouter.post('/:id/delay', authMiddleware, requirePermission('manage_reorder_rules'), async (req: AuthRequest, res: Response) => {
   try {
     const { delayed_until, delay_reason } = req.body;
     if (!delayed_until) return res.status(400).json({ error: 'delayed_until (date) required' });
@@ -228,14 +228,14 @@ pendingRouter.post('/:id/delay', authMiddleware, requireRole(['MANAGER','ADMIN']
   } catch (err) { res.status(500).json({ error: 'Delay failed' }); }
 });
 
-pendingRouter.post('/:id/cancel', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
+pendingRouter.post('/:id/cancel', authMiddleware, requirePermission('manage_reorder_rules'), async (_req: AuthRequest, res: Response) => {
   try {
     await query("UPDATE pending_reorders SET status='CANCELLED', updated_at=NOW() WHERE id=$1", [_req.params.id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: 'Cancel failed' }); }
 });
 
-pendingRouter.post('/bulk-approve', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+pendingRouter.post('/bulk-approve', authMiddleware, requirePermission('manage_reorder_rules'), async (req: AuthRequest, res: Response) => {
   try {
     const pending = await query("SELECT id FROM pending_reorders WHERE status='PENDING'");
     let approved = 0;

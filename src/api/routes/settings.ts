@@ -5,7 +5,7 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, requireRole, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured } from '../../lib/ups.js';
@@ -23,7 +23,7 @@ function asNumber(v: unknown): number | null {
 }
 
 /** GET /api/settings/field-mappings — returns all mappings grouped by direction */
-router.get('/field-mappings', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
+router.get('/field-mappings', authMiddleware, requirePermission('manage_settings'), async (_req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT * FROM field_mappings ORDER BY mapping_direction, created_at ASC`
@@ -38,7 +38,7 @@ router.get('/field-mappings', authMiddleware, requireRole(['MANAGER','ADMIN']), 
 });
 
 /** POST /api/settings/field-mappings — create a new mapping row */
-router.post('/field-mappings', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.post('/field-mappings', authMiddleware, requirePermission('manage_settings'), async (req: AuthRequest, res: Response) => {
   try {
     const { mapping_direction, source_field, source_label, target_field, target_label, transform, notes } = req.body;
     if (!mapping_direction || !source_field || !source_label) {
@@ -62,7 +62,7 @@ router.post('/field-mappings', authMiddleware, requireRole(['MANAGER','ADMIN']),
 });
 
 /** PUT /api/settings/field-mappings/:id — update an existing mapping row */
-router.put('/field-mappings/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.put('/field-mappings/:id', authMiddleware, requirePermission('manage_settings'), async (req: AuthRequest, res: Response) => {
   try {
     const { source_field, source_label, target_field, target_label, transform, notes, is_active } = req.body;
     const result = await query(
@@ -89,7 +89,7 @@ router.put('/field-mappings/:id', authMiddleware, requireRole(['MANAGER','ADMIN'
 });
 
 /** DELETE /api/settings/field-mappings/:id */
-router.delete('/field-mappings/:id', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.delete('/field-mappings/:id', authMiddleware, requirePermission('manage_settings'), async (req: AuthRequest, res: Response) => {
   try {
     await query('DELETE FROM field_mappings WHERE id = $1', [req.params.id]);
     res.json({ success: true });
@@ -99,7 +99,7 @@ router.delete('/field-mappings/:id', authMiddleware, requireRole(['MANAGER','ADM
   }
 });
 
-router.get('/shipping-services', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
+router.get('/shipping-services', authMiddleware, requirePermission('manage_settings'), async (_req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT id, courier_code, courier_name, service_code, service_name, service_level,
@@ -127,7 +127,7 @@ router.get('/shipping-services', authMiddleware, requireRole(['MANAGER','ADMIN']
   }
 });
 
-router.post('/shipping-services', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.post('/shipping-services', authMiddleware, requirePermission('manage_settings'), async (req: AuthRequest, res: Response) => {
   try {
     const {
       courier_code,
@@ -176,7 +176,7 @@ router.post('/shipping-services', authMiddleware, requireRole(['MANAGER','ADMIN'
   }
 });
 
-router.put('/shipping-services/:serviceCode', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.put('/shipping-services/:serviceCode', authMiddleware, requirePermission('manage_settings'), async (req: AuthRequest, res: Response) => {
   try {
     const {
       courier_code,
@@ -228,7 +228,7 @@ router.put('/shipping-services/:serviceCode', authMiddleware, requireRole(['MANA
   }
 });
 
-router.get('/packaging-profiles', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
+router.get('/packaging-profiles', authMiddleware, requirePermission('manage_settings'), async (_req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm,
@@ -277,7 +277,7 @@ router.get('/product-fulfillment-map', authMiddleware, async (_req: AuthRequest,
 });
 
 
-router.post('/shipping-services/ups-sync', authMiddleware, requireRole(['ADMIN']), async (_req: AuthRequest, res: Response) => {
+router.post('/shipping-services/ups-sync', authMiddleware, requirePermission('system_admin'), async (_req: AuthRequest, res: Response) => {
   try {
     let upserted = 0;
 
@@ -675,7 +675,7 @@ async function runUpsAutoTagJob() {
 }
 
 /** POST /api/settings/shipping-services/ups-auto-tag-products — starts the auto-tag job in the background; poll ups-auto-tag-status. */
-router.post('/shipping-services/ups-auto-tag-products', authMiddleware, requireRole(['ADMIN']), (_req: AuthRequest, res: Response) => {
+router.post('/shipping-services/ups-auto-tag-products', authMiddleware, requirePermission('system_admin'), (_req: AuthRequest, res: Response) => {
   if (autoTagState.running) {
     return res.status(409).json({
       error: 'Auto-tag job already in progress',
@@ -696,7 +696,7 @@ router.post('/shipping-services/ups-auto-tag-products', authMiddleware, requireR
 });
 
 /** GET /api/settings/shipping-services/ups-auto-tag-status — poll this after triggering the auto-tag job. */
-router.get('/shipping-services/ups-auto-tag-status', authMiddleware, requireRole(['MANAGER','ADMIN']), (_req: AuthRequest, res: Response) => {
+router.get('/shipping-services/ups-auto-tag-status', authMiddleware, requirePermission('system_admin'), (_req: AuthRequest, res: Response) => {
   res.json({
     running: autoTagState.running,
     progress: autoTagState.progress,
@@ -726,7 +726,7 @@ router.get('/liability-default', authMiddleware, async (_req: AuthRequest, res: 
   }
 });
 
-router.patch('/liability-default', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.patch('/liability-default', authMiddleware, requirePermission('manage_settings'), async (req: AuthRequest, res: Response) => {
   try {
     const { default_liability_status } = req.body;
     if (!['Bisley', 'Ovara'].includes(default_liability_status)) {
