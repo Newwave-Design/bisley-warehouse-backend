@@ -37,6 +37,11 @@ import { query as dbQueryUtil } from './db/index.js';
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Webhooks need the raw request body for HMAC signature verification — must be
+// mounted before the global express.json() below, or that middleware consumes
+// the body first and every signature check silently fails.
+app.use('/api/webhooks', webhooksRoutes);
+
 // Middleware
 app.use(express.json());
 app.use(cors({
@@ -73,7 +78,6 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/genero', generoRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/mobile', mobileRoutes);
-app.use('/api/webhooks', webhooksRoutes);
 app.use('/api/reorder-rules', reorderRulesRoutes);
 app.use('/api/pending-reorders', pendingReordersRouter);
 app.use('/api/error-log', errorLogRoutes);
