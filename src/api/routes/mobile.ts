@@ -359,6 +359,64 @@ async function recomputePickItem(pickListId: string, itemId: string) {
   return { item: updated.rows[0], allPicked };
 }
 
+/**
+ * POST /api/mobile/pick-lists/:id/scan — scan any item in the list, in any order.
+ * Resolves the scanned barcode to whichever pending line it belongs to (rather than
+ * trusting the client's "pick next" ordering), then picks its full remaining quantity.
+ */
+router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { scanned_barcode, location_code, quantity } = req.body;
+    const { id: pickListId } = req.params;
+    if (!scanned_barcode) return res.status(400).json({ error: 'scanned_barcode required' });
+
+    // Resolve barcode -> SKU. Fall back to treating the scan as a literal SKU
+    // (pick tickets render the SKU itself as the barcode — see BarcodeDisplay usage).
+    const bm = await query(
+      `SELECT product_sku FROM barcode_mappings WHERE barcode = $1 AND is_active = true LIMIT 1`,
+      [scanned_barcode]
+    );
+    const sku = bm.rows[0]?.product_sku ?? scanned_barcode;
+
+    const candidates = await query(
+      `SELECT * FROM pick_list_items WHERE pick_list_id = $1 AND product_sku = $2 ORDER BY line_number ASC`,
+      [pickListId, sku]
+    );
+    if (!candidates.rows.length) {
+      return res.status(404).json({ error: `${sku} is not part of this order` });
+    }
+    const item = candidates.rows.find((row: any) => row.status !== 'PICKED');
+    if (!item) return res.status(400).json({ error: 'Already picked' });
+
+    const remainingQty = item.quantity_required - item.quantity_picked;
+    const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : remainingQty;
+    if (qty > remainingQty) {
+      return res.status(400).json({ error: `Only ${remainingQty} remaining — reduce the quantity` });
+    }
+
+    let locationId: string | null = null;
+    if (location_code) {
+      const loc = await query(`SELECT id FROM warehouse_locations WHERE location_code = $1`, [location_code.toUpperCase()]);
+      locationId = loc.rows[0]?.id ?? null;
+    }
+
+    await query(
+      `INSERT INTO pick_scans (pick_list_id, pick_list_item_id, quantity, location_id, scanned_barcode, performed_by)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [pickListId, item.id, qty, locationId, scanned_barcode, toUuidOrNull(req.user?.id)]
+    );
+    if (locationId) {
+      await query(`UPDATE pick_list_items SET picked_from_location_id = $1 WHERE id = $2`, [locationId, item.id]);
+    }
+
+    const { item: updatedItem, allPicked } = await recomputePickItem(pickListId, item.id);
+
+    res.json({ success: true, all_picked: allPicked, item: updatedItem });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message ?? 'Pick failed' });
+  }
+});
+
 /** POST /api/mobile/pick-lists/:id/items/:itemId/pick — scan to pick a quantity (defaults to all remaining) */
 router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
