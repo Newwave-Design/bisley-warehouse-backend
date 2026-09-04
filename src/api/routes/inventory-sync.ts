@@ -113,7 +113,7 @@ router.get('/pre-sync', authMiddleware, async (req: AuthRequest, res: Response) 
 });
 
 // Sync WMS â†’ Medusa
-router.post('/sync', authMiddleware, requireRole(['MANAGER','ADMIN']), async (req: AuthRequest, res: Response) => {
+router.post('/sync', authMiddleware, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
   try {
     const { skus } = req.body;
     const token = await getMedusaToken();

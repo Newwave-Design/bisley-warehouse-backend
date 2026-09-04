@@ -488,7 +488,7 @@ async function runSyncJob() {
 
 // ── POST /api/products/sync — responds immediately, runs in background ─────────
 // Idempotent read-only-from-Medusa + upsert — safe for MANAGER, unlike destructive purge/wipe routes.
-router.post('/sync', authMiddleware, requireRole(['MANAGER','ADMIN']), (req: AuthRequest, res: Response) => {
+router.post('/sync', authMiddleware, requireRole(['ADMIN']), (req: AuthRequest, res: Response) => {
   if (syncState.running) {
     return res.status(409).json({
       error: 'Sync already in progress',

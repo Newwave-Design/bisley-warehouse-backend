@@ -277,7 +277,7 @@ router.get('/product-fulfillment-map', authMiddleware, async (_req: AuthRequest,
 });
 
 
-router.post('/shipping-services/ups-sync', authMiddleware, requireRole(['MANAGER','ADMIN']), async (_req: AuthRequest, res: Response) => {
+router.post('/shipping-services/ups-sync', authMiddleware, requireRole(['ADMIN']), async (_req: AuthRequest, res: Response) => {
   try {
     let upserted = 0;
 
@@ -675,7 +675,7 @@ async function runUpsAutoTagJob() {
 }
 
 /** POST /api/settings/shipping-services/ups-auto-tag-products — starts the auto-tag job in the background; poll ups-auto-tag-status. */
-router.post('/shipping-services/ups-auto-tag-products', authMiddleware, requireRole(['MANAGER','ADMIN']), (_req: AuthRequest, res: Response) => {
+router.post('/shipping-services/ups-auto-tag-products', authMiddleware, requireRole(['ADMIN']), (_req: AuthRequest, res: Response) => {
   if (autoTagState.running) {
     return res.status(409).json({
       error: 'Auto-tag job already in progress',

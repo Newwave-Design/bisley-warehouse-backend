@@ -1,13 +1,15 @@
 /**
  * Authentication API
  *
- * POST /api/auth/login            — verify email/password against warehouse_users, issue a signed JWT
- * POST /api/auth/bootstrap-admin  — one-time only: creates the initial admin account if none exists yet
+ * POST /api/auth/login              — verify email/password against warehouse_users, issue a signed JWT
+ * POST /api/auth/bootstrap-admin    — one-time only: creates the initial admin account if none exists yet
+ * POST /api/auth/promote-to-admin   — one-time only: promotes the calling account to ADMIN if no ADMIN exists yet
  */
 import express, { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { query } from '../../db/index.js';
+import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
 
@@ -69,6 +71,37 @@ router.post('/bootstrap-admin', async (_req: Request, res: Response) => {
   } catch (err) {
     console.error('Bootstrap error:', err);
     res.status(500).json({ error: 'Bootstrap failed' });
+  }
+});
+
+// One-time self-promotion: only succeeds while no account holds the ADMIN role yet.
+// Sync/Medusa/API-type endpoints require ADMIN, but the bootstrap flow above only
+// ever creates a MANAGER — this lets that first account elevate itself once, without
+// needing raw DB access. Becomes permanently inert the moment any account is ADMIN.
+router.post('/promote-to-admin', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const existingAdmin = await query(`SELECT COUNT(*)::int AS c FROM warehouse_users WHERE role = 'ADMIN'`);
+    if (existingAdmin.rows[0].c > 0) {
+      return res.status(403).json({ error: 'An admin account already exists' });
+    }
+
+    const result = await query(
+      `UPDATE warehouse_users SET role = 'ADMIN', updated_at = NOW() WHERE id = $1 RETURNING id, name, email, role`,
+      [req.user?.id]
+    );
+    const user = result.rows[0];
+    if (!user) return res.status(404).json({ error: 'Account not found — log in with a real account first, not the demo token' });
+
+    const token = jwt.sign(
+      { sub: user.id, name: user.name, email: user.email, role: user.role },
+      process.env.JWT_SECRET || 'your_secret',
+      { expiresIn: '30d' }
+    );
+
+    res.json({ success: true, token, user });
+  } catch (err) {
+    console.error('Promote-to-admin error:', err);
+    res.status(500).json({ error: 'Promotion failed' });
   }
 });
 
