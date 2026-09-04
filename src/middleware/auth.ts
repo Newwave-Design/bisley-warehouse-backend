@@ -6,6 +6,7 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { getEffectivePermission } from '../lib/permissions.js';
+import { query } from '../db/index.js';
 
 export interface AuthRequest extends Request {
   user?: {
@@ -21,7 +22,11 @@ export interface AuthRequest extends Request {
 const DEMO_TOKEN = process.env.DEMO_AUTH_TOKEN
   || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJhZG1pbkBiaXNsZXkuY29tIiwicm9sZSI6Ik1BTkFHRVIifQ.demo';
 
-export function authMiddleware(req: AuthRequest, res: Response, next: NextFunction) {
+// The demo token and dev-mode fallback both attach this synthetic id — there's
+// no real warehouse_users row for it, so the active-status check below skips it.
+const TRUSTED_SYNTHETIC_USER_ID = '1';
+
+export async function authMiddleware(req: AuthRequest, res: Response, next: NextFunction) {
   try {
     const token = req.headers.authorization?.replace('Bearer ', '');
 
@@ -43,10 +48,22 @@ export function authMiddleware(req: AuthRequest, res: Response, next: NextFuncti
 
     // Standard JWT verification — validates the signature against JWT_SECRET
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your_secret') as any;
+    const userId = decoded.id || decoded.sub;
+
+    // A JWT stays cryptographically valid for up to 30 days regardless of what
+    // happens to the account afterwards — check current DB state on every
+    // request so a deactivated user is locked out immediately, not just from
+    // permission-gated routes and not just once their old token expires.
+    if (userId && userId !== TRUSTED_SYNTHETIC_USER_ID) {
+      const result = await query(`SELECT is_active FROM warehouse_users WHERE id = $1`, [userId]);
+      if (!result.rows[0] || !result.rows[0].is_active) {
+        return res.status(401).json({ error: 'This account has been deactivated' });
+      }
+    }
 
     // Attach user to request
     req.user = {
-      id: decoded.id || decoded.sub,
+      id: userId,
       email: decoded.email,
       role: decoded.role,
     };
