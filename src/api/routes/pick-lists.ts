@@ -35,17 +35,53 @@ router.post('/sandbox/reset', authMiddleware, async (req: Request, res: Response
   } catch (e) { res.status(500).json({ error: 'Failed to reset sandbox' }); }
 });
 
+/** Every status that means "not yet left the warehouse" — used by the Customer Orders view and the
+ *  "current orders" lookups from Products/Scanner (find which live orders contain a given SKU). */
+const UNFULFILLED_STATUSES = ['PENDING', 'IN_PROGRESS', 'PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED'];
+
 /**
  * GET /api/pick-lists
- * List all active pick lists (with status filtering)
- * 
- * Query params: ?status=PENDING,IN_PROGRESS&limit=50&offset=0
+ * List all active pick lists (with status filtering, customer/order search, and SKU lookup)
+ *
+ * Query params:
+ *   status=PENDING,IN_PROGRESS   comma list, or ALL, or UNFULFILLED (everything but DISPATCHED/CANCELLED)
+ *   search=smith                 matches customer name/email, pick list number or Medusa order id
+ *   sku=H2910NL-av1              only pick lists containing this SKU (also returns per-line qty for it)
+ *   sort=asc|desc                default asc (oldest-first picking queue); Customer Orders view uses desc
+ *   limit=50&offset=0
  */
 router.get('/', authMiddleware, async (req: Request, res: Response) => {
   try {
-    const { status = 'PENDING,IN_PROGRESS', limit = '50', offset = '0' } = req.query;
+    const { status = 'PENDING,IN_PROGRESS', limit = '50', offset = '0', search, sku, sort } = req.query;
 
-    const statuses = (status as string).toUpperCase().split(',').map(s => s.trim());
+    const statusParam = (status as string).toUpperCase();
+    const statuses = statusParam === 'ALL' ? null
+      : statusParam === 'UNFULFILLED' ? UNFULFILLED_STATUSES
+      : statusParam.split(',').map(s => s.trim());
+
+    const conditions: string[] = [];
+    const params: any[] = [];
+    let skuParamIndex = -1;
+
+    if (statuses) {
+      params.push(statuses);
+      conditions.push(`pl.status = ANY($${params.length}::text[])`);
+    }
+    if (search) {
+      params.push(`%${(search as string).trim()}%`);
+      conditions.push(`(pl.customer_name ILIKE $${params.length} OR pl.customer_email ILIKE $${params.length} OR pl.pick_list_number ILIKE $${params.length} OR pl.medusa_order_id ILIKE $${params.length})`);
+    }
+    if (sku) {
+      params.push(sku as string);
+      skuParamIndex = params.length;
+      conditions.push(`EXISTS (SELECT 1 FROM pick_list_items pli2 WHERE pli2.pick_list_id = pl.id AND pli2.product_sku = $${skuParamIndex})`);
+    }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const orderDir = (sort as string)?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+    const countParams = params.slice();
+
+    params.push(parseInt(limit as string), parseInt(offset as string));
 
     const result = await query(
       `SELECT 
@@ -54,19 +90,31 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.medusa_order_id,
          pl.status,
          pl.created_at,
+         pl.customer_name,
+         pl.customer_email,
+         pl.shipping_method_name,
+         pl.dispatched_at,
          COUNT(pli.id) as item_count,
          SUM(CASE WHEN pli.status = 'PICKED' THEN 1 ELSE 0 END) as items_picked
+         ${skuParamIndex > 0 ? `, MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_required END) as sku_quantity_required
+                 , MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_picked END) as sku_quantity_picked` : ''}
        FROM pick_lists pl
        LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
-       WHERE pl.status = ANY($1::text[])
+       ${whereClause}
        GROUP BY pl.id
-       ORDER BY pl.created_at ASC
-       LIMIT $2 OFFSET $3`,
-      [statuses, parseInt(limit as string), parseInt(offset as string)]
+       ORDER BY pl.created_at ${orderDir}
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+
+    const countResult = await query(
+      `SELECT COUNT(*)::int AS total FROM pick_lists pl ${whereClause}`,
+      countParams
     );
 
     return res.json({
       pickLists: result.rows,
+      total: countResult.rows[0]?.total ?? result.rows.length,
       limit: parseInt(limit as string),
       offset: parseInt(offset as string),
     });
