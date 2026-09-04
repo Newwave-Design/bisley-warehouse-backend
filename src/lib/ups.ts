@@ -87,6 +87,13 @@ function getUpsBaseUrl(): string {
   return environment === 'production' ? 'https://onlinetools.ups.com' : 'https://wwwcie.ups.com'
 }
 
+/** GIF/PNG render as an <img> for browser printing on 4x6 label sheets (default — no extra
+ *  hardware needed). ZPL/EPL/SPL/STARPL are raw thermal-printer command languages, not images —
+ *  only usable if a raw print pipeline (e.g. a local print agent) is added on the frontend side. */
+function getUpsLabelImageFormat(): string {
+  return (process.env.UPS_LABEL_IMAGE_FORMAT ?? 'GIF').toUpperCase()
+}
+
 function encodeBasicAuth(clientId: string, clientSecret: string): string {
   return Buffer.from(`${clientId}:${clientSecret}`).toString('base64')
 }
@@ -236,8 +243,14 @@ export async function createUpsShipmentLabel(input: UpsShipmentInput) {
         },
         LabelSpecification: {
           LabelImageFormat: {
-            Code: 'GIF',
-            Description: 'GIF',
+            Code: getUpsLabelImageFormat(),
+            Description: getUpsLabelImageFormat(),
+          },
+          // Every Bisley label printer prints on 4x6 stock — without this UPS defaults to an
+          // 8.5x11-shaped image, which prints wrong/clipped on 4x6 label sheets or rolls.
+          LabelStockSize: {
+            Height: '6',
+            Width: '4',
           },
           HTTPUserAgent: 'Mozilla/5.0',
         },
