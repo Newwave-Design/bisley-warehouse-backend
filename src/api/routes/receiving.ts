@@ -9,6 +9,9 @@
  * GET    /api/receiving/queue                   — Items awaiting bay assignment
  * GET    /api/receiving/locations               — Available warehouse bays
  * POST   /api/receiving/locations               — Create a new bay
+ * GET    /api/receiving/locations/:id/inventory — Products currently stocked in a bay
+ * PATCH  /api/receiving/locations/:id           — Edit a bay's description/max weight
+ * DELETE /api/receiving/locations/:id           — Remove an empty, unused bay
  * PATCH  /api/receiving/queue/:id/assign        — Assign item to a bay
  * POST   /api/receiving/queue/:id/stock         — Mark stocked (moves to warehouse_inventory)
  * POST   /api/receiving/queue/bulk-stock        — Stock multiple items at once
@@ -285,6 +288,58 @@ router.post('/locations/generate', authMiddleware, requirePermission('system_adm
     res.json({ success: true, created, skipped, total });
   } catch (err) {
     res.status(500).json({ error: 'Failed to generate bays' });
+  }
+});
+
+/** GET /api/receiving/locations/:id/inventory — products currently stocked in this bay */
+router.get('/locations/:id/inventory', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(`
+      SELECT wi.id, wi.product_sku, wi.colour_code, wi.quantity, wi.quantity_reserved, wi.quantity_available,
+        wi.liability_status, wi.last_counted_at,
+        wp.product_title, wp.variant_title, wp.colour_name, wp.variant_thumbnail
+      FROM warehouse_inventory wi
+      LEFT JOIN wms_products wp ON wp.variant_sku = wi.product_sku
+      WHERE wi.location_id = $1
+      ORDER BY COALESCE(wp.product_title, wi.product_sku)
+    `, [req.params.id]);
+    res.json({ items: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch bay inventory' });
+  }
+});
+
+/** PATCH /api/receiving/locations/:id — edit a bay's description / max weight */
+router.patch('/locations/:id', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { description, max_weight_kg } = req.body;
+    const result = await query(
+      `UPDATE warehouse_locations SET description=$1, max_weight_kg=$2, updated_at=NOW() WHERE id=$3 AND is_active=true RETURNING *`,
+      [description ?? null, max_weight_kg ?? null, req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Location not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update location' });
+  }
+});
+
+/** DELETE /api/receiving/locations/:id — remove an empty, unused bay (soft delete) */
+router.delete('/locations/:id', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
+  try {
+    const stock = await query(`SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE location_id = $1`, [req.params.id]);
+    if (stock.rows[0].qty > 0) {
+      return res.status(400).json({ error: 'Cannot remove a bay that still has stock — clear or move it first' });
+    }
+    const pending = await query(`SELECT COUNT(*)::int AS n FROM requires_location_queue WHERE location_id = $1 AND status != 'STOCKED'`, [req.params.id]);
+    if (pending.rows[0].n > 0) {
+      return res.status(400).json({ error: 'Cannot remove a bay with items still awaiting assignment/stocking' });
+    }
+    const result = await query(`UPDATE warehouse_locations SET is_active=false, updated_at=NOW() WHERE id=$1 RETURNING id`, [req.params.id]);
+    if (!result.rows[0]) return res.status(404).json({ error: 'Location not found' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to remove location' });
   }
 });
 
