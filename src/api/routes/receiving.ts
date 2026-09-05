@@ -18,6 +18,7 @@ import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
+import { unblockBackorderedPickLists } from './pick-lists.js';
 
 const router = express.Router();
 
@@ -195,8 +196,9 @@ router.post('/queue/:id/stock', authMiddleware, async (req: AuthRequest, res: Re
     if (!syncResult.ok) {
       console.error(`[receiving/stock] Medusa sync failed for ${sku}: ${syncResult.error}`);
     }
+    const unblocked = await unblockBackorderedPickLists([sku]);
 
-    res.json({ success: true, stocked: quantity, location_id, medusa_synced: syncResult.ok, new_total: newTotal });
+    res.json({ success: true, stocked: quantity, location_id, medusa_synced: syncResult.ok, new_total: newTotal, unblocked_pick_lists: unblocked });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to stock item' });
@@ -236,8 +238,9 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
       if (!syncResult.ok) syncErrors.push(`${sku}: ${syncResult.error}`);
     }
     if (syncErrors.length) console.error('[receiving/bulk-stock] Medusa sync errors:', syncErrors);
+    const unblocked = await unblockBackorderedPickLists([...syncedSkus]);
 
-    res.json({ success: true, stocked, medusa_synced: syncedSkus.size - syncErrors.length, sync_errors: syncErrors.length });
+    res.json({ success: true, stocked, medusa_synced: syncedSkus.size - syncErrors.length, sync_errors: syncErrors.length, unblocked_pick_lists: unblocked });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to bulk stock' });

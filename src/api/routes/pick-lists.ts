@@ -37,7 +37,7 @@ router.post('/sandbox/reset', authMiddleware, async (req: Request, res: Response
 
 /** Every status that means "not yet left the warehouse" — used by the Customer Orders view and the
  *  "current orders" lookups from Products/Scanner (find which live orders contain a given SKU). */
-const UNFULFILLED_STATUSES = ['PENDING', 'IN_PROGRESS', 'PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED'];
+const UNFULFILLED_STATUSES = ['PENDING', 'IN_PROGRESS', 'PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED', 'AWAITING_STOCK'];
 
 /**
  * GET /api/pick-lists
@@ -349,7 +349,7 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
 
     const pickList = headerResult.rows[0];
 
-    // Get items in pick list
+    // Get items in pick list — includes current physical stock so the UI can flag shortfalls
     const itemsResult = await query(
       `SELECT 
          pli.*,
@@ -358,7 +358,8 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
          wl.bin_code,
          wp.product_title,
          wp.colour_name,
-         wp.variant_thumbnail
+         wp.variant_thumbnail,
+         COALESCE((SELECT SUM(quantity) FROM warehouse_inventory WHERE product_sku = pli.product_sku), 0)::int AS available_stock
        FROM pick_list_items pli
        LEFT JOIN warehouse_locations wl ON wl.id = pli.picked_from_location_id
        LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
@@ -380,16 +381,182 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
       [pickListId]
     );
 
+    // Related backorder split — either the list this one was split off, or lists split off it
+    const [parentResult, childrenResult] = await Promise.all([
+      pickList.parent_pick_list_id
+        ? query(`SELECT id, pick_list_number, status FROM pick_lists WHERE id = $1`, [pickList.parent_pick_list_id])
+        : Promise.resolve({ rows: [] as any[] }),
+      query(`SELECT id, pick_list_number, status FROM pick_lists WHERE parent_pick_list_id = $1`, [pickListId]),
+    ]);
+
     return res.json({
       pickList,
       items: itemsResult.rows,
       packages: packagesResult.rows,
+      parentPickList: parentResult.rows[0] ?? null,
+      childPickLists: childrenResult.rows,
     });
   } catch (error) {
     console.error('Pick list detail error:', error);
     return res.status(500).json({ error: 'Failed to fetch pick list details' });
   }
 });
+
+/**
+ * POST /api/pick-lists/:pickListId/split-backorder
+ *
+ * For any item that can't be fully picked from current physical stock, moves the
+ * short quantity out into a new "AWAITING_STOCK" pick list (or, if every item is
+ * short, blocks this whole list) and raises a pending-reorder request for Bisley
+ * per backordered SKU so it can be approved from Pending Reorders.
+ */
+router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('manage_operations'), async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+
+    const header = await query(`SELECT * FROM pick_lists WHERE id = $1`, [pickListId]);
+    if (!header.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+    const pl = header.rows[0];
+    if (!['PENDING', 'IN_PROGRESS'].includes(pl.status)) {
+      return res.status(400).json({ error: `Cannot split a pick list with status ${pl.status}` });
+    }
+
+    const itemsResult = await query(`SELECT * FROM pick_list_items WHERE pick_list_id = $1 ORDER BY line_number`, [pickListId]);
+    const items = itemsResult.rows;
+    const outstanding = items.filter(i => i.quantity_required - i.quantity_picked > 0);
+
+    // Work out the shortfall per outstanding line against current physical stock
+    const shortItems: { item: any; shortQty: number }[] = [];
+    for (const item of outstanding) {
+      const remaining = item.quantity_required - item.quantity_picked;
+      const stockRow = await query(`SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE product_sku = $1`, [item.product_sku]);
+      const available = stockRow.rows[0].qty;
+      const shortQty = Math.max(0, Math.min(remaining, remaining - available));
+      if (shortQty > 0) shortItems.push({ item, shortQty });
+    }
+
+    if (!shortItems.length) {
+      return res.status(400).json({ error: 'Every remaining item has enough stock to pick right now — nothing to split' });
+    }
+
+    const fullyBackordered = shortItems.length === outstanding.length
+      && shortItems.every(s => s.shortQty === s.item.quantity_required - s.item.quantity_picked);
+
+    let childPickListNumber: string | null = null;
+
+    if (fullyBackordered) {
+      // Nothing on this list can be picked at all right now — block it in place
+      await query(`UPDATE pick_lists SET status = 'AWAITING_STOCK', updated_at = NOW() WHERE id = $1`, [pickListId]);
+    } else {
+      const suffix = Date.now().toString(36).slice(-4).toUpperCase();
+      const childOrderId = `${pl.medusa_order_id}-BO${suffix}`;
+      childPickListNumber = `${pl.pick_list_number}-B`;
+
+      const child = await query(
+        `INSERT INTO pick_lists (
+           medusa_order_id, pick_list_number, status, parent_pick_list_id,
+           customer_name, customer_email, shipping_method_name, shipping_method_code, shipping_address,
+           is_sandbox, notes, created_at, updated_at
+         )
+         VALUES ($1, $2, 'AWAITING_STOCK', $3, $4, $5, $6, $7, $8::jsonb, $9, $10, NOW(), NOW())
+         RETURNING id`,
+        [
+          childOrderId, childPickListNumber, pickListId,
+          pl.customer_name, pl.customer_email, pl.shipping_method_name, pl.shipping_method_code,
+          JSON.stringify(pl.shipping_address || {}), pl.is_sandbox,
+          `Split from ${pl.pick_list_number} — awaiting stock`,
+        ]
+      );
+      const childId = child.rows[0].id;
+
+      let childLineNumber = 1;
+      for (const { item, shortQty } of shortItems) {
+        const keepQty = item.quantity_required - item.quantity_picked - shortQty;
+        if (keepQty > 0) {
+          // Still enough to pick some now — reduce the required quantity, keep quantity_picked as-is
+          await query(`UPDATE pick_list_items SET quantity_required = $1, updated_at = NOW() WHERE id = $2`, [item.quantity_picked + keepQty, item.id]);
+        } else {
+          await query(`DELETE FROM pick_list_items WHERE id = $1`, [item.id]);
+        }
+
+        await query(
+          `INSERT INTO pick_list_items (pick_list_id, line_number, product_sku, colour_code, quantity_required, status, is_sandbox, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, NOW(), NOW())`,
+          [childId, childLineNumber++, item.product_sku, item.colour_code, shortQty, pl.is_sandbox]
+        );
+      }
+    }
+
+    // Raise (or top up) a pending reorder request per backordered SKU
+    let reorderRequestsCreated = 0;
+    for (const { item, shortQty } of shortItems) {
+      const existing = await query(
+        `SELECT id FROM pending_reorders WHERE sku = $1 AND origin_pick_list_id = $2 AND status IN ('PENDING', 'DELAYED')`,
+        [item.product_sku, pickListId]
+      );
+      if (existing.rows[0]) {
+        await query(`UPDATE pending_reorders SET qty_to_order = qty_to_order + $1, updated_at = NOW() WHERE id = $2`, [shortQty, existing.rows[0].id]);
+      } else {
+        const [stockRow, productRow] = await Promise.all([
+          query(`SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE product_sku = $1`, [item.product_sku]),
+          query(`SELECT product_title FROM wms_products WHERE variant_sku = $1`, [item.product_sku]),
+        ]);
+        await query(
+          `INSERT INTO pending_reorders (sku, product_name, qty_to_order, current_stock, reorder_point, source, origin_pick_list_id)
+           VALUES ($1, $2, $3, $4, 0, 'BACKORDER', $5)`,
+          [item.product_sku, productRow.rows[0]?.product_title ?? null, shortQty, stockRow.rows[0].qty, pickListId]
+        );
+      }
+      reorderRequestsCreated++;
+    }
+
+    return res.json({
+      success: true,
+      fully_backordered: fullyBackordered,
+      child_pick_list_number: childPickListNumber,
+      backordered_skus: shortItems.map(s => s.item.product_sku),
+      reorder_requests_created: reorderRequestsCreated,
+    });
+  } catch (error) {
+    console.error('Split backorder error:', error);
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to split backorder' });
+  }
+});
+
+/**
+ * Called after physical stock increases (receiving) — checks whether any AWAITING_STOCK
+ * pick lists containing the given SKUs can now be fully covered, and if so puts them
+ * back into the normal picking queue (PENDING).
+ */
+export async function unblockBackorderedPickLists(skus: string[]): Promise<string[]> {
+  if (!skus.length) return [];
+  const unblocked: string[] = [];
+
+  const candidates = await query(
+    `SELECT DISTINCT pl.id, pl.pick_list_number
+     FROM pick_lists pl
+     JOIN pick_list_items pli ON pli.pick_list_id = pl.id
+     WHERE pl.status = 'AWAITING_STOCK' AND pli.product_sku = ANY($1::text[])`,
+    [skus]
+  );
+
+  for (const candidate of candidates.rows) {
+    const itemsRow = await query(
+      `SELECT pli.quantity_required, pli.quantity_picked,
+              COALESCE((SELECT SUM(quantity) FROM warehouse_inventory WHERE product_sku = pli.product_sku), 0)::int AS available
+       FROM pick_list_items pli
+       WHERE pli.pick_list_id = $1`,
+      [candidate.id]
+    );
+    const stillShort = itemsRow.rows.some(r => r.available < (r.quantity_required - r.quantity_picked));
+    if (!stillShort) {
+      await query(`UPDATE pick_lists SET status = 'PENDING', updated_at = NOW() WHERE id = $1`, [candidate.id]);
+      unblocked.push(candidate.pick_list_number);
+    }
+  }
+
+  return unblocked;
+}
 
 /**
  * POST /api/pick-lists

@@ -251,7 +251,8 @@ CREATE TABLE IF NOT EXISTS pick_lists (
   medusa_order_id VARCHAR(100) NOT NULL UNIQUE,
   pick_list_number VARCHAR(50) NOT NULL UNIQUE,
   status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
-  -- Statuses: PENDING, IN_PROGRESS, PICKED, PACKING, PACKED, LABEL_PRINTED, DISPATCHED, CANCELLED
+  -- Statuses: PENDING, IN_PROGRESS, PICKED, PACKING, PACKED, LABEL_PRINTED, DISPATCHED, CANCELLED,
+  -- AWAITING_STOCK (split off / blocked on a supplier reorder — excluded from picking queues)
   customer_name VARCHAR(255),
   customer_email VARCHAR(255),
   shipping_method_name VARCHAR(255),
@@ -274,6 +275,7 @@ CREATE TABLE IF NOT EXISTS pick_lists (
   notes TEXT,
   is_sandbox BOOLEAN NOT NULL DEFAULT false,
   updated_at TIMESTAMP DEFAULT NOW()
+  -- parent_pick_list_id: set when this list was split off another (backordered items)
 );
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS customer_name VARCHAR(255);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS customer_email VARCHAR(255);
@@ -291,6 +293,8 @@ ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS label_printed_at TIMESTAMP;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMP;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS packing_notes TEXT;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_sandbox BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS parent_pick_list_id UUID REFERENCES pick_lists(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_pick_lists_parent ON pick_lists(parent_pick_list_id);
 
 -- ================================================================================
 -- PICK LIST ITEMS (Individual line items in a pick list)
@@ -880,7 +884,10 @@ CREATE TABLE IF NOT EXISTS pending_reorders (
   supplier_order_id UUID REFERENCES supplier_orders(id) ON DELETE SET NULL,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
+  -- source: 'THRESHOLD' (reorder rule) or 'BACKORDER' (split from a short customer order)
 );
+ALTER TABLE pending_reorders ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'THRESHOLD';
+ALTER TABLE pending_reorders ADD COLUMN IF NOT EXISTS origin_pick_list_id UUID REFERENCES pick_lists(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_pending_reorders_status ON pending_reorders(status);
 CREATE INDEX IF NOT EXISTS idx_pending_reorders_sku ON pending_reorders(sku);
 CREATE INDEX IF NOT EXISTS idx_reorder_rules_sku ON reorder_rules(sku);

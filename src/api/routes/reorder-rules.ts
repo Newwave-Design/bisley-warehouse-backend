@@ -158,12 +158,14 @@ pendingRouter.get('/', authMiddleware, requirePermission('manage_reorder_rules')
     const r = await query(`
       SELECT pr.*,
         COALESCE(SUM(wi.quantity), 0)::int AS live_stock,
-        wp.variant_thumbnail AS thumbnail
+        wp.variant_thumbnail AS thumbnail,
+        opl.pick_list_number AS origin_pick_list_number
       FROM pending_reorders pr
       LEFT JOIN warehouse_inventory wi ON wi.product_sku = pr.sku
       LEFT JOIN wms_products wp ON wp.variant_sku = pr.sku
+      LEFT JOIN pick_lists opl ON opl.id = pr.origin_pick_list_id
       WHERE pr.status = ANY($1::text[])
-      GROUP BY pr.id, wp.variant_thumbnail
+      GROUP BY pr.id, wp.variant_thumbnail, opl.pick_list_number
       ORDER BY pr.triggered_at DESC
     `, [statuses]);
     res.json({ pending: r.rows, total: r.rows.length });
