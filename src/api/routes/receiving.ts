@@ -133,7 +133,9 @@ router.post('/locations', authMiddleware, async (req: AuthRequest, res: Response
     const result = await query(
       `INSERT INTO warehouse_locations (aisle_code, bay_code, bin_code, location_code, description, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-       ON CONFLICT (location_code) DO NOTHING RETURNING *`,
+       ON CONFLICT (location_code) DO UPDATE SET is_active = true, updated_at = NOW()
+         WHERE warehouse_locations.is_active = false
+       RETURNING *`,
       [aisle, row, bay, location_code, description || (aisle ? `Aisle ${aisle}, Row ${row}, Bay ${bay}` : `Row ${row}, Bay ${bay}`)]
     );
     if (!result.rows[0]) return res.status(409).json({ error: 'Location already exists' });
@@ -275,7 +277,8 @@ router.post('/locations/generate', authMiddleware, requirePermission('system_adm
           const result = await query(
             `INSERT INTO warehouse_locations (aisle_code, bay_code, bin_code, location_code, description, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-             ON CONFLICT (location_code) DO NOTHING`,
+             ON CONFLICT (location_code) DO UPDATE SET is_active = true, updated_at = NOW()
+               WHERE warehouse_locations.is_active = false`,
             [aisle_code, bay_code, bin_code, location_code, `Aisle ${aisle_code}, Row ${bay_code}, Bay ${bin_code}`]
           );
           if (result.rowCount && result.rowCount > 0) created++;
@@ -313,9 +316,13 @@ router.get('/locations/:id/inventory', authMiddleware, async (req: AuthRequest, 
 router.patch('/locations/:id', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
   try {
     const { description, max_weight_kg } = req.body;
+    const weight = max_weight_kg === '' || max_weight_kg === undefined || max_weight_kg === null ? null : Number(max_weight_kg);
+    if (weight !== null && (!Number.isFinite(weight) || weight < 0)) {
+      return res.status(400).json({ error: 'max_weight_kg must be a positive number' });
+    }
     const result = await query(
       `UPDATE warehouse_locations SET description=$1, max_weight_kg=$2, updated_at=NOW() WHERE id=$3 AND is_active=true RETURNING *`,
-      [description ?? null, max_weight_kg ?? null, req.params.id]
+      [description || null, weight, req.params.id]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Location not found' });
     res.json(result.rows[0]);
