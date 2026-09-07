@@ -106,7 +106,7 @@ router.get('/shipping-services', authMiddleware, requirePermission('manage_setti
               shipment_mode, integration_type, constraints, metadata, is_active, sort_order,
               created_at, updated_at
        FROM shipping_services
-       WHERE courier_code IN ('ups', 'ait')
+       WHERE courier_code IN ('ups', 'ait', 'dhl')
        ORDER BY sort_order ASC, courier_name ASC, service_name ASC`
     );
     res.json({ shipping_services: result.rows });
