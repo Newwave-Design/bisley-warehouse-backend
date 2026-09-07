@@ -9,7 +9,7 @@ import { authMiddleware, requirePermission, AuthRequest } from '../../middleware
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured } from '../../lib/ups.js';
-import { decideShippingForPackedItem } from '../../lib/shipping-decision.js';
+import { decideShippingForPackedItem, parseAitWeightTiers } from '../../lib/shipping-decision.js';
 
 const router = express.Router();
 
@@ -430,11 +430,12 @@ async function runUpsAutoTagJob() {
     ]);
 
     // AIT is Bisley's real current shipping operation for anything that doesn't fit a standard
-    // carton — a flat percentage-of-price cost estimate, not a live-quoted courier. Percentage is
-    // configurable via the shipping-services settings UI (falls back to 10% if not set up yet).
+    // carton — a flat cost per weight band (see weight_tiers), falling back to a percentage-of-
+    // price estimate only if no rate card has been configured yet.
     const aitServiceCode = aitServiceResult.rows[0]?.service_code ?? 'ait_freight';
     const aitServiceName = aitServiceResult.rows[0]?.service_name ?? 'AIT Freight (Oversized / Non-Parcel)';
     const aitPercentageOfPrice = asNumber(aitServiceResult.rows[0]?.metadata?.percentage_of_price) ?? 10;
+    const aitWeightTiers = parseAitWeightTiers(aitServiceResult.rows[0]?.metadata);
 
     // Kit variants (e.g. MultiDesk) have no dims of their own — batch-load every component
     // SKU's dims once so kit dimensions can be computed as stacked-in-a-box totals.
@@ -579,7 +580,7 @@ async function runUpsAutoTagJob() {
             priceGbp: asNumber(row.price_gbp),
             isMultidesk: Boolean(row.is_kit),
             upsServices: services,
-            aitServiceCode, aitServiceName, aitPercentageOfPrice,
+            aitServiceCode, aitServiceName, aitWeightTiers, aitPercentageOfPrice,
             upsConfigured: true,
             getUpsQuotes: getCachedUpsRates,
           });
@@ -637,7 +638,7 @@ async function runUpsAutoTagJob() {
           needsManual,
           JSON.stringify(needsManual ? ['ups-manual-review'] : ['ups-auto-tagged']),
           manualReviewReason ?? (preferredServiceCode === aitServiceCode
-            ? `Auto-tagged for AIT freight shipping - flat ${aitPercentageOfPrice}% of item price.`
+            ? `Auto-tagged for AIT freight shipping - flat £${Number(preferredCostAmount).toFixed(2)}.`
             : 'Auto-tagged using a live UPS Rating API quote for packed dimensions (+140 mm).'),
           preferredCostAmount,
           preferredCostCurrency,

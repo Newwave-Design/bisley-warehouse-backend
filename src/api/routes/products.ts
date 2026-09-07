@@ -14,7 +14,7 @@ import { query } from '../../db/index.js';
 import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured, type UpsRateQuote } from '../../lib/ups.js';
-import { decideShippingForPackedItem, type AitAssignment } from '../../lib/shipping-decision.js';
+import { decideShippingForPackedItem, parseAitWeightTiers, type AitAssignment, type AitWeightTier } from '../../lib/shipping-decision.js';
 
 const router = express.Router();
 
@@ -586,6 +586,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
     let aitServiceCode = 'ait_freight';
     let aitServiceName = 'AIT Freight (Oversized / Non-Parcel)';
     let aitPercentageOfPrice = 10;
+    let aitWeightTiers: AitWeightTier[] | null = null;
 
     try {
       const aitResult = await query(
@@ -595,6 +596,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
         aitServiceCode = aitResult.rows[0].service_code;
         aitServiceName = aitResult.rows[0].service_name;
         aitPercentageOfPrice = asNumber(aitResult.rows[0].metadata?.percentage_of_price) ?? 10;
+        aitWeightTiers = parseAitWeightTiers(aitResult.rows[0].metadata);
       }
     } catch (err) {
       if (!isMissingRelationError(err)) throw err;
@@ -733,7 +735,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
             priceGbp: asNumber(row.price_gbp),
             isMultidesk: Boolean(row.is_kit),
             upsServices: services,
-            aitServiceCode, aitServiceName, aitPercentageOfPrice,
+            aitServiceCode, aitServiceName, aitWeightTiers, aitPercentageOfPrice,
             upsConfigured: upsReferenceDestinationConfigured(),
             getUpsQuotes: getCachedUpsRates,
           });

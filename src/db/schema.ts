@@ -536,7 +536,7 @@ VALUES
   ('palletways', 'Palletways', 'palletways_economy', 'Palletways Economy', 'economy', 'pallet', 'manual', '{"pallet_required": true}'::jsonb, '{"ready_for_api": false, "category": "pallet"}'::jsonb, 60),
   ('palletforce', 'Palletforce', 'palletforce_premium', 'Palletforce Premium', 'express', 'pallet', 'manual', '{"pallet_required": true}'::jsonb, '{"ready_for_api": false, "category": "pallet"}'::jsonb, 70),
   ('manual', 'Manual Selection', 'manual_pallet', 'Manual Pallet', 'economy', 'pallet', 'manual', '{}'::jsonb, '{"ready_for_api": false}'::jsonb, 80),
-  ('ait', 'AIT', 'ait_freight', 'AIT Freight (Oversized / Non-Parcel)', 'standard', 'freight', 'percentage', '{"required_packaging_type": "freight"}'::jsonb, '{"ready_for_api": false, "category": "freight", "percentage_of_price": 10}'::jsonb, 45)
+  ('ait', 'AIT', 'ait_freight', 'AIT Freight (Oversized / Non-Parcel)', 'standard', 'freight', 'weight_tiers', '{"required_packaging_type": "freight"}'::jsonb, '{"ready_for_api": false, "category": "freight", "integration_type": "weight_tiers", "weight_tiers": [{"max_weight_kg": 29, "cost_gbp": 40}, {"max_weight_kg": 68, "cost_gbp": 52.5}], "percentage_of_price": 10}'::jsonb, 45)
 ON CONFLICT (service_code) DO NOTHING;
 
 -- Default size/weight/volume rules used by the shipping estimator.

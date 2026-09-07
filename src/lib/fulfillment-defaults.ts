@@ -63,8 +63,8 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
   },
   {
     // Bisley's real current shipping operation for anything that doesn't fit a standard
-    // carton (BOX-SMALL/MEDIUM/LARGE) — not a live-quoted courier, a flat percentage-of-price
-    // cost estimate. percentage_of_price is editable via the shipping-services settings UI.
+    // carton (BOX-SMALL/MEDIUM/LARGE) — not a live-quoted courier, a flat cost per weight band
+    // (confirmed with AIT). weight_tiers is editable via the shipping-services settings UI.
     courier_code: 'ait',
     courier_name: 'AIT',
     service_code: 'ait_freight',
@@ -72,7 +72,11 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     service_level: 'standard',
     shipment_mode: 'freight',
     constraints: { required_packaging_type: 'freight' },
-    metadata: { ready_for_api: false, category: 'freight', integration_type: 'percentage', percentage_of_price: 10 },
+    metadata: {
+      ready_for_api: false, category: 'freight', integration_type: 'weight_tiers',
+      weight_tiers: [{ max_weight_kg: 29, cost_gbp: 40 }, { max_weight_kg: 68, cost_gbp: 52.5 }],
+      percentage_of_price: 10, // legacy fallback, only used if weight_tiers is ever cleared
+    },
   },
 ];
 
