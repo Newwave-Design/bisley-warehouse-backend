@@ -108,10 +108,6 @@ const STATEMENTS: string[] = [
     ('ups', 'UPS', 'ups_expedited', 'UPS Worldwide Expedited', 'standard', 'parcel', 'manual', '{"required_packaging_type":"parcel","max_weight_kg":70,"max_length_mm":2740,"max_girth_plus_length_mm":4000,"max_volume_litres":1200}'::jsonb, '{"ready_for_api":false,"category":"parcel"}'::jsonb, 9),
     ('ups', 'UPS', 'ups_express_freight', 'UPS Worldwide Express Freight', 'express', 'freight', 'manual', '{"required_packaging_type":"freight","max_weight_kg":500,"max_length_mm":3000,"max_volume_litres":5000}'::jsonb, '{"ready_for_api":false,"category":"freight"}'::jsonb, 10)
    ON CONFLICT (service_code) DO NOTHING`,
-    `UPDATE shipping_services
-     SET is_active = false,
-       updated_at = NOW()
-     WHERE courier_code <> 'ups'`,
   `INSERT INTO packaging_profiles (code, name, package_type, inner_length_mm, inner_width_mm, inner_height_mm, max_weight_grams, tare_weight_grams, default_cost_gbp, notes)
    VALUES
     ('BOX-SMALL', 'Small Carton', 'parcel', 350, 250, 180, 10000, 250, 1.25, 'Generic small parcel carton'),
