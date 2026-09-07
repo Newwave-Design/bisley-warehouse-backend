@@ -9,7 +9,7 @@ import { authMiddleware, requirePermission, AuthRequest } from '../../middleware
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured } from '../../lib/ups.js';
-import { decideShippingForPackedItem, parseAitWeightTiers } from '../../lib/shipping-decision.js';
+import { decideShippingForPackedItem, parseAitWeightTiers, parseDhlTiers } from '../../lib/shipping-decision.js';
 
 const router = express.Router();
 
@@ -400,7 +400,7 @@ const autoTagState: AutoTagState = {
 async function runUpsAutoTagJob() {
   try {
     autoTagState.progress = 'Loading services, packaging profiles and products…';
-    const [servicesResult, profilesResult, productsResult, aitServiceResult] = await Promise.all([
+    const [servicesResult, profilesResult, productsResult, aitServiceResult, dhlServiceResult] = await Promise.all([
       query(
         `SELECT service_code, service_name, courier_code, courier_name, service_level, shipment_mode, constraints, metadata
          FROM shipping_services
@@ -427,6 +427,9 @@ async function runUpsAutoTagJob() {
       query(
         `SELECT service_code, service_name, metadata FROM shipping_services WHERE service_code = 'ait_freight' AND is_active = true LIMIT 1`
       ),
+      query(
+        `SELECT service_code, service_name, metadata FROM shipping_services WHERE service_code = 'dhl_parcel_uk' AND is_active = true LIMIT 1`
+      ),
     ]);
 
     // AIT is Bisley's real current shipping operation for anything that doesn't fit a standard
@@ -436,6 +439,12 @@ async function runUpsAutoTagJob() {
     const aitServiceName = aitServiceResult.rows[0]?.service_name ?? 'AIT Freight (Oversized / Non-Parcel)';
     const aitPercentageOfPrice = asNumber(aitServiceResult.rows[0]?.metadata?.percentage_of_price) ?? 10;
     const aitWeightTiers = parseAitWeightTiers(aitServiceResult.rows[0]?.metadata);
+
+    // DHL is tried before UPS/AIT once configured — a flat rate per named parcel size band, no
+    // live API yet (account still being set up). Null/unconfigured until a rate card is added.
+    const dhlServiceCode = dhlServiceResult.rows[0]?.service_code ?? null;
+    const dhlServiceName = dhlServiceResult.rows[0]?.service_name ?? null;
+    const dhlTiers = parseDhlTiers(dhlServiceResult.rows[0]?.metadata);
 
     // Kit variants (e.g. MultiDesk) have no dims of their own — batch-load every component
     // SKU's dims once so kit dimensions can be computed as stacked-in-a-box totals.
@@ -580,6 +589,7 @@ async function runUpsAutoTagJob() {
             priceGbp: asNumber(row.price_gbp),
             isMultidesk: Boolean(row.is_kit),
             upsServices: services,
+            dhlServiceCode, dhlServiceName, dhlTiers,
             aitServiceCode, aitServiceName, aitWeightTiers, aitPercentageOfPrice,
             upsConfigured: true,
             getUpsQuotes: getCachedUpsRates,
@@ -639,7 +649,9 @@ async function runUpsAutoTagJob() {
           JSON.stringify(needsManual ? ['ups-manual-review'] : ['ups-auto-tagged']),
           manualReviewReason ?? (preferredServiceCode === aitServiceCode
             ? `Auto-tagged for AIT freight shipping - flat £${Number(preferredCostAmount).toFixed(2)}.`
-            : 'Auto-tagged using a live UPS Rating API quote for packed dimensions (+140 mm).'),
+            : preferredServiceCode === dhlServiceCode
+              ? `Auto-tagged for DHL shipping - flat £${Number(preferredCostAmount).toFixed(2)} rate card (no live API yet).`
+              : 'Auto-tagged using a live UPS Rating API quote for packed dimensions (+140 mm).'),
           preferredCostAmount,
           preferredCostCurrency,
         ]

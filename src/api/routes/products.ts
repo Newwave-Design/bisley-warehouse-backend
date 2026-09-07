@@ -14,7 +14,7 @@ import { query } from '../../db/index.js';
 import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured, type UpsRateQuote } from '../../lib/ups.js';
-import { decideShippingForPackedItem, parseAitWeightTiers, type AitAssignment, type AitWeightTier } from '../../lib/shipping-decision.js';
+import { decideShippingForPackedItem, parseAitWeightTiers, parseDhlTiers, type AitAssignment, type AitWeightTier, type DhlAssignment, type DhlTier } from '../../lib/shipping-decision.js';
 
 const router = express.Router();
 
@@ -587,6 +587,9 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
     let aitServiceName = 'AIT Freight (Oversized / Non-Parcel)';
     let aitPercentageOfPrice = 10;
     let aitWeightTiers: AitWeightTier[] | null = null;
+    let dhlServiceCode: string | null = null;
+    let dhlServiceName: string | null = null;
+    let dhlTiers: DhlTier[] | null = null;
 
     try {
       const aitResult = await query(
@@ -597,6 +600,19 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
         aitServiceName = aitResult.rows[0].service_name;
         aitPercentageOfPrice = asNumber(aitResult.rows[0].metadata?.percentage_of_price) ?? 10;
         aitWeightTiers = parseAitWeightTiers(aitResult.rows[0].metadata);
+      }
+    } catch (err) {
+      if (!isMissingRelationError(err)) throw err;
+    }
+
+    try {
+      const dhlResult = await query(
+        `SELECT service_code, service_name, metadata FROM shipping_services WHERE service_code = 'dhl_parcel_uk' AND is_active = true LIMIT 1`
+      );
+      if (dhlResult.rows[0]) {
+        dhlServiceCode = dhlResult.rows[0].service_code;
+        dhlServiceName = dhlResult.rows[0].service_name;
+        dhlTiers = parseDhlTiers(dhlResult.rows[0].metadata);
       }
     } catch (err) {
       if (!isMissingRelationError(err)) throw err;
@@ -671,6 +687,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
       liveQuoteError: string | null;
       liveQuoteConfigRequired: boolean;
       aitQuote: AitAssignment | null;
+      dhlQuote: DhlAssignment | null;
     }
 
     // Colour variants share identical dims within a product — compute the shipping decision once
@@ -727,6 +744,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
               liveQuoteError: 'Missing weight or dimensions — cannot request a live UPS rate.',
               liveQuoteConfigRequired: false,
               aitQuote: null,
+              dhlQuote: null,
             };
           }
 
@@ -735,6 +753,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
             priceGbp: asNumber(row.price_gbp),
             isMultidesk: Boolean(row.is_kit),
             upsServices: services,
+            dhlServiceCode, dhlServiceName, dhlTiers,
             aitServiceCode, aitServiceName, aitWeightTiers, aitPercentageOfPrice,
             upsConfigured: upsReferenceDestinationConfigured(),
             getUpsQuotes: getCachedUpsRates,
@@ -746,6 +765,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
             liveQuoteError: decisionResult.liveQuoteError,
             liveQuoteConfigRequired: decisionResult.liveQuoteConfigRequired,
             aitQuote: decisionResult.aitQuote,
+            dhlQuote: decisionResult.dhlQuote,
           };
         })();
         groupPromiseCache.set(groupKey, groupPromise);
@@ -783,6 +803,7 @@ router.get('/:id/shipping-estimates', authMiddleware, async (req: AuthRequest, r
         ups_live_quote_error: group.liveQuoteError,
         ups_live_quote_configuration_required: group.liveQuoteConfigRequired,
         ait_quote: group.aitQuote,
+        dhl_quote: group.dhlQuote,
       };
     }));
 

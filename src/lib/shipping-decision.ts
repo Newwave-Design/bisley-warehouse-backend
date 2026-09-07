@@ -4,13 +4,15 @@
  * function so the two call sites can't silently drift out of sync on the routing rules.
  *
  * Rules (as confirmed with Bisley):
- * 1. MultiDesk kit bundles always ship via AIT, regardless of whether UPS would accept them.
- * 2. Everything else tries a real live UPS Rating API quote first, restricted to genuine UPS
- *    parcel services (never UPS's own freight/pallet-tier service — Bisley uses AIT for freight).
- * 3. If UPS rejects the package, or only offers freight-tier services, fall back to AIT.
- * 4. If UPS accepts it but the cheapest quote costs more than MAX_UPS_COST_PERCENT_OF_PRICE of
+ * 1. MultiDesk kit bundles always ship via AIT, regardless of whether UPS or DHL would accept them.
+ * 2. Everything else tries DHL first (flat rate per weight+size band — no live API yet, account
+ *    still being set up). If the packed weight+dims don't fit any configured DHL band, fall through.
+ * 3. Then tries a real live UPS Rating API quote, restricted to genuine UPS parcel services (never
+ *    UPS's own freight/pallet-tier service — Bisley uses AIT for freight).
+ * 4. If UPS rejects the package, or only offers freight-tier services, fall back to AIT.
+ * 5. If UPS accepts it but the cheapest quote costs more than MAX_UPS_COST_PERCENT_OF_PRICE of
  *    the item's price, it's not worth using UPS even though it's technically eligible — use AIT.
- * 5. AIT's real rate card is a flat cost per weight band (see aitWeightTiers) — not a live-quoted
+ * 6. AIT's real rate card is a flat cost per weight band (see aitWeightTiers) — not a live-quoted
  *    courier. If the item's weight exceeds every configured band, it needs manual review rather
  *    than guessing a price. Falls back to a percentage-of-price estimate only if no weight tiers
  *    are configured at all (legacy behaviour, kept as a safety net).
@@ -48,6 +50,57 @@ export interface AitAssignment {
   estimated_cost_gbp: number | null;
 }
 
+/** A flat DHL rate band — a named parcel size (Small/Medium/...) with its own weight AND dimension caps. */
+export interface DhlTier {
+  name: string;
+  max_weight_kg: number;
+  max_length_mm: number;
+  max_width_mm: number;
+  max_height_mm: number;
+  cost_gbp: number;
+}
+
+/** Parses/validates the dhl_parcel service's metadata.tiers into a validated tier list. */
+export function parseDhlTiers(metadata: unknown): DhlTier[] | null {
+  const raw = (metadata as { tiers?: unknown } | null | undefined)?.tiers;
+  if (!Array.isArray(raw) || !raw.length) return null;
+  const tiers = raw
+    .map((t) => ({
+      name: String((t as any)?.name ?? ''),
+      max_weight_kg: Number((t as any)?.max_weight_kg),
+      max_length_mm: Number((t as any)?.max_length_mm),
+      max_width_mm: Number((t as any)?.max_width_mm),
+      max_height_mm: Number((t as any)?.max_height_mm),
+      cost_gbp: Number((t as any)?.cost_gbp),
+    }))
+    .filter((t) =>
+      Number.isFinite(t.max_weight_kg) && t.max_weight_kg > 0 &&
+      Number.isFinite(t.max_length_mm) && t.max_length_mm > 0 &&
+      Number.isFinite(t.max_width_mm) && t.max_width_mm > 0 &&
+      Number.isFinite(t.max_height_mm) && t.max_height_mm > 0 &&
+      Number.isFinite(t.cost_gbp) && t.cost_gbp >= 0
+    );
+  return tiers.length ? tiers : null;
+}
+
+/** Finds the cheapest DHL tier whose weight AND (orientation-agnostic) size caps both fit the packed item. */
+function findFittingDhlTier(tiers: DhlTier[], weightKg: number, longestMm: number, middleMm: number, shortestMm: number): DhlTier | null {
+  const fitting = tiers.filter((t) => {
+    const tierDims = [t.max_length_mm, t.max_width_mm, t.max_height_mm].sort((a, b) => b - a);
+    return weightKg <= t.max_weight_kg && longestMm <= tierDims[0] && middleMm <= tierDims[1] && shortestMm <= tierDims[2];
+  });
+  if (!fitting.length) return null;
+  fitting.sort((a, b) => a.cost_gbp - b.cost_gbp);
+  return fitting[0];
+}
+
+export interface DhlAssignment {
+  service_code: string;
+  service_name: string;
+  tier_name: string;
+  estimated_cost_gbp: number;
+}
+
 export interface ShippingDecisionInput {
   lengthMm: number;
   widthMm: number;
@@ -57,6 +110,10 @@ export interface ShippingDecisionInput {
   isMultidesk: boolean;
   /** Active UPS shipping services — used to resolve a quote's shipment_mode and display name. */
   upsServices: ShippingService[];
+  /** DHL service identity + rate card — null if DHL isn't configured/active yet. */
+  dhlServiceCode: string | null;
+  dhlServiceName: string | null;
+  dhlTiers: DhlTier[] | null;
   aitServiceCode: string;
   aitServiceName: string;
   /** Real AIT rate card, sorted ascending by max_weight_kg. Preferred over aitPercentageOfPrice. */
@@ -78,11 +135,13 @@ export interface ShippingDecisionResult {
   liveQuoteError: string | null;
   liveQuoteConfigRequired: boolean;
   aitQuote: AitAssignment | null;
+  dhlQuote: DhlAssignment | null;
 }
 
 export async function decideShippingForPackedItem(input: ShippingDecisionInput): Promise<ShippingDecisionResult> {
   const {
     lengthMm, widthMm, heightMm, weightGrams, priceGbp, isMultidesk, upsServices,
+    dhlServiceCode, dhlServiceName, dhlTiers,
     aitServiceCode, aitServiceName, aitWeightTiers, aitPercentageOfPrice, upsConfigured, getUpsQuotes,
   } = input;
 
@@ -94,6 +153,7 @@ export async function decideShippingForPackedItem(input: ShippingDecisionInput):
   let liveQuoteError: string | null = null;
   let liveQuoteConfigRequired = false;
   let aitQuote: AitAssignment | null = null;
+  let dhlQuote: DhlAssignment | null = null;
 
   // Returns true if AIT could actually be assigned a real cost.
   const assignAit = (): boolean => {
@@ -138,13 +198,26 @@ export async function decideShippingForPackedItem(input: ShippingDecisionInput):
     if (!assignAit()) {
       manualReviewReason = aitFailureReason();
     }
-    return { preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote };
+    return { preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote, dhlQuote };
+  }
+
+  // DHL is tried first for everything else — flat rate per weight+size band, no live API yet.
+  if (dhlServiceCode && dhlTiers && dhlTiers.length) {
+    const [longestMm, middleMm, shortestMm] = [lengthMm, widthMm, heightMm].sort((a, b) => b - a);
+    const tier = findFittingDhlTier(dhlTiers, weightGrams / 1000, longestMm, middleMm, shortestMm);
+    if (tier) {
+      dhlQuote = { service_code: dhlServiceCode, service_name: dhlServiceName ?? 'DHL', tier_name: tier.name, estimated_cost_gbp: tier.cost_gbp };
+      preferredServiceCode = dhlServiceCode;
+      preferredCostAmount = tier.cost_gbp;
+      preferredCostCurrency = 'GBP';
+      return { preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote, dhlQuote };
+    }
   }
 
   if (!upsConfigured) {
     liveQuoteConfigRequired = true;
     liveQuoteError = 'Live UPS rates are not configured. Set UPS_REFERENCE_DESTINATION_* env vars on the backend.';
-    return { preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote };
+    return { preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote, dhlQuote };
   }
 
   const result = await getUpsQuotes({ lengthMm, widthMm, heightMm, weightGrams });
@@ -169,7 +242,7 @@ export async function decideShippingForPackedItem(input: ShippingDecisionInput):
     if (!assignAit()) {
       manualReviewReason = `Manual review required - UPS ${result.error ? 'rejected this package' : 'only offered freight-tier services'} (${result.error ?? 'no parcel services were returned'}) and AIT could not be assigned either: ${aitFailureReason().replace('Manual review required - ', '')}`;
     }
-    return { preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote };
+    return { preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote, dhlQuote };
   }
 
   const cheapest = liveQuotes.reduce((best, quote) => {
@@ -180,7 +253,7 @@ export async function decideShippingForPackedItem(input: ShippingDecisionInput):
 
   if (!cheapest?.internalServiceCode) {
     manualReviewReason = 'Manual review required - UPS returned quotes but none matched a configured internal service code.';
-    return { preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote };
+    return { preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote, dhlQuote };
   }
 
   const tooExpensiveForUps = priceGbp != null && cheapest.totalChargesAmount != null
@@ -196,5 +269,5 @@ export async function decideShippingForPackedItem(input: ShippingDecisionInput):
     preferredCostCurrency = cheapest.totalChargesCurrency ?? null;
   }
 
-  return { preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote };
+  return { preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote, dhlQuote };
 }

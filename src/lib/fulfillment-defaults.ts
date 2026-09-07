@@ -62,6 +62,26 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     metadata: { ready_for_api: false, category: 'freight' },
   },
   {
+    // DHL account is being set up (no live API yet) — a flat rate per named parcel size band,
+    // tried before UPS/AIT for anything that fits. tiers is editable via the settings UI.
+    courier_code: 'dhl',
+    courier_name: 'DHL',
+    service_code: 'dhl_parcel_uk',
+    service_name: 'DHL Parcel UK',
+    service_level: 'standard',
+    shipment_mode: 'parcel',
+    constraints: { required_packaging_type: 'parcel', max_weight_kg: 25 },
+    metadata: {
+      ready_for_api: false, category: 'parcel', integration_type: 'weight_size_tiers',
+      tiers: [
+        { name: 'Small', max_weight_kg: 5, max_length_mm: 350, max_width_mm: 350, max_height_mm: 350, cost_gbp: 3.78 },
+        { name: 'Medium', max_weight_kg: 10, max_length_mm: 600, max_width_mm: 600, max_height_mm: 600, cost_gbp: 3.84 },
+        { name: 'Large', max_weight_kg: 20, max_length_mm: 600, max_width_mm: 600, max_height_mm: 600, cost_gbp: 5.10 },
+        { name: 'Extra-Large', max_weight_kg: 25, max_length_mm: 1200, max_width_mm: 700, max_height_mm: 700, cost_gbp: 5.10 },
+      ],
+    },
+  },
+  {
     // Bisley's real current shipping operation for anything that doesn't fit a standard
     // carton (BOX-SMALL/MEDIUM/LARGE) — not a live-quoted courier, a flat cost per weight band
     // (confirmed with AIT). weight_tiers is editable via the shipping-services settings UI.
