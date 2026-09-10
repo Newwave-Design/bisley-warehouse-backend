@@ -18,7 +18,7 @@ interface MatchedProduct {
 }
 interface VariantRow {
   product_id: string; title: string; handle: string; status: string; thumbnail: string | null
-  sku: string; width_mm: number | null; inventory_qty: number
+  sku: string; width_mm: number | null; weight_grams: number | null; inventory_qty: number
 }
 
 function matchesRules(rules: MatchRule[], v: VariantRow): boolean {
@@ -38,7 +38,8 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
       query(`SELECT * FROM box_size_requirements ORDER BY sort_order ASC, product_range ASC`),
       query(`
         SELECT medusa_product_id AS product_id, product_title, product_handle, product_status, product_thumbnail,
-               variant_sku, COALESCE(variant_width_mm, width_mm) AS width_mm, inventory_qty
+               variant_sku, COALESCE(variant_width_mm, width_mm) AS width_mm,
+               COALESCE(variant_weight_grams, weight_grams) AS weight_grams, inventory_qty
         FROM wms_products
       `),
     ]);
@@ -51,6 +52,7 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
       thumbnail: r.product_thumbnail,
       sku: r.variant_sku,
       width_mm: r.width_mm,
+      weight_grams: r.weight_grams,
       inventory_qty: r.inventory_qty ?? 0,
     }));
 
@@ -72,12 +74,18 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
       // Roll matching variants back up to their product, but only counting the variants that
       // actually matched (e.g. a width-specific rule should only show that width's variants).
       const matchedByProduct = new Map<string, MatchedProduct>();
+      let minWeightGrams: number | null = null;
+      let maxWeightGrams: number | null = null;
       for (const v of matchingVariants) {
         let p = matchedByProduct.get(v.product_id);
         if (!p) { p = { id: v.product_id, title: v.title, handle: v.handle, status: v.status, thumbnail: v.thumbnail, variant_count: 0, total_stock: 0 }; matchedByProduct.set(v.product_id, p); }
         p.variant_count++;
         p.total_stock += v.inventory_qty;
         matchedProductIds.add(v.product_id);
+        if (v.weight_grams != null) {
+          minWeightGrams = minWeightGrams == null ? v.weight_grams : Math.min(minWeightGrams, v.weight_grams);
+          maxWeightGrams = maxWeightGrams == null ? v.weight_grams : Math.max(maxWeightGrams, v.weight_grams);
+        }
       }
 
       return {
@@ -94,6 +102,8 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
         box_internal_depth_mm: row.box_internal_depth_mm,
         box_internal_height_mm: row.box_internal_height_mm,
         notes: row.notes,
+        min_product_weight_kg: minWeightGrams != null ? minWeightGrams / 1000 : null,
+        max_product_weight_kg: maxWeightGrams != null ? maxWeightGrams / 1000 : null,
         matched_products: [...matchedByProduct.values()],
       };
     });
