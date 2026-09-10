@@ -11,51 +11,75 @@ import { query } from '../../db/index.js';
 
 const router = express.Router();
 
-interface MatchRule { field: 'title' | 'handle'; contains: string }
+interface MatchRule { field: 'title' | 'handle'; contains: string; width_mm?: number }
 interface MatchedProduct {
   id: string; title: string; handle: string; status: string; thumbnail: string | null
   variant_count: number; total_stock: number
 }
+interface VariantRow {
+  product_id: string; title: string; handle: string; status: string; thumbnail: string | null
+  sku: string; width_mm: number | null; inventory_qty: number
+}
 
-function matchesRules(rules: MatchRule[], title: string, handle: string): boolean {
+function matchesRules(rules: MatchRule[], v: VariantRow): boolean {
   if (!Array.isArray(rules) || !rules.length) return false;
-  const t = title.toLowerCase();
-  const h = handle.toLowerCase();
-  return rules.some(r => (r.field === 'handle' ? h : t).includes(String(r.contains).toLowerCase()));
+  const t = v.title.toLowerCase();
+  const h = v.handle.toLowerCase();
+  return rules.some(r => {
+    const textMatch = (r.field === 'handle' ? h : t).includes(String(r.contains).toLowerCase());
+    if (!textMatch) return false;
+    return r.width_mm == null || v.width_mm === r.width_mm;
+  });
 }
 
 router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const [requirementsResult, productsResult] = await Promise.all([
+    const [requirementsResult, variantsResult] = await Promise.all([
       query(`SELECT * FROM box_size_requirements ORDER BY sort_order ASC, product_range ASC`),
       query(`
-        SELECT medusa_product_id,
-               MAX(product_title) AS product_title,
-               MAX(product_handle) AS product_handle,
-               MAX(product_status) AS product_status,
-               MAX(product_thumbnail) AS product_thumbnail,
-               COUNT(*)::int AS variant_count,
-               COALESCE(SUM(inventory_qty), 0)::int AS total_stock
+        SELECT medusa_product_id AS product_id, product_title, product_handle, product_status, product_thumbnail,
+               variant_sku, COALESCE(variant_width_mm, width_mm) AS width_mm, inventory_qty
         FROM wms_products
-        GROUP BY medusa_product_id
       `),
     ]);
 
-    const products: MatchedProduct[] = productsResult.rows.map((r: any) => ({
-      id: r.medusa_product_id,
+    const variants: VariantRow[] = variantsResult.rows.map((r: any) => ({
+      product_id: r.product_id,
       title: r.product_title ?? '',
       handle: r.product_handle ?? '',
       status: r.product_status,
       thumbnail: r.product_thumbnail,
-      variant_count: r.variant_count,
-      total_stock: r.total_stock,
+      sku: r.variant_sku,
+      width_mm: r.width_mm,
+      inventory_qty: r.inventory_qty ?? 0,
     }));
+
+    // Product-level summary, used for the "products with no box size at all" gap list below.
+    const productsById = new Map<string, MatchedProduct>();
+    for (const v of variants) {
+      let p = productsById.get(v.product_id);
+      if (!p) { p = { id: v.product_id, title: v.title, handle: v.handle, status: v.status, thumbnail: v.thumbnail, variant_count: 0, total_stock: 0 }; productsById.set(v.product_id, p); }
+      p.variant_count++;
+      p.total_stock += v.inventory_qty;
+    }
+    const products = [...productsById.values()];
 
     const matchedProductIds = new Set<string>();
     const requirements = requirementsResult.rows.map((row: any) => {
       const rules: MatchRule[] = row.match_rules ?? [];
-      const matched = products.filter(p => matchesRules(rules, p.title, p.handle));
-      for (const p of matched) matchedProductIds.add(p.id);
+      const matchingVariants = variants.filter(v => matchesRules(rules, v));
+
+      // Roll matching variants back up to their product, but only counting the variants that
+      // actually matched (e.g. a width-specific rule should only show that width's variants).
+      const matchedByProduct = new Map<string, MatchedProduct>();
+      for (const v of matchingVariants) {
+        let p = matchedByProduct.get(v.product_id);
+        if (!p) { p = { id: v.product_id, title: v.title, handle: v.handle, status: v.status, thumbnail: v.thumbnail, variant_count: 0, total_stock: 0 }; matchedByProduct.set(v.product_id, p); }
+        p.variant_count++;
+        p.total_stock += v.inventory_qty;
+        matchedProductIds.add(v.product_id);
+      }
+
       return {
         id: row.id,
         code: row.code,
@@ -70,7 +94,7 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
         box_internal_depth_mm: row.box_internal_depth_mm,
         box_internal_height_mm: row.box_internal_height_mm,
         notes: row.notes,
-        matched_products: matched,
+        matched_products: [...matchedByProduct.values()],
       };
     });
 
