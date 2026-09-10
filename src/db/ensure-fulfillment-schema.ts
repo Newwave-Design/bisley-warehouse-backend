@@ -147,6 +147,7 @@ const STATEMENTS: string[] = [
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
   )`,
+  `ALTER TABLE box_size_requirements ADD COLUMN IF NOT EXISTS estimated_monthly_sales_units INTEGER`,
   `INSERT INTO box_size_requirements
      (code, product_range, product_label, width_mm, depth_mm, height_mm, protection_type, foam_thickness_mm,
       box_internal_width_mm, box_internal_depth_mm, box_internal_height_mm, match_rules, notes, sort_order)

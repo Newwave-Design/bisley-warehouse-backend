@@ -76,17 +76,22 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
       const matchedByProduct = new Map<string, MatchedProduct>();
       let minWeightGrams: number | null = null;
       let maxWeightGrams: number | null = null;
+      let totalInventory = 0;
       for (const v of matchingVariants) {
         let p = matchedByProduct.get(v.product_id);
         if (!p) { p = { id: v.product_id, title: v.title, handle: v.handle, status: v.status, thumbnail: v.thumbnail, variant_count: 0, total_stock: 0 }; matchedByProduct.set(v.product_id, p); }
         p.variant_count++;
         p.total_stock += v.inventory_qty;
         matchedProductIds.add(v.product_id);
+        totalInventory += v.inventory_qty;
         if (v.weight_grams != null) {
           minWeightGrams = minWeightGrams == null ? v.weight_grams : Math.min(minWeightGrams, v.weight_grams);
           maxWeightGrams = maxWeightGrams == null ? v.weight_grams : Math.max(maxWeightGrams, v.weight_grams);
         }
       }
+
+      // Estimated monthly sales: initial stock (= ~2 months worth) divided by 2
+      const estimatedMonthlySalesUnits = totalInventory > 0 ? Math.round(totalInventory / 2) : 0;
 
       return {
         id: row.id,
@@ -104,6 +109,7 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
         notes: row.notes,
         min_product_weight_kg: minWeightGrams != null ? minWeightGrams / 1000 : null,
         max_product_weight_kg: maxWeightGrams != null ? maxWeightGrams / 1000 : null,
+        estimated_monthly_sales_units: estimatedMonthlySalesUnits,
         matched_products: [...matchedByProduct.values()],
       };
     });
