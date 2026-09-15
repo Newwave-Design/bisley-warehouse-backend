@@ -7,10 +7,14 @@
 
 import express, { Request, Response } from 'express'
 import { v4 as uuid } from 'uuid'
-import pool from '../../db/index.js'
+import { getPool } from '../../db/index.js'
+import { authMiddleware } from '../../middleware/auth.js'
 import type { PoolClient } from 'pg'
 
 const router = express.Router()
+
+// Apply auth middleware to all routes
+router.use(authMiddleware)
 
 /**
  * GET /api/queries
@@ -58,7 +62,7 @@ router.get('/', async (req: Request, res: Response) => {
     query += ` GROUP BY q.id, au.id ORDER BY q.${sort_by} DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`
     params.push(limit, offset)
 
-    const result = await pool.query(query, params)
+    const result = await getPool().query(query, params)
     res.json({ queries: result.rows, total: result.rows.length })
   } catch (error) {
     console.error('Error fetching queries:', error)
@@ -72,7 +76,7 @@ router.get('/', async (req: Request, res: Response) => {
  * Body: { customer_name, customer_email, customer_phone, subject, description, priority, assigned_to }
  */
 router.post('/', async (req: Request, res: Response) => {
-  const client: PoolClient | undefined = await pool.connect()
+  let client: PoolClient | undefined
   try {
     const { customer_name, customer_email, customer_phone, subject, description, priority = 'normal', assigned_to } = req.body
     const user_id = (req as any).user?.id
@@ -82,10 +86,16 @@ router.post('/', async (req: Request, res: Response) => {
       return
     }
 
+    client = await getPool().connect()
+    if (!client) {
+      res.status(500).json({ error: 'Database connection failed' })
+      return
+    }
+
     const query_number = `Q-${Date.now()}`
     const query_id = uuid()
 
-    const result = await client!.query(
+    const result = await client.query(
       `INSERT INTO customer_queries (id, query_number, customer_name, customer_email, customer_phone, subject, description, status, priority, assigned_to, created_by)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8, $9, $10)
        RETURNING *`,
@@ -95,7 +105,7 @@ router.post('/', async (req: Request, res: Response) => {
     res.status(201).json(result.rows[0])
   } catch (error) {
     console.error('Error creating query:', error)
-    res.status(500).json({ error: 'Failed to create query' })
+    res.status(500).json({ error: 'Failed to create query', details: error instanceof Error ? error.message : String(error) })
   } finally {
     client?.release()
   }
@@ -109,7 +119,7 @@ router.get('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params
 
-    const queryResult = await pool.query(
+    const queryResult = await getPool().query(
       `SELECT q.*, 
               au.name as assigned_to_name,
               u.email as created_by_email
@@ -128,7 +138,7 @@ router.get('/:id', async (req: Request, res: Response) => {
     const query = queryResult.rows[0]
 
     // Fetch records (communication history)
-    const recordsResult = await pool.query(
+    const recordsResult = await getPool().query(
       `SELECT qr.*, u.name as created_by_name
        FROM query_records qr
        LEFT JOIN warehouse_users u ON qr.created_by = u.id
@@ -138,13 +148,13 @@ router.get('/:id', async (req: Request, res: Response) => {
     )
 
     // Fetch linked orders
-    const ordersResult = await pool.query(
+    const ordersResult = await getPool().query(
       `SELECT * FROM query_linked_orders WHERE query_id = $1 ORDER BY tagged_at DESC`,
       [id]
     )
 
     // Fetch actions
-    const actionsResult = await pool.query(
+    const actionsResult = await getPool().query(
       `SELECT qa.*, u.name as created_by_name
        FROM query_actions qa
        LEFT JOIN warehouse_users u ON qa.created_by = u.id
@@ -170,8 +180,14 @@ router.get('/:id', async (req: Request, res: Response) => {
  * Update a query (status, priority, assignment, description)
  */
 router.put('/:id', async (req: Request, res: Response) => {
-  const client: PoolClient | undefined = await pool.connect()
+  let client: PoolClient | undefined
   try {
+    client = await getPool().connect()
+    if (!client) {
+      res.status(500).json({ error: 'Database connection failed' })
+      return
+    }
+
     const { id } = req.params
     const { status, priority, assigned_to, description, subject } = req.body
 
@@ -205,17 +221,19 @@ router.put('/:id', async (req: Request, res: Response) => {
     updateQuery += ` WHERE id = $${params.length + 1} RETURNING *`
     params.push(id)
 
-    const result = await client!.query(updateQuery, params)
+    console.log('Updating query:', { id, status, priority, assigned_to, description })
+    const result = await client.query(updateQuery, params)
 
     if (result.rows.length === 0) {
       res.status(404).json({ error: 'Query not found' })
       return
     }
 
+    console.log('Query updated successfully:', result.rows[0])
     res.json(result.rows[0])
   } catch (error) {
     console.error('Error updating query:', error)
-    res.status(500).json({ error: 'Failed to update query' })
+    res.status(500).json({ error: 'Failed to update query', details: error instanceof Error ? error.message : String(error) })
   } finally {
     client?.release()
   }
@@ -231,7 +249,7 @@ router.get('/:id/matching-orders', async (req: Request, res: Response) => {
     const { id } = req.params
 
     // Get the query to extract customer info
-    const queryResult = await pool.query(
+    const queryResult = await getPool().query(
       `SELECT customer_name, customer_email FROM customer_queries WHERE id = $1`,
       [id]
     )
@@ -244,7 +262,7 @@ router.get('/:id/matching-orders', async (req: Request, res: Response) => {
     const { customer_name, customer_email } = queryResult.rows[0]
 
     // Find matching pick lists
-    const pickListsResult = await pool.query(
+    const pickListsResult = await getPool().query(
       `SELECT pl.id, pl.pick_list_number, pl.medusa_order_id, pl.customer_name, pl.status, pl.created_at
        FROM pick_lists pl
        WHERE (pl.customer_email = $1 OR pl.customer_name ILIKE $2)
@@ -254,7 +272,7 @@ router.get('/:id/matching-orders', async (req: Request, res: Response) => {
     )
 
     // Get already-linked orders for this query
-    const linkedResult = await pool.query(
+    const linkedResult = await getPool().query(
       `SELECT pick_list_id, medusa_order_id FROM query_linked_orders WHERE query_id = $1`,
       [id]
     )
@@ -275,7 +293,7 @@ router.get('/:id/matching-orders', async (req: Request, res: Response) => {
  * Body: { record_type, record_title, content, record_value }
  */
 router.post('/:id/records', async (req: Request, res: Response) => {
-  const client: PoolClient | undefined = await pool.connect()
+  const client: PoolClient | undefined = await getPool().connect()
   try {
     const { id } = req.params
     const { record_type, record_title, content, record_value } = req.body
@@ -314,7 +332,7 @@ router.post('/:id/records', async (req: Request, res: Response) => {
  * Body: { action_type, action_value, action_description, linked_pick_list_id }
  */
 router.post('/:id/actions', async (req: Request, res: Response) => {
-  const client: PoolClient | undefined = await pool.connect()
+  const client: PoolClient | undefined = await getPool().connect()
   try {
     const { id } = req.params
     const { action_type, action_value, action_description, linked_pick_list_id } = req.body
@@ -353,7 +371,7 @@ router.post('/:id/actions', async (req: Request, res: Response) => {
  * Body: { pick_list_id, medusa_order_id, order_status, order_value_gbp }
  */
 router.post('/:id/link-order', async (req: Request, res: Response) => {
-  const client: PoolClient | undefined = await pool.connect()
+  const client: PoolClient | undefined = await getPool().connect()
   try {
     const { id } = req.params
     const { pick_list_id, medusa_order_id, order_status, order_value_gbp, customer_name_on_order } = req.body

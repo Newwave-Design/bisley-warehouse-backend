@@ -30,4 +30,21 @@ export async function medusaGet(path: string): Promise<any> {
   return res.json();
 }
 
+export async function medusaPost(path: string, body: any): Promise<any> {
+  const token = await getMedusaToken();
+  const res = await fetch(`${MEDUSA_URL}${path}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const error = await res.json();
+    throw new Error(`Medusa API error: ${res.status} ${JSON.stringify(error)}`);
+  }
+  return res.json();
+}
+
 export { MEDUSA_URL };

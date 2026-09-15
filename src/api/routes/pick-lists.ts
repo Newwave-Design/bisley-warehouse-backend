@@ -1020,4 +1020,132 @@ router.delete('/:pickListId', authMiddleware, requirePermission('manage_operatio
   }
 });
 
+/**
+ * POST /api/pick-lists/:pickListId/sync-to-medusa
+ *
+ * Create a fulfillment in Medusa for this pick list.
+ * 
+ * Requirements:
+ *   - Pick list status must be PACKED (items picked, packed, label printed)
+ *   - All line items must have medusa_order_line_item_id stored
+ *   - Calls Medusa POST /admin/orders/{order_id}/fulfillments
+ *
+ * Response: { success: true, medusa_fulfillment_id: "ful_..." }
+ */
+router.post('/:pickListId/sync-to-medusa', authMiddleware, requirePermission('manage_operations'), async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    const { medusaPost } = await import('../../lib/medusa-client.js');
+
+    // Get pick list
+    const plResult = await query(
+      `SELECT id, medusa_order_id, status FROM pick_lists WHERE id = $1`,
+      [pickListId]
+    );
+
+    if (!plResult.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+
+    const pickList = plResult.rows[0];
+    if (pickList.status !== 'PACKED' && pickList.status !== 'LABEL_PRINTED') {
+      return res.status(400).json({ error: `Pick list must be PACKED or LABEL_PRINTED, currently ${pickList.status}` });
+    }
+
+    // Get all items with their line item IDs
+    const itemsResult = await query(
+      `SELECT id, medusa_order_line_item_id, quantity_picked, product_sku
+       FROM pick_list_items
+       WHERE pick_list_id = $1 AND medusa_order_line_item_id IS NOT NULL
+       ORDER BY line_number`,
+      [pickListId]
+    );
+
+    if (itemsResult.rows.length === 0) {
+      return res.status(400).json({ error: 'No items with Medusa line item IDs found' });
+    }
+
+    // Build fulfillment payload for Medusa
+    const fulfillmentItems = itemsResult.rows.map((row: any) => ({
+      id: row.medusa_order_line_item_id,
+      quantity: row.quantity_picked || 1,
+    }));
+
+    // Call Medusa API to create fulfillment
+    const fulfillmentResponse = await medusaPost(
+      `/admin/orders/${pickList.medusa_order_id}/fulfillments`,
+      { items: fulfillmentItems }
+    );
+
+    const fulfillmentId = fulfillmentResponse.fulfillment?.id;
+    if (!fulfillmentId) {
+      throw new Error(`No fulfillment ID in Medusa response: ${JSON.stringify(fulfillmentResponse)}`);
+    }
+
+    // Store fulfillment ID in pick_lists for later shipment sync
+    await query(
+      `UPDATE pick_lists
+       SET medusa_fulfillment_id = $1, updated_at = NOW()
+       WHERE id = $2`,
+      [fulfillmentId, pickListId]
+    );
+
+    console.log(`✓ Fulfillment ${fulfillmentId} created for order ${pickList.medusa_order_id}`);
+    res.json({ success: true, medusa_fulfillment_id: fulfillmentId });
+  } catch (error: any) {
+    console.error('Fulfillment sync error:', error);
+    res.status(500).json({ error: error.message || 'Failed to sync to Medusa' });
+  }
+});
+
+/**
+ * POST /api/pick-lists/:pickListId/shipment-to-medusa
+ *
+ * Create shipment tracking in Medusa for a fulfillment.
+ *
+ * Requirements:
+ *   - Pick list must have been synced (medusa_fulfillment_id must exist)
+ *   - Requires tracking_number in request body or from pick_lists.selected_courier_code
+ *   - Calls Medusa POST /admin/fulfillments/{fulfillment_id}/shipment
+ *
+ * Body: { tracking_number?: "..." }
+ * Response: { success: true, shipment_tracking_id: "..." }
+ */
+router.post('/:pickListId/shipment-to-medusa', authMiddleware, requirePermission('manage_operations'), async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    const { tracking_number } = req.body;
+    const { medusaPost } = await import('../../lib/medusa-client.js');
+
+    // Get pick list
+    const plResult = await query(
+      `SELECT id, medusa_fulfillment_id, status FROM pick_lists WHERE id = $1`,
+      [pickListId]
+    );
+
+    if (!plResult.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+
+    const pickList = plResult.rows[0];
+    if (!pickList.medusa_fulfillment_id) {
+      return res.status(400).json({ error: 'Pick list has not been synced to Medusa yet. Call /sync-to-medusa first.' });
+    }
+
+    // Call Medusa API to create shipment
+    const shipmentResponse = await medusaPost(
+      `/admin/fulfillments/${pickList.medusa_fulfillment_id}/shipment`,
+      tracking_number ? { tracking_numbers: [tracking_number] } : {}
+    );
+
+    // Update pick list status to DISPATCHED
+    await query(
+      `UPDATE pick_lists SET status = 'DISPATCHED', dispatched_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [pickListId]
+    );
+
+    console.log(`✓ Shipment created for fulfillment ${pickList.medusa_fulfillment_id} with tracking ${tracking_number || '(none)'}`);
+    res.json({ success: true, shipment_tracking_id: shipmentResponse.shipment?.id });
+  } catch (error: any) {
+    console.error('Shipment sync error:', error);
+    res.status(500).json({ error: error.message || 'Failed to sync shipment to Medusa' });
+  }
+});
+
 export default router;

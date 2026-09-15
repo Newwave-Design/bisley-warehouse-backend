@@ -250,26 +250,5 @@ router.post('/purge-skus', authMiddleware, requirePermission('system_admin'), as
   }
 });
 
-/**
- * POST /api/inventory-sync/trigger
- * Phase 3: Manually trigger an inventory sync to Medusa (admin only)
- * Syncs all SKUs with medusa_variant_id to Medusa stocked_quantity
- */
-router.post('/trigger', authMiddleware, requirePermission('manage_inventory'), async (req: Request, res: Response) => {
-  try {
-    const { triggerInventorySyncNow } = await import('../../jobs/inventory-sync-scheduler.js');
-    const results = await triggerInventorySyncNow();
-    const syncedCount = results.filter(r => r.status === 'SYNCED').length;
-    const failedCount = results.filter(r => r.status === 'FAILED').length;
-    res.json({
-      success: true,
-      message: `Synced ${syncedCount} SKUs, ${failedCount} failed`,
-      results,
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Failed to trigger sync' });
-  }
-});
-
 export default router;
 
