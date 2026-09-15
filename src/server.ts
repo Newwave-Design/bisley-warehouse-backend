@@ -31,6 +31,7 @@ import deliveriesRoutes from './api/routes/deliveries.js';
 import authRoutes from './api/routes/auth.js';
 import usersRoutes from './api/routes/users.js';
 import groupsRoutes from './api/routes/groups.js';
+import queriesRoutes from './api/routes/queries.js';
 import { createNotificationOnce } from './lib/notifications.js';
 import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
 import { query as dbQueryUtil } from './db/index.js';
@@ -87,6 +88,7 @@ app.use('/api/notifications', notificationsRoutes);
 app.use('/api/deliveries', deliveriesRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/groups', groupsRoutes);
+app.use('/api/queries', queriesRoutes);
 
 // 404 handler
 app.use((req, res) => {

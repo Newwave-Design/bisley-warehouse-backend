@@ -439,7 +439,7 @@ SELECT g.id, p.key, true
 FROM user_groups g
 CROSS JOIN (VALUES
   ('system_admin'), ('manage_orders'), ('manage_reorder_rules'), ('manage_settings'),
-  ('manage_sku_mappings'), ('manage_financials'), ('manage_error_log'), ('manage_operations'), ('manage_users')
+  ('manage_sku_mappings'), ('manage_financials'), ('manage_error_log'), ('manage_operations'), ('manage_users'), ('manage_crm')
 ) AS p(key)
 WHERE g.name = 'Admin'
 ON CONFLICT (group_id, permission_key) DO NOTHING;
@@ -449,7 +449,7 @@ SELECT g.id, p.key, true
 FROM user_groups g
 CROSS JOIN (VALUES
   ('manage_orders'), ('manage_reorder_rules'), ('manage_settings'),
-  ('manage_sku_mappings'), ('manage_financials'), ('manage_error_log'), ('manage_operations')
+  ('manage_sku_mappings'), ('manage_financials'), ('manage_error_log'), ('manage_operations'), ('manage_crm')
 ) AS p(key)
 WHERE g.name = 'WMS'
 ON CONFLICT (group_id, permission_key) DO NOTHING;
@@ -957,4 +957,97 @@ CREATE TABLE IF NOT EXISTS genero_deliveries (
 );
 CREATE INDEX IF NOT EXISTS idx_deliveries_est ON genero_deliveries(est_delivery);
 CREATE INDEX IF NOT EXISTS idx_deliveries_status ON genero_deliveries(status);
+
+-- ================================================================================
+-- CUSTOMER QUERIES (Phase 7: CRM module for customer inquiries)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS customer_queries (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  query_number VARCHAR(50) NOT NULL UNIQUE,
+  customer_name VARCHAR(255) NOT NULL,
+  customer_email VARCHAR(255),
+  customer_phone VARCHAR(20),
+  subject VARCHAR(500) NOT NULL,
+  description TEXT,
+  status VARCHAR(50) NOT NULL DEFAULT 'open',
+  -- Statuses: open, in_progress, resolved, closed
+  priority VARCHAR(20) NOT NULL DEFAULT 'normal',
+  -- Priorities: low, normal, high, urgent
+  assigned_to UUID REFERENCES warehouse_users(id) ON DELETE SET NULL,
+  created_by UUID NOT NULL REFERENCES warehouse_users(id),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_customer_queries_status ON customer_queries(status);
+CREATE INDEX IF NOT EXISTS idx_customer_queries_assigned_to ON customer_queries(assigned_to);
+CREATE INDEX IF NOT EXISTS idx_customer_queries_created_at ON customer_queries(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_customer_queries_customer_email ON customer_queries(customer_email);
+
+-- ================================================================================
+-- QUERY RECORDS (Communication history for a customer query)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS query_records (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  query_id UUID NOT NULL REFERENCES customer_queries(id) ON DELETE CASCADE,
+  record_type VARCHAR(50) NOT NULL,
+  -- Types: note, action, status_change, system_event
+  record_title VARCHAR(255),
+  -- e.g. "Part refund (£25)", "Return initiated", "Order cancelled"
+  record_value DECIMAL(10,2),
+  -- For financial actions: refund amount, etc.
+  content TEXT,
+  -- The full note or description
+  created_by UUID NOT NULL REFERENCES warehouse_users(id),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_query_records_query_id ON query_records(query_id);
+CREATE INDEX IF NOT EXISTS idx_query_records_type ON query_records(record_type);
+CREATE INDEX IF NOT EXISTS idx_query_records_created_at ON query_records(created_at DESC);
+
+-- ================================================================================
+-- QUERY LINKED ORDERS (Join table: customer queries to pick lists/Medusa orders)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS query_linked_orders (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  query_id UUID NOT NULL REFERENCES customer_queries(id) ON DELETE CASCADE,
+  pick_list_id UUID REFERENCES pick_lists(id) ON DELETE SET NULL,
+  medusa_order_id VARCHAR(100),
+  -- Optional: reference to Medusa order if not yet in WMS
+  customer_name_on_order VARCHAR(255),
+  order_value_gbp DECIMAL(10,2),
+  order_status VARCHAR(100),
+  tagged_at TIMESTAMP DEFAULT NOW(),
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(query_id, pick_list_id, medusa_order_id)
+);
+CREATE INDEX IF NOT EXISTS idx_query_linked_orders_query_id ON query_linked_orders(query_id);
+CREATE INDEX IF NOT EXISTS idx_query_linked_orders_pick_list_id ON query_linked_orders(pick_list_id);
+CREATE INDEX IF NOT EXISTS idx_query_linked_orders_medusa_order_id ON query_linked_orders(medusa_order_id);
+
+-- ================================================================================
+-- QUERY ACTIONS (Action log: part refunds, returns, cancellations per query)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS query_actions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  query_id UUID NOT NULL REFERENCES customer_queries(id) ON DELETE CASCADE,
+  action_type VARCHAR(50) NOT NULL,
+  -- Types: part_refund, full_refund, return, cancel_order, reorder, other
+  action_value DECIMAL(10,2),
+  -- For refunds: amount; for other actions: NULL
+  action_description TEXT,
+  linked_pick_list_id UUID REFERENCES pick_lists(id) ON DELETE SET NULL,
+  medusa_sync_status VARCHAR(50) NOT NULL DEFAULT 'pending',
+  -- Status: pending, synced, failed, retry
+  medusa_sync_error TEXT,
+  -- Error message if sync failed
+  synced_at TIMESTAMP,
+  synced_by UUID REFERENCES warehouse_users(id),
+  created_by UUID NOT NULL REFERENCES warehouse_users(id),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_query_actions_query_id ON query_actions(query_id);
+CREATE INDEX IF NOT EXISTS idx_query_actions_type ON query_actions(action_type);
+CREATE INDEX IF NOT EXISTS idx_query_actions_sync_status ON query_actions(medusa_sync_status);
+CREATE INDEX IF NOT EXISTS idx_query_actions_created_at ON query_actions(created_at DESC);
 `;
