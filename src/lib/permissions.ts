@@ -22,6 +22,7 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'manage_financials', label: 'Financials', description: 'View financial reports and edit per-SKU unit costs.' },
   { key: 'manage_error_log', label: 'Error Log', description: 'Bulk-resolve error log entries.' },
   { key: 'manage_operations', label: 'Delete Records', description: 'Delete pick lists and check-in sessions.' },
+  { key: 'manage_crm', label: 'CRM & Queries', description: 'Manage customer queries, communications history, and complaint actions.' },
   { key: 'manage_users', label: 'Users & Permissions', description: 'Invite/manage users, groups, and permissions.' },
 ];
 
