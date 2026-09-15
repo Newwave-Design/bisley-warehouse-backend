@@ -200,6 +200,11 @@ async function start() {
       void runDailyChecks(); // also run once on boot rather than waiting a full day
       console.log('✓ Daily checks scheduled (weekly report + liability review, every 24h)');
     }
+
+    // Phase 3: Inventory Sync Scheduler — syncs WMS inventory to Medusa every 5 minutes
+    const { startInventorySyncScheduler } = await import('./jobs/inventory-sync-scheduler.js');
+    startInventorySyncScheduler();
+    console.log('✓ Inventory sync scheduler started (every 5 min)');
   } catch (error) {
     console.error('❌ Startup failed:', error);
     process.exit(1);

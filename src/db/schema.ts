@@ -135,6 +135,35 @@ ALTER TABLE warehouse_inventory ADD COLUMN IF NOT EXISTS liability_status VARCHA
 CREATE INDEX IF NOT EXISTS idx_inventory_liability ON warehouse_inventory(liability_status);
 
 -- ================================================================================
+-- INVENTORY SYNC LOG (Phase 3: Audit trail for Medusa inventory sync)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS inventory_sync_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  product_sku VARCHAR(100) NOT NULL,
+  medusa_variant_id VARCHAR(100),
+  medusa_product_id VARCHAR(100),
+  available_qty INTEGER NOT NULL DEFAULT 0,
+  stocked_qty_before INTEGER,
+  stocked_qty_after INTEGER,
+  status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'SYNCED', 'FAILED')),
+  error_message TEXT,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  last_retry_at TIMESTAMP,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_inventory_sync_log_status ON inventory_sync_log(status);
+CREATE INDEX IF NOT EXISTS idx_inventory_sync_log_created ON inventory_sync_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_inventory_sync_log_sku ON inventory_sync_log(product_sku);
+
+-- Add Medusa variant tracking to wms_products
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS medusa_product_id VARCHAR(100);
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS medusa_variant_id VARCHAR(100);
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMP;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS last_sync_status VARCHAR(20);
+
+-- ================================================================================
 -- WMS SETTINGS (Phase 6: single key/value store for global toggles)
 -- ================================================================================
 CREATE TABLE IF NOT EXISTS wms_settings (
@@ -249,6 +278,7 @@ CREATE TABLE IF NOT EXISTS product_fulfillment_profiles (
 CREATE TABLE IF NOT EXISTS pick_lists (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   medusa_order_id VARCHAR(100) NOT NULL UNIQUE,
+  medusa_fulfillment_id VARCHAR(100),
   pick_list_number VARCHAR(50) NOT NULL UNIQUE,
   status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
   -- Statuses: PENDING, IN_PROGRESS, PICKED, PACKING, PACKED, LABEL_PRINTED, DISPATCHED, CANCELLED,
@@ -294,6 +324,7 @@ ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMP;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS packing_notes TEXT;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_sandbox BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS parent_pick_list_id UUID REFERENCES pick_lists(id) ON DELETE SET NULL;
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS medusa_fulfillment_id VARCHAR(100);
 CREATE INDEX IF NOT EXISTS idx_pick_lists_parent ON pick_lists(parent_pick_list_id);
 
 -- ================================================================================
@@ -321,6 +352,10 @@ ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS is_sandbox BOOLEAN NOT NULL
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS liability_status VARCHAR(20);
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS unit_price_gbp DECIMAL(10,2);
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS unit_cost_gbp DECIMAL(10,2);
+-- Medusa order line item IDs — required for fulfillment sync to Medusa Admin API
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS medusa_order_line_item_id VARCHAR(100);
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS medusa_variant_id VARCHAR(100);
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS medusa_product_id VARCHAR(100);
 
 -- ================================================================================
 -- PICK SCANS (Individual scan history — supports partial-quantity picking,
