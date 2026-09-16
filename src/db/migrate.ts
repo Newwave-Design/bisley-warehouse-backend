@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import * as pg from 'pg';
 import { WAREHOUSE_SCHEMA } from './schema.js';
 import { fileURLToPath } from 'url';
@@ -5,8 +6,17 @@ import { fileURLToPath } from 'url';
 const { Client } = pg;
 
 export async function runMigrations() {
+  // Try multiple database URLs in order: NEON_DATABASE_URL, DATABASE_URL, or WAREHOUSE_DATABASE_URL
+  const dbUrl = process.env.NEON_DATABASE_URL ||
+                process.env.DATABASE_URL ||
+                process.env.WAREHOUSE_DATABASE_URL;
+
+  if (!dbUrl) {
+    throw new Error('No database URL found. Set DATABASE_URL, NEON_DATABASE_URL, or WAREHOUSE_DATABASE_URL env var.');
+  }
+
   const client = new Client({
-    connectionString: process.env.WAREHOUSE_DATABASE_URL,
+    connectionString: dbUrl,
   });
 
   try {

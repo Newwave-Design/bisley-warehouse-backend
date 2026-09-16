@@ -32,6 +32,7 @@ import authRoutes from './api/routes/auth.js';
 import usersRoutes from './api/routes/users.js';
 import groupsRoutes from './api/routes/groups.js';
 import queriesRoutes from './api/routes/queries.js';
+import returnsRoutes from './api/routes/returns.js';
 import shippingOptionsRoutes from './routes/shipping-options.js';
 import { createNotificationOnce } from './lib/notifications.js';
 import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
@@ -90,6 +91,7 @@ app.use('/api/deliveries', deliveriesRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/groups', groupsRoutes);
 app.use('/api/queries', queriesRoutes);
+app.use('/api/returns', returnsRoutes);
 app.use('/api', shippingOptionsRoutes);
 
 // 404 handler

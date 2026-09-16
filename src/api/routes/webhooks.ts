@@ -215,12 +215,13 @@ async function handleOrderCancelled(order: any) {
 }
 
 /**
- * handleOrderReturned — Optionally redeem returned items back to warehouse
+ * handleOrderReturned — Create RMA and optionally redeem returned items
  *
  * When a return is initiated for an order:
- *   1. Find the original pick list
- *   2. If return.metadata.redeem_to_warehouse == true: add qty back to warehouse_inventory
- *   3. Sync updated available qty to Medusa (only if redeemed)
+ *   1. Create return_authorization record with RMA number
+ *   2. Create return_items records
+ *   3. If return.metadata.redeem_to_warehouse == true: add qty back to warehouse_inventory
+ *   4. Sync updated available qty to Medusa (only if redeemed)
  * 
  * If not redeemed, items are discarded (e.g., damaged, hygiene, etc.) and NOT added back.
  */
@@ -228,29 +229,46 @@ async function handleOrderReturned(order: any) {
   const medusaOrderId = order.id;
   console.log(`[webhooks] Processing order.returned for ${medusaOrderId}`);
 
-  // Find the pick list
-  const plResult = await query(`SELECT id FROM pick_lists WHERE medusa_order_id = $1`, [medusaOrderId]);
-  if (plResult.rows.length === 0) {
-    console.log(`[webhooks] No pick list found for order ${medusaOrderId}, skipping return`);
-    return;
-  }
-
-  const pickListId = plResult.rows[0].id;
-
   // Medusa return data format:
   // order.returns is an array of return objects, each with metadata.redeem_to_warehouse
   const returns = order.returns ?? [];
-  const affectedSkus = new Set<string>();
 
   for (const ret of returns) {
-    // Only process if explicitly marked for warehouse redemption
-    const shouldRedeem = ret.metadata?.redeem_to_warehouse === true;
-    if (!shouldRedeem) {
-      console.log(`[webhooks] Return ${ret.id} not marked for warehouse redemption, skipping`);
+    // Generate RMA number: RMA-YYYYMMDD-XXXX
+    const today = new Date().toISOString().split('T')[0].replace(/-/g, '');
+    const countResult = await query(
+      `SELECT COUNT(*) as count FROM return_authorizations 
+       WHERE rma_number LIKE $1`,
+      [`RMA-${today}-%`]
+    );
+    const count = parseInt(countResult.rows[0].count) + 1;
+    const rma_number = `RMA-${today}-${String(count).padStart(4, '0')}`;
+
+    // Check if already processed
+    const existingResult = await query(
+      `SELECT id FROM return_authorizations WHERE medusa_return_id = $1`,
+      [ret.id]
+    );
+    if (existingResult.rows.length > 0) {
+      console.log(`[webhooks] Return ${ret.id} already processed, skipping`);
       continue;
     }
 
+    // Only process if explicitly marked for warehouse redemption
+    const shouldRedeem = ret.metadata?.redeem_to_warehouse === true;
+
+    // Create return authorization
+    const raResult = await query(
+      `INSERT INTO return_authorizations
+       (rma_number, medusa_order_id, medusa_return_id, status, redeem_to_warehouse)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [rma_number, medusaOrderId, ret.id, shouldRedeem ? 'AUTHORIZED' : 'AUTHORIZED', shouldRedeem]
+    );
+
+    const raId = raResult.rows[0].id;
     const returnItems = ret.items ?? [];
+    const affectedSkus = new Set<string>();
 
     for (const returnItem of returnItems) {
       // returnItem has: id (line item id), quantity
@@ -264,27 +282,41 @@ async function handleOrderReturned(order: any) {
       const sku = itemResult.rows[0].product_sku;
       const qty = returnItem.quantity || 1;
 
-      // Add stock back to inventory
+      // Create return item record
       await query(
-        `UPDATE warehouse_inventory
-         SET quantity = quantity + $1, updated_at = NOW()
-         WHERE product_sku = $2`,
-        [qty, sku]
+        `INSERT INTO return_items
+         (return_authorization_id, medusa_order_line_item_id, product_sku, quantity_requested)
+         VALUES ($1, $2, $3, $4)`,
+        [raId, returnItem.id, sku, qty]
       );
 
-      affectedSkus.add(sku);
-      console.log(`✓ Redeemed ${qty}x ${sku} from return ${ret.id}`);
-    }
-  }
+      // If redeemable, add stock back to inventory
+      if (shouldRedeem) {
+        await query(
+          `UPDATE warehouse_inventory
+           SET quantity = quantity + $1, updated_at = NOW()
+           WHERE product_sku = $2`,
+          [qty, sku]
+        );
 
-  // Sync updated available quantities to Medusa (only for redeemed SKUs)
-  for (const sku of affectedSkus) {
-    const row = await query(
-      `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
-      [sku]
-    );
-    const available = Math.max(0, parseInt(row.rows[0]?.qty ?? '0') - parseInt(row.rows[0]?.reserved ?? '0'));
-    await syncSkuToMedusa(sku, available);
+        affectedSkus.add(sku);
+        console.log(`✓ Redeemed ${qty}x ${sku} from return ${ret.id} (RMA: ${rma_number})`);
+      }
+    }
+
+    // Sync updated available quantities to Medusa (only if redeemable)
+    if (shouldRedeem) {
+      for (const sku of affectedSkus) {
+        const row = await query(
+          `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
+          [sku]
+        );
+        const available = Math.max(0, parseInt(row.rows[0]?.qty ?? '0') - parseInt(row.rows[0]?.reserved ?? '0'));
+        await syncSkuToMedusa(sku, available);
+      }
+    }
+
+    console.log(`✓ Return processed: ${rma_number} (order: ${medusaOrderId}, redeemable: ${shouldRedeem})`);
   }
 
 

@@ -455,7 +455,10 @@ router.post('/shipping-services/ups-sync', authMiddleware, requirePermission('sy
 // Helper: Calculate DHL cost with surcharge breakdown
 interface DhlCostBreakdown {
   base_cost_gbp: number;
-  surcharges: { name: string; amount_gbp: number }[];
+  weight_surcharge_gbp: number;
+  weight_bracket?: string; // e.g., "5.01-10kg"
+  length_surcharge_gbp: number;
+  length_bracket?: string; // e.g., "1000-1500cm"
   total_cost_gbp: number;
   calculation_summary: string;
 }
@@ -469,14 +472,18 @@ function calculateDhlCostBreakdown(
   dhlSurcharges: any
 ): DhlCostBreakdown {
   const weightKg = weightGrams / 1000;
-  const surcharges: { name: string; amount_gbp: number }[] = [];
+  let weightSurcharge = 0;
+  let weightBracket: string | undefined;
+  let lengthSurcharge = 0;
+  let lengthBracket: string | undefined;
   
   // 1. Find base rate tier (weight-only matching for DHL Parcel UK)
   const baseTier = dhlTiers.find(t => weightKg <= t.max_weight_kg);
   if (!baseTier) {
     return {
       base_cost_gbp: 0,
-      surcharges: [],
+      weight_surcharge_gbp: 0,
+      length_surcharge_gbp: 0,
       total_cost_gbp: 0,
       calculation_summary: `ERROR: Product weight ${weightKg.toFixed(2)}kg exceeds all configured DHL tiers`,
     };
@@ -490,7 +497,8 @@ function calculateDhlCostBreakdown(
       b => weightKg >= b.min_kg && weightKg <= b.max_kg
     );
     if (heavyBand) {
-      surcharges.push({ name: `Heavy weight (${weightKg.toFixed(1)}kg)`, amount_gbp: heavyBand.surcharge_gbp });
+      weightSurcharge = heavyBand.surcharge_gbp;
+      weightBracket = `${heavyBand.min_kg.toFixed(2)}-${heavyBand.max_kg.toFixed(2)}kg`;
     }
   }
   
@@ -501,22 +509,30 @@ function calculateDhlCostBreakdown(
       b => maxDim >= b.min_cm && maxDim <= b.max_cm
     );
     if (lengthBand) {
-      surcharges.push({ name: `Long length (${maxDim.toFixed(0)}cm)`, amount_gbp: lengthBand.surcharge_gbp });
+      lengthSurcharge = lengthBand.surcharge_gbp;
+      lengthBracket = `${lengthBand.min_cm.toFixed(0)}-${lengthBand.max_cm.toFixed(0)}cm`;
     }
   }
   
-  const totalSurcharges = surcharges.reduce((sum, s) => sum + s.amount_gbp, 0);
-  const totalCost = baseCost + totalSurcharges;
+  const totalCost = baseCost + weightSurcharge + lengthSurcharge;
   
-  const surchargeText = surcharges.length > 0
-    ? ` + ${surcharges.map(s => `£${s.amount_gbp.toFixed(2)} (${s.name})`).join(', ')}`
-    : '';
+  // Format as: "Base £X.XX + Weight £Y.YY (5.01-10kg) + Length £Z.ZZ (1000-1500cm) = £Total"
+  const parts = [`Base £${baseCost.toFixed(2)}`];
+  if (weightSurcharge > 0) {
+    parts.push(`Weight £${weightSurcharge.toFixed(2)}${weightBracket ? ` (${weightBracket})` : ''}`);
+  }
+  if (lengthSurcharge > 0) {
+    parts.push(`Length £${lengthSurcharge.toFixed(2)}${lengthBracket ? ` (${lengthBracket})` : ''}`);
+  }
   
   return {
     base_cost_gbp: baseCost,
-    surcharges,
+    weight_surcharge_gbp: weightSurcharge,
+    weight_bracket: weightBracket,
+    length_surcharge_gbp: lengthSurcharge,
+    length_bracket: lengthBracket,
     total_cost_gbp: totalCost,
-    calculation_summary: `Base rate £${baseCost.toFixed(2)}${surchargeText} = £${totalCost.toFixed(2)}`,
+    calculation_summary: `${parts.join(' + ')} = £${totalCost.toFixed(2)}`,
   };
 }
 
@@ -757,7 +773,7 @@ async function runUpsAutoTagJob() {
       if (needsManual) manualReview++;
       const checklistTemplateCode = 'STD-PARCEL';
 
-      // Build pack instructions with DHL cost breakdown (including surcharges)
+      // Build pack instructions with DHL cost breakdown (including surcharges with brackets)
       let packInstructions = manualReviewReason ?? '';
       let finalCostGbp: number = preferredCostAmount ? Number(preferredCostAmount) : 0;
       
@@ -771,16 +787,12 @@ async function runUpsAutoTagJob() {
             dhlTiers,
             dhlSurcharges
           );
+          // Format: "DHL Zone A: Base £5.75 + Weight £0.45 (5.01-10kg) + Length £0.00 = £6.20"
           packInstructions = `DHL Zone ${dhlZoneA?.zone || 'A'}: ${breakdown.calculation_summary}`;
-          if (breakdown.surcharges.length > 0) {
-            packInstructions += ' | Surcharges: ' + breakdown.surcharges
-              .map(s => `${s.name} £${s.amount_gbp.toFixed(2)}`)
-              .join(', ');
-          }
           finalCostGbp = breakdown.total_cost_gbp;
         } catch (e) {
           // Fallback to base cost if breakdown fails
-          packInstructions = `DHL Zone ${dhlZoneA?.zone || 'A'}: Base rate £${Number(preferredCostAmount).toFixed(2)}`;
+          packInstructions = `DHL Zone ${dhlZoneA?.zone || 'A'}: Base £${Number(preferredCostAmount).toFixed(2)}`;
         }
       }
 

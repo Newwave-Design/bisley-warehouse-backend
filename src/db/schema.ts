@@ -1179,4 +1179,61 @@ CREATE INDEX IF NOT EXISTS idx_dpd_base_rates_service ON dpd_base_rates(service_
 CREATE INDEX IF NOT EXISTS idx_dpd_weight_surcharges_min_kg ON dpd_weight_surcharges(min_kg);
 CREATE INDEX IF NOT EXISTS idx_dpd_length_surcharges_min_cm ON dpd_length_surcharges(min_cm);
 CREATE INDEX IF NOT EXISTS idx_dpd_additional_services_active ON dpd_additional_services(is_active);
+
+-- ================================================================================
+-- RETURN AUTHORIZATIONS (RMA tracking for customer returns)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS return_authorizations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  rma_number VARCHAR(50) NOT NULL UNIQUE,
+  medusa_order_id VARCHAR(100) NOT NULL,
+  medusa_return_id VARCHAR(100),
+  status VARCHAR(50) NOT NULL DEFAULT 'AUTHORIZED',
+  -- Statuses: AUTHORIZED, RECEIVED, APPROVED, REJECTED, REFUNDED, EXCHANGED
+  redeem_to_warehouse BOOLEAN NOT NULL DEFAULT true,
+  -- If true: add items back to inventory + sync to Medusa
+  -- If false: items are discarded (damaged, hygiene, etc.) - no sync
+  customer_name VARCHAR(255),
+  customer_email VARCHAR(255),
+  return_reason VARCHAR(255),
+  notes TEXT,
+  authorized_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  received_at TIMESTAMP,
+  approved_at TIMESTAMP,
+  rejected_at TIMESTAMP,
+  refunded_at TIMESTAMP,
+  approved_by UUID REFERENCES warehouse_users(id),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_return_authorizations_medusa_order_id ON return_authorizations(medusa_order_id);
+CREATE INDEX IF NOT EXISTS idx_return_authorizations_status ON return_authorizations(status);
+CREATE INDEX IF NOT EXISTS idx_return_authorizations_rma_number ON return_authorizations(rma_number);
+
+-- ================================================================================
+-- RETURN ITEMS (Individual items within a return authorization)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS return_items (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  return_authorization_id UUID NOT NULL REFERENCES return_authorizations(id) ON DELETE CASCADE,
+  medusa_order_line_item_id VARCHAR(100),
+  product_sku VARCHAR(50) NOT NULL,
+  colour_code VARCHAR(20),
+  quantity_requested INT NOT NULL DEFAULT 1,
+  quantity_received INT DEFAULT 0,
+  unit_price_gbp DECIMAL(10,2),
+  status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
+  -- Statuses: PENDING, RECEIVED, APPROVED, REJECTED, REFUNDED
+  item_condition VARCHAR(50),
+  -- e.g., 'unused', 'lightly_used', 'damaged', 'hygiene_issue', 'wrong_item'
+  item_notes TEXT,
+  received_at TIMESTAMP,
+  approved_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_return_items_authorization_id ON return_items(return_authorization_id);
+CREATE INDEX IF NOT EXISTS idx_return_items_status ON return_items(status);
+CREATE INDEX IF NOT EXISTS idx_return_items_sku ON return_items(product_sku);
+
 `;
