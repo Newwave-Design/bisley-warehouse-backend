@@ -263,7 +263,8 @@ router.get('/product-fulfillment-map', authMiddleware, async (_req: AuthRequest,
               pfp.requires_manual_review,
               pfp.packaging_profile_code,
               pfp.estimated_shipping_cost_gbp,
-              pfp.estimated_shipping_currency
+              pfp.estimated_shipping_currency,
+              pfp.pack_instructions
        FROM wms_products wp
        LEFT JOIN product_fulfillment_profiles pfp ON pfp.product_sku = wp.variant_sku
        WHERE wp.variant_sku IS NOT NULL AND wp.variant_sku <> ''`
@@ -450,6 +451,65 @@ router.post('/shipping-services/ups-sync', authMiddleware, requirePermission('sy
   }
 });
 
+// Helper: Calculate DHL cost with surcharge breakdown
+interface DhlCostBreakdown {
+  base_cost_gbp: number;
+  surcharges: { name: string; amount_gbp: number }[];
+  total_cost_gbp: number;
+  calculation_summary: string;
+}
+
+function calculateDhlCostBreakdown(
+  weightGrams: number,
+  lengthMm: number,
+  widthMm: number,
+  heightMm: number,
+  dhlTiers: any[],
+  dhlSurcharges: any
+): DhlCostBreakdown {
+  const weightKg = weightGrams / 1000;
+  const surcharges: { name: string; amount_gbp: number }[] = [];
+  
+  // 1. Find base rate tier (up to 25kg)
+  const baseTier = dhlTiers.find(t => weightKg <= t.max_weight_kg);
+  const baseCost = baseTier ? baseTier.cost_gbp : dhlTiers[dhlTiers.length - 1]?.cost_gbp ?? 0;
+  
+  // 2. Heavy weight surcharge (weight > 5kg)
+  if (weightKg > 5 && dhlSurcharges.heavy_weight_kg) {
+    const heavyBand = (dhlSurcharges.heavy_weight_kg as any[]).find(
+      b => weightKg >= b.min_kg && weightKg <= b.max_kg
+    );
+    if (heavyBand) {
+      surcharges.push({ name: `Heavy weight (${weightKg.toFixed(1)}kg)`, amount_gbp: heavyBand.surcharge_gbp });
+    }
+  }
+  
+  // 3. Long length surcharge (length > 100cm)
+  const maxDim = Math.max(lengthMm, widthMm, heightMm) / 10;
+  if (maxDim > 100 && dhlSurcharges.long_length_cm) {
+    const lengthBand = (dhlSurcharges.long_length_cm as any[]).find(
+      b => maxDim >= b.min_cm && maxDim <= b.max_cm
+    );
+    if (lengthBand) {
+      surcharges.push({ name: `Long length (${maxDim.toFixed(0)}cm)`, amount_gbp: lengthBand.surcharge_gbp });
+    }
+  }
+  
+  const totalSurcharges = surcharges.reduce((sum, s) => sum + s.amount_gbp, 0);
+  const totalCost = baseCost + totalSurcharges;
+  
+  const surchargeText = surcharges.length > 0
+    ? ` + ${surcharges.map(s => `£${s.amount_gbp.toFixed(2)} (${s.name})`).join(', ')}`
+    : '';
+  
+  return {
+    base_cost_gbp: baseCost,
+    surcharges,
+    total_cost_gbp: totalCost,
+    calculation_summary: `Base rate £${baseCost.toFixed(2)}${surchargeText} = £${totalCost.toFixed(2)}`,
+  };
+}
+
 interface AutoTagState {
   running: boolean;
   started_at: Date | null;
@@ -496,7 +556,10 @@ async function runUpsAutoTagJob() {
         `SELECT service_code, service_name, metadata FROM shipping_services WHERE service_code = 'ait_freight' AND is_active = true LIMIT 1`
       ),
       query(
-        `SELECT service_code, service_name, metadata FROM shipping_services WHERE service_code = 'dhl_parcel_uk' AND is_active = true LIMIT 1`
+        `SELECT service_code, service_name, metadata FROM shipping_services 
+         WHERE service_code IN ('dhl_parcel_zone_a', 'dhl_parcel_zone_b', 'dhl_parcel_zone_c', 'dhl_parcel_zone_d') 
+         AND is_active = true 
+         ORDER BY metadata->>'zone' ASC`
       ),
     ]);
 
@@ -508,11 +571,19 @@ async function runUpsAutoTagJob() {
     const aitPercentageOfPrice = asNumber(aitServiceResult.rows[0]?.metadata?.percentage_of_price) ?? 10;
     const aitWeightTiers = parseAitWeightTiers(aitServiceResult.rows[0]?.metadata);
 
-    // DHL is tried before UPS/AIT once configured — a flat rate per named parcel size band, no
-    // live API yet (account still being set up). Null/unconfigured until a rate card is added.
-    const dhlServiceCode = dhlServiceResult.rows[0]?.service_code ?? null;
-    const dhlServiceName = dhlServiceResult.rows[0]?.service_name ?? null;
-    const dhlTiers = parseDhlTiers(dhlServiceResult.rows[0]?.metadata);
+    // DHL zones: query returns all 4 zone services (A, B, C, D). Default to Zone A for all products.
+    // Can be overridden per-product via manual edit in the dashboard.
+    const dhlZoneServices = (dhlServiceResult.rows as any[]).map(row => ({
+      service_code: row.service_code,
+      service_name: row.service_name,
+      zone: row.metadata?.zone || 'A',
+      metadata: row.metadata || {},
+    }));
+    const dhlZoneA = dhlZoneServices.find(s => s.zone === 'A') ?? dhlZoneServices[0];
+    const dhlServiceCode = dhlZoneA?.service_code ?? null;
+    const dhlServiceName = dhlZoneA?.service_name ?? null;
+    const dhlTiers = parseDhlTiers(dhlZoneA?.metadata);
+    const dhlSurcharges = dhlZoneA?.metadata?.surcharges ?? {};
 
     // Kit variants (e.g. MultiDesk) have no dims of their own — batch-load every component
     // SKU's dims once so kit dimensions can be computed as stacked-in-a-box totals.
@@ -682,6 +753,36 @@ async function runUpsAutoTagJob() {
       // fit a standard carton" without it actually shipping via freight).
       const checklistTemplateCode = preferredServiceCode === aitServiceCode ? 'PALLET-FREIGHT' : 'STD-PARCEL';
 
+      // Build pack instructions with cost breakdown for DHL
+      let packInstructions = manualReviewReason ?? (preferredServiceCode === aitServiceCode
+        ? `Auto-tagged for AIT freight shipping - flat £${Number(preferredCostAmount).toFixed(2)}.`
+        : preferredServiceCode === dhlServiceCode
+          ? `Auto-tagged for DHL ${dhlZoneA?.zone || 'A'} - £${Number(preferredCostAmount).toFixed(2)} (calculated below).`
+          : 'Auto-tagged using a live UPS Rating API quote for packed dimensions (+140 mm).');
+
+      // If DHL, add surcharge breakdown
+      if (preferredServiceCode === dhlServiceCode && estimate?.packaged_dimensions) {
+        try {
+          const breakdown = calculateDhlCostBreakdown(
+            estimate.package_weight_grams,
+            estimate.packaged_dimensions.used_length_mm,
+            estimate.packaged_dimensions.used_width_mm,
+            estimate.packaged_dimensions.used_height_mm,
+            dhlTiers,
+            dhlSurcharges
+          );
+          packInstructions = `DHL Zone ${dhlZoneA?.zone || 'A'}: ${breakdown.calculation_summary}`;
+          if (breakdown.surcharges.length > 0) {
+            packInstructions += ' | Surcharges: ' + breakdown.surcharges
+              .map(s => `${s.name} £${s.amount_gbp.toFixed(2)}`)
+              .join(', ');
+          }
+        } catch (e) {
+          // Fallback to simple message if breakdown fails
+          packInstructions = `Auto-tagged for DHL ${dhlZoneA?.zone || 'A'} - £${Number(preferredCostAmount).toFixed(2)}.`;
+        }
+      }
+
       await query(
         `INSERT INTO product_fulfillment_profiles (
            product_sku,
@@ -715,11 +816,7 @@ async function runUpsAutoTagJob() {
           preferredServiceCode,
           needsManual,
           JSON.stringify(needsManual ? ['ups-manual-review'] : ['ups-auto-tagged']),
-          manualReviewReason ?? (preferredServiceCode === aitServiceCode
-            ? `Auto-tagged for AIT freight shipping - flat £${Number(preferredCostAmount).toFixed(2)}.`
-            : preferredServiceCode === dhlServiceCode
-              ? `Auto-tagged for DHL shipping - flat £${Number(preferredCostAmount).toFixed(2)} rate card (no live API yet).`
-              : 'Auto-tagged using a live UPS Rating API quote for packed dimensions (+140 mm).'),
+          packInstructions,
           preferredCostAmount,
           preferredCostCurrency,
         ]
