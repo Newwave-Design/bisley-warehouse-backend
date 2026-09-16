@@ -15,3 +15,14 @@ yarn-error.log*
 *~
 .cache/
 .turbo/
+
+# Ad-hoc scripts and test files (keep locally, don't publish)
+check-*.mjs
+check-*.ts
+populate-*.mjs
+populate-*.ts
+test-*.mjs
+test-*.ts
+scripts/
+*.md
+PHASE_*.md
