@@ -9,7 +9,7 @@ import { authMiddleware, requirePermission, AuthRequest } from '../../middleware
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured } from '../../lib/ups.js';
-import { decideShippingForPackedItem, parseAitWeightTiers, parseDhlTiers } from '../../lib/shipping-decision.js';
+import { decideShippingForPackedItem, parseAitWeightTiers, parseDhlTiers, type DhlTier } from '../../lib/shipping-decision.js';
 
 const router = express.Router();
 
@@ -21,6 +21,7 @@ function asNumber(v: unknown): number | null {
   }
   return null;
 }
+
 
 /** GET /api/settings/field-mappings — returns all mappings grouped by direction */
 router.get('/field-mappings', authMiddleware, requirePermission('manage_settings'), async (_req: AuthRequest, res: Response) => {
@@ -712,13 +713,6 @@ async function runUpsAutoTagJob() {
             })
           : null;
 
-        const packed = estimate?.packaged_dimensions;
-        const lengthMm = packed?.used_length_mm ?? 0;
-        const widthMm = packed?.used_width_mm ?? 0;
-        const heightMm = packed?.used_height_mm ?? 0;
-        const packageWeightGrams = estimate?.package_weight_grams ?? 0;
-        const hasCompletePackedDims = lengthMm > 0 && widthMm > 0 && heightMm > 0 && packageWeightGrams > 0;
-
         let preferredServiceCode: string | null = null;
         let preferredCostAmount: number | null = null;
         let preferredCostCurrency: string | null = null;
@@ -726,10 +720,11 @@ async function runUpsAutoTagJob() {
 
         if (!hasCompleteDimensions) {
           manualReviewReason = 'Manual review required - product weight and all dimensions must be recorded before a shipping service can be assigned.';
-        } else if (!hasCompletePackedDims) {
+        } else if (!estimate || !estimate.packaged_dimensions) {
           manualReviewReason = 'Manual review required - no packaging profile could be resolved for this item\'s dimensions.';
         } else {
           // FORCE DHL assignment for all standard parcels (no UPS/AIT fallback in auto-tag)
+          const packageWeightGrams = estimate?.package_weight_grams ?? 0;
           const weightKg = packageWeightGrams / 1000;
           const dhlTierForWeight = dhlTiers && dhlTiers.length ? dhlTiers.find(t => weightKg <= t.max_weight_kg) : null;
           
@@ -750,6 +745,13 @@ async function runUpsAutoTagJob() {
 
       const { estimate, preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason } = decision;
 
+      // Extract packed dimensions for cost calculation
+      const packed = estimate?.packaged_dimensions;
+      const lengthMm = packed?.used_length_mm ?? 0;
+      const widthMm = packed?.used_width_mm ?? 0;
+      const heightMm = packed?.used_height_mm ?? 0;
+      const packageWeightGrams = estimate?.package_weight_grams ?? 0;
+
       if (!preferredServiceCode) noEligible++;
       const needsManual = Boolean(manualReviewReason);
       if (needsManual) manualReview++;
@@ -757,15 +759,15 @@ async function runUpsAutoTagJob() {
 
       // Build pack instructions with DHL cost breakdown (including surcharges)
       let packInstructions = manualReviewReason ?? '';
-      let finalCostGbp = preferredCostAmount ?? 0;
+      let finalCostGbp: number = preferredCostAmount ? Number(preferredCostAmount) : 0;
       
       if (preferredServiceCode === dhlServiceCode && estimate?.packaged_dimensions && !manualReviewReason && dhlTiers) {
         try {
           const breakdown = calculateDhlCostBreakdown(
-            estimate.package_weight_grams,
-            estimate.packaged_dimensions.used_length_mm,
-            estimate.packaged_dimensions.used_width_mm,
-            estimate.packaged_dimensions.used_height_mm,
+            packageWeightGrams,
+            lengthMm,
+            widthMm,
+            heightMm,
             dhlTiers,
             dhlSurcharges
           );
