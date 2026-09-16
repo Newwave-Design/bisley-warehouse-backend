@@ -1,5 +1,5 @@
-﻿/**
- * Inventory Sync API â€” Phases 6 & 7
+/**
+ * Inventory Sync API — Phases 6 & 7
  * Phase 6: Pre-sync comparison (WMS vs Medusa)
  * Phase 7: Push WMS quantities to Medusa
  */
@@ -75,11 +75,11 @@ async function getMedusaItemInfo(sku: string): Promise<{ itemId: string; locatio
   return level ? { itemId: item.id, locationId: level.location_id } : null;
 }
 
-// Pre-sync comparison — Medusa is the source of truth; WMS defaults to 0 if not stocked
+// Pre-sync comparison � Medusa is the source of truth; WMS defaults to 0 if not stocked
 router.get('/pre-sync', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const forceRefresh = req.query.refresh === 'true';
-    // Fetch Medusa inventory first — uses 10-min cache; pass ?refresh=true to force reload
+    // Fetch Medusa inventory first � uses 10-min cache; pass ?refresh=true to force reload
     let medusaMap: Map<string, number>;
     try {
       medusaMap = await fetchMedusaInventory(forceRefresh);
@@ -112,59 +112,10 @@ router.get('/pre-sync', authMiddleware, async (req: AuthRequest, res: Response) 
   }
 });
 
-// Sync WMS â†’ Medusa
-router.post('/sync', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
-  try {
-    const { skus } = req.body;
-    const token = await getMedusaToken();
-
-    let sql = `SELECT product_sku as sku, SUM(quantity) as qty FROM warehouse_inventory`;
-    const params: any[] = [];
-    if (skus?.length) { sql += ` WHERE product_sku = ANY($1::text[])`; params.push(skus); }
-    sql += ` GROUP BY product_sku`;
-
-    const wmsItems = await query(sql, params);
-    const results: any[] = [];
-
-    for (const item of wmsItems.rows) {
-      const wmsQty = parseInt(item.qty);
-      const info = await getMedusaItemInfo(item.sku);
-
-      if (!info) { results.push({ sku: item.sku, status: 'NOT_IN_MEDUSA', wms_qty: wmsQty }); continue; }
-
-      const updateRes = await fetch(
-        `${MEDUSA_URL}/admin/inventory-items/${info.itemId}/location-levels/${info.locationId}`,
-        {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ stocked_quantity: wmsQty }),
-        }
-      );
-
-      results.push(updateRes.ok
-        ? { sku: item.sku, status: 'SYNCED', wms_qty: wmsQty }
-        : { sku: item.sku, status: 'ERROR', error: (await updateRes.json() as any).message, wms_qty: wmsQty }
-      );
-    }
-
-    await query(
-      `INSERT INTO audit_log (action, entity_type, entity_id, user_id, new_values, created_at)
-       VALUES ('MEDUSA_SYNC', 'inventory', 'bulk', $1, $2, NOW())`,
-      [(req as any).user?.sub || 'system', JSON.stringify({ count: results.length, synced: results.filter(r => r.status === 'SYNCED').length })]
-    ).catch(() => {});
-
-    res.json({
-      success: true,
-      synced: results.filter(r => r.status === 'SYNCED').length,
-      errors: results.filter(r => r.status === 'ERROR').length,
-      not_in_medusa: results.filter(r => r.status === 'NOT_IN_MEDUSA').length,
-      results,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Sync failed', detail: (err as Error).message });
-  }
-});
+// ⚠️ REMOVED: POST /api/inventory/sync
+// This endpoint was removed in Phase 3 event-driven refactor.
+// Inventory sync now happens ONLY via webhooks (order.placed → reserve, fulfilled → deduct).
+// See BACKORDER_FLOW_ANALYSIS.md and MEDUSA_WMS_INTEGRATION.md for architecture.
 
 // WMS inventory flat list
 router.get('/all', authMiddleware, async (req: AuthRequest, res: Response) => {
@@ -180,58 +131,18 @@ router.get('/all', authMiddleware, async (req: AuthRequest, res: Response) => {
   }
 });
 
-// Seed WMS from Medusa — use Medusa quantities as the WMS baseline
-// Creates a default location "MEDUSA-IMPORT" if none exists, then upserts inventory
-router.post('/seed-from-medusa', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
-  try {
-    // Always fetch fresh from Medusa when seeding
-    const medusaMap = await fetchMedusaInventory(true);
+// ?? REMOVED: POST /api/inventory/seed-from-medusa
+// This endpoint was removed in Phase 3 refactor.
+// Initial SKU/product import now uses POST /api/products/sync (imports product definitions, not inventory quantities).
+// Warehouse inventory is populated via receiving (checked in by warehouse staff), never from Medusa.
+// See INVENTORY_SYNC_ENDPOINTS_AUDIT.md for details.
 
-    // Ensure a default import location exists
-    await query(`
-      INSERT INTO warehouse_locations (bay_code, bin_code, location_code, description, created_at, updated_at)
-      VALUES ('IMPORT', '01', 'IMPORT-01', 'Medusa import baseline', NOW(), NOW())
-      ON CONFLICT (location_code) DO NOTHING
-    `);
-    const locResult = await query(`SELECT id FROM warehouse_locations WHERE location_code = 'IMPORT-01'`);
-    const locationId = locResult.rows[0]?.id;
+// ?? REMOVED: DELETE /api/inventory/wms-inventory
+// This endpoint was removed in Phase 3 refactor.
+// Was only used to clear IMPORT-01 baseline from seed-from-medusa (which was also removed).
+// To clean up test data, use POST /api/inventory/purge-skus instead (deletes specific SKUs).
 
-    if (!locationId) return res.status(500).json({ error: 'Failed to create import location' });
-
-    let imported = 0;
-    for (const [sku, qty] of medusaMap) {
-      if (qty <= 0) continue;
-      await query(`
-        INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, created_at, updated_at)
-        VALUES ($1, $2, '', $3, NOW(), NOW())
-        ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
-        DO UPDATE SET quantity = $3, updated_at = NOW()
-      `, [locationId, sku, qty]);
-      imported++;
-    }
-
-    res.json({ success: true, imported, location: 'IMPORT-01' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to seed from Medusa', detail: (err as Error).message });
-  }
-});
-
-// Clear WMS inventory — wipe the IMPORT-01 baseline to start fresh
-router.delete('/wms-inventory', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
-  try {
-    const result = await query(`
-      DELETE FROM warehouse_inventory wi
-      USING warehouse_locations wl
-      WHERE wi.location_id = wl.id AND wl.location_code = 'IMPORT-01'
-    `);
-    res.json({ success: true, deleted: result.rowCount });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to clear WMS inventory' });
-  }
-});
-
-// Purge specific legacy/phantom SKUs from warehouse_inventory — used to clean up
+// Purge specific legacy/phantom SKUs from warehouse_inventory � used to clean up
 // old test data (renamed/typo'd product codes) that no longer has a Medusa counterpart.
 // Body: { skus: string[] }
 router.post('/purge-skus', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
@@ -251,4 +162,5 @@ router.post('/purge-skus', authMiddleware, requirePermission('system_admin'), as
 });
 
 export default router;
+
 
