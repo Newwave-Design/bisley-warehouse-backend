@@ -20,6 +20,11 @@ function getMedusaHeaders(): Record<string, string> {
   };
 }
 
+export async function getMedusaToken(): Promise<string> {
+  if (!MEDUSA_API_KEY) throw new Error('MEDUSA_SECRET_API_KEY env var is not set');
+  return MEDUSA_API_KEY;
+}
+
 /**
  * Set the stocked_quantity of a SKU's inventory item at the warehouse location.
  * Fetches the current WMS total for that SKU and sets it in Medusa.
