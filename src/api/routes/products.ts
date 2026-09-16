@@ -126,7 +126,7 @@ async function fetchAllProductsFromMedusa(forceRefresh = false): Promise<WmsProd
   let pOff = 0;
   while (true) {
     const d = await fetch(
-      `${MEDUSA_URL}/admin/products?limit=100&offset=${pOff}` +
+      `${MEDUSA_URL}/admin/products?limit=100&offset=${pOff}&status[]=published` +
       `&fields=id,title,subtitle,description,handle,status,thumbnail,material,weight,height,width,length,metadata` +
       `,*images,*variants,*variants.inventory_items,*variants.inventory_items.inventory_item,*variants.prices`,
       { headers: auth }
@@ -135,40 +135,45 @@ async function fetchAllProductsFromMedusa(forceRefresh = false): Promise<WmsProd
     for (const p of d.products ?? []) {
       const gallery: string[] = (p.images ?? []).map((img: any) => img.url).filter(Boolean);
 
-      const variants: WmsVariant[] = (p.variants ?? []).map((v: any) => {
-        const links: any[] = v.inventory_items ?? [];
-        const kit_components = links
-          .map((l: any) => ({
-            // Medusa v2 doesn't deep-expand inventory_item.sku in product queries — use itemIdToSku map
-            sku: l.inventory_item?.sku ?? itemIdToSku.get(l.inventory_item_id) ?? null,
-            required_quantity: l.required_quantity ?? 1,
-          }))
-          .filter(c => c.sku);
-        const is_kit = links.length > 1;
-        const inventory_qty = is_kit && kit_components.length > 0
-          ? Math.min(...kit_components.map(c => Math.floor((inventoryMap.get(c.sku) ?? 0) / c.required_quantity)))
-          : inventoryMap.get(v.sku) ?? 0;
-        const colour_code = extractColourCode(v.sku ?? '');
-        const colour_name = COLOUR_NAMES[colour_code ?? ''] ?? v.title ?? null;
-        // Use variant-level dimensions/weight if set, fall back to product-level
-        const weight_grams = v.weight ?? p.weight ?? null;
-        const height_mm = v.height ?? p.height ?? null;
-        const width_mm = v.width ?? p.width ?? null;
-        const depth_mm = v.length ?? p.length ?? null;
-        // GBP price: find the GBP price entry and convert from stored amount (major units = pounds)
-        const gbpPrice = (v.prices ?? []).find((pr: any) => pr.currency_code === 'gbp');
-        const price_gbp = gbpPrice ? gbpPrice.amount : null;
+      const variants: WmsVariant[] = (p.variants ?? [])
+        .map((v: any) => {
+          const links: any[] = v.inventory_items ?? [];
+          const kit_components = links
+            .map((l: any) => ({
+              // Medusa v2 doesn't deep-expand inventory_item.sku in product queries — use itemIdToSku map
+              sku: l.inventory_item?.sku ?? itemIdToSku.get(l.inventory_item_id) ?? null,
+              required_quantity: l.required_quantity ?? 1,
+            }))
+            .filter(c => c.sku);
+          const is_kit = links.length > 1;
+          const inventory_qty = is_kit && kit_components.length > 0
+            ? Math.min(...kit_components.map(c => Math.floor((inventoryMap.get(c.sku) ?? 0) / c.required_quantity)))
+            : inventoryMap.get(v.sku) ?? 0;
+          const colour_code = extractColourCode(v.sku ?? '');
+          const colour_name = COLOUR_NAMES[colour_code ?? ''] ?? v.title ?? null;
+          // Use variant-level dimensions/weight if set, fall back to product-level
+          const weight_grams = v.weight ?? p.weight ?? null;
+          const height_mm = v.height ?? p.height ?? null;
+          const width_mm = v.width ?? p.width ?? null;
+          const depth_mm = v.length ?? p.length ?? null;
+          // GBP price: find the GBP price entry and convert from stored amount (major units = pounds)
+          const gbpPrice = (v.prices ?? []).find((pr: any) => pr.currency_code === 'gbp');
+          const price_gbp = gbpPrice ? gbpPrice.amount : null;
 
-        return {
-          id: v.id, sku: v.sku ?? '', title: v.title ?? '', thumbnail: v.thumbnail ?? null,
-          manage_inventory: !!v.manage_inventory, is_kit, kit_components,
-          inventory_qty, colour_code, colour_name,
-          allow_backorder: !!v.allow_backorder,
-          price_gbp,
-          barcode: v.barcode ?? null,
-          weight_grams, height_mm, width_mm, depth_mm,
-        };
-      });
+          return {
+            id: v.id, sku: v.sku ?? '', title: v.title ?? '', thumbnail: v.thumbnail ?? null,
+            manage_inventory: !!v.manage_inventory, is_kit, kit_components,
+            inventory_qty, colour_code, colour_name,
+            allow_backorder: !!v.allow_backorder,
+            price_gbp,
+            barcode: v.barcode ?? null,
+            weight_grams, height_mm, width_mm, depth_mm,
+          };
+        })
+        // Only sync variants with full weight + dimensions so DHL costs can be calculated
+        .filter((v: WmsVariant) => v.weight_grams != null && v.height_mm != null && v.width_mm != null && v.depth_mm != null);
+
+      if (variants.length === 0) continue;
 
       products.push({
         id: p.id, title: p.title, subtitle: p.subtitle ?? null,
@@ -354,6 +359,7 @@ async function runSyncJob() {
   const syncStart = new Date();
   let inserted = 0, updated = 0, skipped = 0, barcodesSynced = 0;
   const errors: string[] = [];
+  const sampleChanges: any[] = []; // Track sample field changes
 
   try {
     syncState.progress = 'Fetching from Medusa…';
@@ -446,7 +452,7 @@ async function runSyncJob() {
             inventory_qty       = EXCLUDED.inventory_qty,
             last_synced_at      = NOW(),
             updated_at          = NOW()
-          RETURNING (xmax = 0) AS is_insert
+          RETURNING (xmax = 0) AS is_insert, medusa_variant_id, variant_sku
         `, params);
         
         for (const row of r.rows) {
@@ -516,15 +522,21 @@ async function runSyncJob() {
       barcodes_synced: barcodesSynced,
       sku_mappings_enriched: enrichResult.rowCount ?? 0,
       stale_rows: staleResult.rows[0]?.stale_count ?? 0,
-      errors: errors.slice(0, 20),
+      errors: errors.length > 0 ? errors : [],
+      error_count: errors.length,
       duration_ms: Date.now() - syncStart.getTime(),
       total_variants: inserted + updated,
+      summary: {
+        processed: inserted + updated + skipped,
+        success_rate: `${Math.round((inserted + updated) / (inserted + updated + skipped) * 100)}%`,
+        sync_time_sec: Math.round((Date.now() - syncStart.getTime()) / 1000),
+      }
     };
     syncState.error = null;
   } catch (err: any) {
     console.error('Sync job error:', err);
     syncState.error = err.message;
-    syncState.result = { inserted, updated, errors };
+    syncState.result = { inserted, updated, errors, error_count: errors.length };
   } finally {
     syncState.running = false;
     syncState.finished_at = new Date();
