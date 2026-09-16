@@ -22,8 +22,10 @@ import { query } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
+import { getLogger } from '../../lib/logger.js';
 
 const router = express.Router();
+const logger = getLogger('receiving');
 
 /** Current default liability owner applied to newly received stock (Bisley by default). */
 async function getDefaultLiabilityStatus(): Promise<string> {
@@ -170,12 +172,16 @@ router.patch('/queue/:id/assign', authMiddleware, async (req: AuthRequest, res: 
 // Stock a single item — moves from queue to warehouse_inventory
 router.post('/queue/:id/stock', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const item = await query(`SELECT * FROM requires_location_queue WHERE id = $1`, [req.params.id]);
+    const itemId = req.params.id;
+    const item = await query(`SELECT * FROM requires_location_queue WHERE id = $1`, [itemId]);
     if (!item.rows[0]) return res.status(404).json({ error: 'Item not found' });
     if (!item.rows[0].location_id) return res.status(400).json({ error: 'Must assign a location first' });
 
     const { location_id, nw_code, colour, medusa_sku, quantity } = item.rows[0];
+    const sku = medusa_sku || nw_code;
     const defaultLiability = await getDefaultLiabilityStatus();
+
+    logger.info(`Receiving ${quantity}x ${sku} (colour: ${colour || 'default'}) into location ${location_id}`);
 
     // Upsert into warehouse_inventory
     await query(`
@@ -183,29 +189,47 @@ router.post('/queue/:id/stock', authMiddleware, async (req: AuthRequest, res: Re
       VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
       ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
       DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
-    `, [location_id, medusa_sku || nw_code, colour || '', quantity, defaultLiability]);
+    `, [location_id, sku, colour || '', quantity, defaultLiability]);
+
+    logger.info(`✓ Inserted ${quantity}x ${sku} into warehouse_inventory at location ${location_id}`);
 
     await query(
       `UPDATE requires_location_queue SET status='STOCKED', stocked_at=NOW(), updated_at=NOW() WHERE id=$1`,
-      [req.params.id]
+      [itemId]
     );
 
     // Push WMS available (physical - reserved) to Medusa — no Medusa reservation needed
-    const sku = medusa_sku || nw_code;
     const totalResult = await query(
       `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
       [sku]
     );
     const newTotal = Math.max(0, parseInt(totalResult.rows[0]?.qty ?? '0') - parseInt(totalResult.rows[0]?.reserved ?? '0'));
+    
+    logger.info(`Syncing ${sku} to Medusa (available qty: ${newTotal})`);
     const syncResult = await syncSkuToMedusa(sku, newTotal);
+    
     if (!syncResult.ok) {
-      console.error(`[receiving/stock] Medusa sync failed for ${sku}: ${syncResult.error}`);
+      logger.error(`Medusa sync failed for ${sku}: ${syncResult.error}`);
+    } else {
+      logger.info(`✓ Medusa sync successful: ${sku} now has ${newTotal} units available`);
     }
+    
     const unblocked = await unblockBackorderedPickLists([sku]);
+    if (unblocked && unblocked.length > 0) {
+      logger.info(`Unblocked ${unblocked.length} pick lists for ${sku}`);
+    }
 
-    res.json({ success: true, stocked: quantity, location_id, medusa_synced: syncResult.ok, new_total: newTotal, unblocked_pick_lists: unblocked });
+    res.json({ 
+      success: true, 
+      stocked: quantity, 
+      location_id, 
+      medusa_synced: syncResult.ok, 
+      new_total: newTotal, 
+      unblocked_pick_lists: unblocked 
+    });
   } catch (err) {
-    console.error(err);
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`Stock endpoint error: ${errMsg}`);
     res.status(500).json({ error: 'Failed to stock item' });
   }
 });
@@ -218,36 +242,52 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
     const syncedSkus = new Set<string>();
     const defaultLiability = await getDefaultLiabilityStatus();
 
+    logger.info(`Bulk-stocking ${assigned.rows.length} items from queue`);
+
     for (const item of assigned.rows) {
+      const sku = item.medusa_sku || item.nw_code;
       await query(`
         INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
         ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
         DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
-      `, [item.location_id, item.medusa_sku || item.nw_code, item.colour || '', item.quantity, defaultLiability]);
+      `, [item.location_id, sku, item.colour || '', item.quantity, defaultLiability]);
 
       await query(
         `UPDATE requires_location_queue SET status='STOCKED', stocked_at=NOW(), updated_at=NOW() WHERE id=$1`,
         [item.id]
       );
-      syncedSkus.add(item.medusa_sku || item.nw_code);
+      syncedSkus.add(sku);
       stocked++;
+      logger.info(`✓ Stocked ${item.quantity}x ${sku} at location ${item.location_id}`);
     }
 
     // Push updated totals for all affected SKUs to Medusa
     const syncErrors: string[] = [];
+    logger.info(`Syncing ${syncedSkus.size} unique SKUs to Medusa...`);
+    
     for (const sku of syncedSkus) {
       const totalResult = await query(`SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`, [sku]);
       const newTotal = Math.max(0, parseInt(totalResult.rows[0]?.qty ?? '0') - parseInt(totalResult.rows[0]?.reserved ?? '0'));
       const syncResult = await syncSkuToMedusa(sku, newTotal);
-      if (!syncResult.ok) syncErrors.push(`${sku}: ${syncResult.error}`);
+      if (!syncResult.ok) {
+        const errMsg = `${sku}: ${syncResult.error}`;
+        syncErrors.push(errMsg);
+        logger.error(`Medusa sync failed: ${errMsg}`);
+      } else {
+        logger.info(`✓ Medusa sync: ${sku} → ${newTotal} units`);
+      }
     }
-    if (syncErrors.length) console.error('[receiving/bulk-stock] Medusa sync errors:', syncErrors);
+    
     const unblocked = await unblockBackorderedPickLists([...syncedSkus]);
+    if (unblocked && unblocked.length > 0) {
+      logger.info(`Unblocked ${unblocked.length} pick lists`);
+    }
 
     res.json({ success: true, stocked, medusa_synced: syncedSkus.size - syncErrors.length, sync_errors: syncErrors.length, unblocked_pick_lists: unblocked });
   } catch (err) {
-    console.error(err);
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`Bulk-stock endpoint error: ${errMsg}`);
     res.status(500).json({ error: 'Failed to bulk stock' });
   }
 });
@@ -383,6 +423,106 @@ router.patch('/inventory/liability', authMiddleware, requirePermission('manage_s
     res.json({ success: true, updated_rows: result.rowCount ?? 0 });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update liability status' });
+  }
+});
+
+/**
+ * GET /api/receiving/audit/logs — query recent receiving & Medusa sync activities
+ * Query params:
+ *   - limit: max results (default 50, max 500)
+ *   - offset: pagination offset (default 0)
+ *   - status: filter by sync status (PENDING, SYNCED, FAILED, SKIPPED)
+ *   - sku: filter by product_sku (contains search)
+ *
+ * Returns both inventory_sync_log entries (Medusa pushes) and recent warehouse_inventory updates
+ */
+router.get('/audit/logs', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 500);
+    const offset = parseInt(req.query.offset as string) || 0;
+    const status = req.query.status as string;
+    const sku = req.query.sku as string;
+
+    let whereClause = '1=1';
+    const params: any[] = [];
+
+    if (status) {
+      whereClause += ` AND status = $${params.length + 1}`;
+      params.push(status);
+    }
+
+    if (sku) {
+      whereClause += ` AND product_sku ILIKE $${params.length + 1}`;
+      params.push(`%${sku}%`);
+    }
+
+    const result = await query(
+      `SELECT 
+        id,
+        product_sku,
+        medusa_variant_id,
+        medusa_product_id,
+        available_qty,
+        status,
+        error_message,
+        created_at,
+        updated_at
+       FROM inventory_sync_log
+       WHERE ${whereClause}
+       ORDER BY created_at DESC
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
+    );
+
+    const countResult = await query(
+      `SELECT COUNT(*) FROM inventory_sync_log WHERE ${whereClause}`,
+      params
+    );
+
+    res.json({
+      logs: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit,
+      offset,
+    });
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`Audit logs endpoint error: ${errMsg}`);
+    res.status(500).json({ error: 'Failed to fetch audit logs' });
+  }
+});
+
+/**
+ * GET /api/receiving/audit/summary — quick summary of recent activity
+ * Returns:
+ *   - total_received_today: sum of quantities received in last 24h
+ *   - synced_skus_count: unique SKUs synced to Medusa today
+ *   - failed_syncs_count: number of failed Medusa syncs
+ *   - avg_sync_time_seconds: average time between receive and sync (approximation)
+ */
+router.get('/audit/summary', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const summary = await query(
+      `SELECT
+        (SELECT COALESCE(SUM(quantity), 0) FROM warehouse_inventory WHERE updated_at > NOW() - INTERVAL '24 hours') as total_received_24h,
+        (SELECT COUNT(DISTINCT product_sku) FROM inventory_sync_log WHERE created_at > NOW() - INTERVAL '24 hours' AND status = 'SYNCED') as synced_skus_count,
+        (SELECT COUNT(*) FROM inventory_sync_log WHERE created_at > NOW() - INTERVAL '24 hours' AND status = 'FAILED') as failed_syncs_count,
+        (SELECT ROUND(EXTRACT(EPOCH FROM AVG(updated_at - created_at))) FROM inventory_sync_log WHERE created_at > NOW() - INTERVAL '24 hours' AND status = 'SYNCED') as avg_sync_time_seconds`
+    );
+
+    const { total_received_24h, synced_skus_count, failed_syncs_count, avg_sync_time_seconds } = summary.rows[0];
+
+    res.json({
+      period: 'last 24 hours',
+      total_received_qty: parseInt(total_received_24h) || 0,
+      synced_skus_count: parseInt(synced_skus_count) || 0,
+      failed_syncs_count: parseInt(failed_syncs_count) || 0,
+      avg_sync_time_seconds: parseInt(avg_sync_time_seconds) || null,
+    });
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`Audit summary endpoint error: ${errMsg}`);
+    res.status(500).json({ error: 'Failed to fetch audit summary' });
   }
 });
 
