@@ -41,9 +41,10 @@ router.post('/medusa', express.raw({ type: '*/*' }), async (req: Request, res: R
     }
 
     const payload = JSON.parse((req.body as Buffer).toString());
-    const { event, data } = payload;
+    const eventType = payload.type ?? payload.event; // support both 'type' (Medusa Cloud) and 'event' (legacy)
+    const { data } = payload;
 
-    switch (event) {
+    switch (eventType) {
       case 'order.placed':
         await handleOrderPlaced(data);
         break;
@@ -54,10 +55,10 @@ router.post('/medusa', express.raw({ type: '*/*' }), async (req: Request, res: R
         await handleOrderReturned(data);
         break;
       default:
-        console.log(`[webhooks] Unhandled event: ${event}`);
+        console.log(`[webhooks] Unhandled event: ${eventType}`);
     }
 
-    res.json({ received: true, event });
+    res.json({ received: true, event: eventType });
   } catch (err: any) {
     console.error('Webhook error:', err);
     res.status(500).json({ error: 'Webhook processing failed' });
