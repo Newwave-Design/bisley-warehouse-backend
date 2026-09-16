@@ -11,27 +11,17 @@ import { authMiddleware, requirePermission, AuthRequest } from '../../middleware
 const router = express.Router();
 
 const MEDUSA_URL = process.env.MEDUSA_API_BASE_URL || 'https://bisley-shop.medusajs.app';
-const MEDUSA_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || 'matt@ovara.co.uk';
-const MEDUSA_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
-if (!MEDUSA_PASSWORD) throw new Error('MEDUSA_ADMIN_PASSWORD env var is not set');
+const MEDUSA_API_KEY = process.env.MEDUSA_SECRET_API_KEY;
+if (!MEDUSA_API_KEY) throw new Error('MEDUSA_SECRET_API_KEY env var is not set');
 // Medusa has 2 stock locations (European Warehouse + an unused legacy "Ovara" location with
 // no sales channel). Every inventory lookup MUST filter to this one or quantities double-count.
 const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY792H831KT3TKH4CYPF7FT9';
 
-let _medusaToken: string | null = null;
-let _medusaTokenExpiry = 0;
-
-async function getMedusaToken(): Promise<string> {
-  if (_medusaToken && Date.now() < _medusaTokenExpiry) return _medusaToken;
-  const res = await fetch(`${MEDUSA_URL}/auth/user/emailpass`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: MEDUSA_EMAIL, password: MEDUSA_PASSWORD }),
-  });
-  const data = await res.json() as any;
-  if (!data.token) throw new Error('Medusa auth failed');
-  _medusaToken = data.token;
-  _medusaTokenExpiry = Date.now() + 50 * 60 * 1000;
-  return data.token;
+function getMedusaHeaders(): Record<string, string> {
+  return {
+    'Authorization': `Bearer ${MEDUSA_API_KEY}`,
+    'Content-Type': 'application/json',
+  };
 }
 
 // 10-minute in-memory cache for Medusa inventory (avoids 60s Medusa API round-trips)
@@ -42,13 +32,13 @@ async function fetchMedusaInventory(forceRefresh = false): Promise<Map<string, n
   if (!forceRefresh && _inventoryCache && Date.now() < _inventoryCacheExpiry) {
     return _inventoryCache;
   }
-  const token = await getMedusaToken();
+  const headers = getMedusaHeaders();
   const qtyMap = new Map<string, number>();
   let offset = 0;
   while (true) {
     const res = await fetch(
       `${MEDUSA_URL}/admin/inventory-items?limit=100&offset=${offset}&fields=id,sku,*location_levels`,
-      { headers: { Authorization: `Bearer ${token}` } }
+      { headers }
     );
     const data = await res.json() as any;
     for (const item of data.inventory_items ?? []) {
@@ -64,10 +54,10 @@ async function fetchMedusaInventory(forceRefresh = false): Promise<Map<string, n
 }
 
 async function getMedusaItemInfo(sku: string): Promise<{ itemId: string; locationId: string } | null> {
-  const token = await getMedusaToken();
+  const headers = getMedusaHeaders();
   const res = await fetch(
     `${MEDUSA_URL}/admin/inventory-items?sku=${encodeURIComponent(sku)}&fields=id,sku,*location_levels`,
-    { headers: { Authorization: `Bearer ${token}` } }
+    { headers }
   );
   const data = await res.json() as any;
   const item = data.inventory_items?.[0];

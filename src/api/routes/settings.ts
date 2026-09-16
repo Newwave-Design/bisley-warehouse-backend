@@ -388,7 +388,7 @@ router.post('/shipping-services/ups-sync', authMiddleware, requirePermission('sy
       `UPDATE shipping_services
        SET is_active = false,
            updated_at = NOW()
-       WHERE courier_code NOT IN ('ups', 'ait')`
+       WHERE courier_code NOT IN ('ups', 'ait', 'dhl')`
     );
 
     for (const profile of DEFAULT_PACKAGING_PROFILES) {
