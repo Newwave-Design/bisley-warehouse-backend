@@ -358,96 +358,142 @@ async function runSyncJob() {
   try {
     syncState.progress = 'Fetching from Medusa…';
     const allProducts = await fetchAllProductsFromMedusa(true);
+    const totalVariants = allProducts.reduce((s, p) => s + p.variant_count, 0);
 
-    syncState.progress = `Writing ${allProducts.reduce((s, p) => s + p.variant_count, 0)} variants to DB…`;
+    syncState.progress = `Writing ${totalVariants} variants to DB…`;
+
+    // Batch collect all variants for bulk insert (avoid 3k+ individual queries)
+    const variantRows: any[] = [];
+    const barcodeRows: any[] = [];
 
     for (const product of allProducts) {
       for (const v of product.variants) {
         if (!v.sku) { skipped++; continue; }
-        try {
-          const kitJson = JSON.stringify(v.kit_components);
-          const r = await query(`
-            INSERT INTO wms_products
-              (medusa_product_id, medusa_variant_id,
-               product_title, product_subtitle, product_handle, product_status, product_thumbnail,
-               product_description, product_material, gallery_images, metadata,
-               weight_grams, height_mm, width_mm, depth_mm,
-               variant_sku, variant_title, colour_code, colour_name, variant_thumbnail,
-               manage_inventory, allow_backorder, price_gbp, variant_barcode,
-               variant_weight_grams, variant_height_mm, variant_width_mm, variant_depth_mm,
-               is_kit, kit_components, inventory_qty, last_synced_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14,$15,
-                    $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30::jsonb,$31,NOW())
-            ON CONFLICT (medusa_variant_id) DO UPDATE SET
-              product_title       = EXCLUDED.product_title,
-              product_subtitle    = EXCLUDED.product_subtitle,
-              product_handle      = EXCLUDED.product_handle,
-              product_status      = EXCLUDED.product_status,
-              product_thumbnail   = EXCLUDED.product_thumbnail,
-              product_description = EXCLUDED.product_description,
-              product_material    = EXCLUDED.product_material,
-              gallery_images      = EXCLUDED.gallery_images,
-              metadata            = EXCLUDED.metadata,
-              weight_grams        = EXCLUDED.weight_grams,
-              height_mm           = EXCLUDED.height_mm,
-              width_mm            = EXCLUDED.width_mm,
-              depth_mm            = EXCLUDED.depth_mm,
-              variant_sku         = EXCLUDED.variant_sku,
-              variant_title       = EXCLUDED.variant_title,
-              colour_code         = EXCLUDED.colour_code,
-              colour_name         = EXCLUDED.colour_name,
-              variant_thumbnail   = EXCLUDED.variant_thumbnail,
-              manage_inventory    = EXCLUDED.manage_inventory,
-              allow_backorder     = EXCLUDED.allow_backorder,
-              price_gbp           = EXCLUDED.price_gbp,
-              variant_barcode     = EXCLUDED.variant_barcode,
-              variant_weight_grams = EXCLUDED.variant_weight_grams,
-              variant_height_mm   = EXCLUDED.variant_height_mm,
-              variant_width_mm    = EXCLUDED.variant_width_mm,
-              variant_depth_mm    = EXCLUDED.variant_depth_mm,
-              is_kit              = EXCLUDED.is_kit,
-              kit_components      = EXCLUDED.kit_components,
-              inventory_qty       = EXCLUDED.inventory_qty,
-              last_synced_at      = NOW(),
-              updated_at          = NOW()
-            RETURNING (xmax = 0) AS is_insert
-          `, [
-            product.id, v.id,
-            product.title, product.subtitle, product.handle, product.status, product.thumbnail,
-            product.description, product.material,
-            JSON.stringify(product.gallery_images), JSON.stringify(product.metadata),
-            product.weight_grams, product.height_mm, product.width_mm, product.depth_mm,
-            v.sku, v.title, v.colour_code, v.colour_name, v.thumbnail,
-            v.manage_inventory, v.allow_backorder, v.price_gbp, v.barcode,
-            v.weight_grams, v.height_mm, v.width_mm, v.depth_mm,
-            v.is_kit, kitJson, v.inventory_qty,
-          ]);
-          if (r.rows[0]?.is_insert) inserted++; else updated++;
+        variantRows.push({
+          product, v, kitJson: JSON.stringify(v.kit_components)
+        });
+        if (v.sku) barcodeRows.push({ product, v });
+      }
+    }
 
-          if (v.sku) {
-            await query(`
-              INSERT INTO barcode_mappings
-                (barcode, product_sku, colour_code, colour_name, product_name,
-                 thumbnail_url, medusa_product_id, medusa_variant_id)
-              VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-              ON CONFLICT (barcode) DO UPDATE SET
-                product_sku       = EXCLUDED.product_sku,
-                colour_code       = EXCLUDED.colour_code,
-                colour_name       = EXCLUDED.colour_name,
-                product_name      = EXCLUDED.product_name,
-                thumbnail_url     = EXCLUDED.thumbnail_url,
-                medusa_product_id = EXCLUDED.medusa_product_id,
-                medusa_variant_id = EXCLUDED.medusa_variant_id,
-                updated_at        = NOW()
-            `, [
-              v.sku, v.sku, v.colour_code, v.colour_name, product.title,
-              v.thumbnail ?? product.thumbnail, product.id, v.id,
-            ]);
-            barcodesSynced++;
-          }
-        } catch (err: any) {
-          errors.push(`${v.sku}: ${err.message?.slice(0, 80)}`);
+    // Bulk insert wms_products in batches of 200
+    const BATCH_SIZE = 200;
+    for (let i = 0; i < variantRows.length; i += BATCH_SIZE) {
+      const batch = variantRows.slice(i, i + BATCH_SIZE);
+      const params: any[] = [];
+      const valuePlaceholders: string[] = [];
+      let paramIdx = 1;
+
+      for (const row of batch) {
+        const { product, v, kitJson } = row;
+        valuePlaceholders.push(
+          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++}::jsonb,$${paramIdx++}::jsonb,$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++}::jsonb,$${paramIdx++},NOW())`
+        );
+        params.push(
+          product.id, v.id,
+          product.title, product.subtitle, product.handle, product.status, product.thumbnail,
+          product.description, product.material,
+          JSON.stringify(product.gallery_images), JSON.stringify(product.metadata),
+          product.weight_grams, product.height_mm, product.width_mm, product.depth_mm,
+          v.sku, v.title, v.colour_code, v.colour_name, v.thumbnail,
+          v.manage_inventory, v.allow_backorder, v.price_gbp, v.barcode,
+          v.weight_grams, v.height_mm, v.width_mm, v.depth_mm,
+          v.is_kit, kitJson, v.inventory_qty
+        );
+      }
+
+      try {
+        const r = await query(`
+          INSERT INTO wms_products
+            (medusa_product_id, medusa_variant_id,
+             product_title, product_subtitle, product_handle, product_status, product_thumbnail,
+             product_description, product_material, gallery_images, metadata,
+             weight_grams, height_mm, width_mm, depth_mm,
+             variant_sku, variant_title, colour_code, colour_name, variant_thumbnail,
+             manage_inventory, allow_backorder, price_gbp, variant_barcode,
+             variant_weight_grams, variant_height_mm, variant_width_mm, variant_depth_mm,
+             is_kit, kit_components, inventory_qty, last_synced_at)
+          VALUES ${valuePlaceholders.join(',')}
+          ON CONFLICT (medusa_variant_id) DO UPDATE SET
+            product_title       = EXCLUDED.product_title,
+            product_subtitle    = EXCLUDED.product_subtitle,
+            product_handle      = EXCLUDED.product_handle,
+            product_status      = EXCLUDED.product_status,
+            product_thumbnail   = EXCLUDED.product_thumbnail,
+            product_description = EXCLUDED.product_description,
+            product_material    = EXCLUDED.product_material,
+            gallery_images      = EXCLUDED.gallery_images,
+            metadata            = EXCLUDED.metadata,
+            weight_grams        = EXCLUDED.weight_grams,
+            height_mm           = EXCLUDED.height_mm,
+            width_mm            = EXCLUDED.width_mm,
+            depth_mm            = EXCLUDED.depth_mm,
+            variant_sku         = EXCLUDED.variant_sku,
+            variant_title       = EXCLUDED.variant_title,
+            colour_code         = EXCLUDED.colour_code,
+            colour_name         = EXCLUDED.colour_name,
+            variant_thumbnail   = EXCLUDED.variant_thumbnail,
+            manage_inventory    = EXCLUDED.manage_inventory,
+            allow_backorder     = EXCLUDED.allow_backorder,
+            price_gbp           = EXCLUDED.price_gbp,
+            variant_barcode     = EXCLUDED.variant_barcode,
+            variant_weight_grams = EXCLUDED.variant_weight_grams,
+            variant_height_mm   = EXCLUDED.variant_height_mm,
+            variant_width_mm    = EXCLUDED.variant_width_mm,
+            variant_depth_mm    = EXCLUDED.variant_depth_mm,
+            is_kit              = EXCLUDED.is_kit,
+            kit_components      = EXCLUDED.kit_components,
+            inventory_qty       = EXCLUDED.inventory_qty,
+            last_synced_at      = NOW(),
+            updated_at          = NOW()
+          RETURNING (xmax = 0) AS is_insert
+        `, params);
+        
+        for (const row of r.rows) {
+          if (row.is_insert) inserted++; else updated++;
         }
+      } catch (err: any) {
+        errors.push(`Batch ${Math.floor(i / BATCH_SIZE)}: ${err.message?.slice(0, 80)}`);
+      }
+
+      syncState.progress = `Writing ${totalVariants} variants to DB… (${Math.min(i + BATCH_SIZE, variantRows.length)} / ${variantRows.length})`;
+    }
+
+    // Bulk insert barcodes in batches of 200
+    for (let i = 0; i < barcodeRows.length; i += BATCH_SIZE) {
+      const batch = barcodeRows.slice(i, i + BATCH_SIZE);
+      const params: any[] = [];
+      const valuePlaceholders: string[] = [];
+      let paramIdx = 1;
+
+      for (const row of batch) {
+        const { product, v } = row;
+        valuePlaceholders.push(`($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`);
+        params.push(
+          v.sku, v.sku, v.colour_code, v.colour_name, product.title,
+          v.thumbnail ?? product.thumbnail, product.id, v.id
+        );
+      }
+
+      try {
+        await query(`
+          INSERT INTO barcode_mappings
+            (barcode, product_sku, colour_code, colour_name, product_name,
+             thumbnail_url, medusa_product_id, medusa_variant_id)
+          VALUES ${valuePlaceholders.join(',')}
+          ON CONFLICT (barcode) DO UPDATE SET
+            product_sku       = EXCLUDED.product_sku,
+            colour_code       = EXCLUDED.colour_code,
+            colour_name       = EXCLUDED.colour_name,
+            product_name      = EXCLUDED.product_name,
+            thumbnail_url     = EXCLUDED.thumbnail_url,
+            medusa_product_id = EXCLUDED.medusa_product_id,
+            medusa_variant_id = EXCLUDED.medusa_variant_id,
+            updated_at        = NOW()
+        `, params);
+        barcodesSynced += batch.length;
+      } catch (err: any) {
+        errors.push(`Barcodes batch ${Math.floor(i / BATCH_SIZE)}: ${err.message?.slice(0, 80)}`);
       }
     }
 
