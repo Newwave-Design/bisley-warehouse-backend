@@ -1090,4 +1090,93 @@ CREATE INDEX IF NOT EXISTS idx_query_actions_query_id ON query_actions(query_id)
 CREATE INDEX IF NOT EXISTS idx_query_actions_type ON query_actions(action_type);
 CREATE INDEX IF NOT EXISTS idx_query_actions_sync_status ON query_actions(medusa_sync_status);
 CREATE INDEX IF NOT EXISTS idx_query_actions_created_at ON query_actions(created_at DESC);
+
+-- ================================================================================
+-- DPD SHIPPING RATES (Pricing tables from official rate card)
+-- ================================================================================
+
+-- Rate zones
+CREATE TABLE IF NOT EXISTS dpd_rate_zones (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  zone_code VARCHAR(1) NOT NULL UNIQUE, -- A, B, C, D
+  zone_label VARCHAR(100) NOT NULL,
+  description TEXT,
+  zone_number INTEGER NOT NULL UNIQUE,
+  examples VARCHAR(500),
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Base rates by zone and service type (first parcel vs 2nd+, up to 25kg)
+CREATE TABLE IF NOT EXISTS dpd_base_rates (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  zone_code VARCHAR(1) NOT NULL REFERENCES dpd_rate_zones(zone_code),
+  service_type VARCHAR(50) NOT NULL, -- 'next_working_day' or 'second_subsequent'
+  max_weight_kg DECIMAL(8,2) NOT NULL DEFAULT 25.00,
+  base_cost_gbp DECIMAL(10,2) NOT NULL,
+  per_kg_over_max DECIMAL(10,2) NOT NULL,
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(zone_code, service_type, max_weight_kg)
+);
+
+-- Heavy weight surcharges (when item weight exceeds threshold)
+CREATE TABLE IF NOT EXISTS dpd_weight_surcharges (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  min_kg DECIMAL(8,2) NOT NULL,
+  max_kg DECIMAL(8,2) NOT NULL,
+  surcharge_gbp DECIMAL(10,2) NOT NULL,
+  description VARCHAR(100),
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(min_kg, max_kg)
+);
+
+-- Long length surcharges (when longest dimension exceeds thresholds)
+CREATE TABLE IF NOT EXISTS dpd_length_surcharges (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  min_cm DECIMAL(8,2) NOT NULL,
+  max_cm DECIMAL(8,2) NOT NULL,
+  surcharge_gbp DECIMAL(10,2) NOT NULL,
+  description VARCHAR(100),
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(min_cm, max_cm)
+);
+
+-- Additional services (Isle of Wight, Return to Sender, etc.)
+CREATE TABLE IF NOT EXISTS dpd_additional_services (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  service_code VARCHAR(50) NOT NULL UNIQUE,
+  service_name VARCHAR(255) NOT NULL,
+  charge_gbp DECIMAL(10,2) NOT NULL,
+  charge_type VARCHAR(50), -- 'per_shipment', 'per_item', 'per_kg', etc.
+  applicable_zones VARCHAR(10) DEFAULT 'A,B,C,D',
+  description TEXT,
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- DPD rate configuration and constants
+CREATE TABLE IF NOT EXISTS dpd_config (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  config_key VARCHAR(100) NOT NULL UNIQUE,
+  config_value VARCHAR(500) NOT NULL,
+  data_type VARCHAR(20), -- 'string', 'number', 'json'
+  description TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Indexes for performance
+CREATE INDEX IF NOT EXISTS idx_dpd_base_rates_zone ON dpd_base_rates(zone_code);
+CREATE INDEX IF NOT EXISTS idx_dpd_base_rates_service ON dpd_base_rates(service_type);
+CREATE INDEX IF NOT EXISTS idx_dpd_weight_surcharges_min_kg ON dpd_weight_surcharges(min_kg);
+CREATE INDEX IF NOT EXISTS idx_dpd_length_surcharges_min_cm ON dpd_length_surcharges(min_cm);
+CREATE INDEX IF NOT EXISTS idx_dpd_additional_services_active ON dpd_additional_services(is_active);
 `;

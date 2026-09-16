@@ -6,7 +6,7 @@ const { Client } = pg;
 
 export async function runMigrations() {
   const client = new Client({
-    connectionString: process.env.DATABASE_URL,
+    connectionString: process.env.WAREHOUSE_DATABASE_URL,
   });
 
   try {

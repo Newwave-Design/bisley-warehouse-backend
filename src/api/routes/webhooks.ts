@@ -129,26 +129,21 @@ async function handleOrderPlaced(order: any) {
          created_at, updated_at)
       VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8, NOW(), NOW())
     `, [pickListId, lineNumber++, sku, colourCode, item.quantity, medusaLineItemId, medusaVariantId, medusaProductId]);
+  }
 
-    // Reserve the quantity immediately across all locations holding this SKU
+  // Reserve the quantity immediately across all locations holding this SKU
+  // Note: Do NOT sync to Medusa here — Medusa stock is already down from the order.placed event
+  // (stock was deducted when the customer placed the order). We just reserve here in WMS.
+  for (const item of order.items ?? []) {
+    const sku = item.variant?.sku ?? item.variant_sku ?? item.sku;
+    if (!sku) continue;
+
     await query(
       `UPDATE warehouse_inventory
        SET quantity_reserved = quantity_reserved + $1, updated_at = NOW()
        WHERE product_sku = $2`,
       [item.quantity, sku]
     );
-  }
-
-  // Push WMS available (quantity - quantity_reserved) to Medusa stocked_quantity
-  // so Medusa's stock count drops immediately — no separate Medusa reservation needed
-  const affectedSkus = new Set<string>((order.items ?? []).map((i: any) => i.variant?.sku ?? i.variant_sku ?? i.sku).filter((s: unknown): s is string => typeof s === 'string'));
-  for (const sku of affectedSkus) {
-    const row = await query(
-      `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
-      [sku]
-    );
-    const available = Math.max(0, parseInt(row.rows[0]?.qty ?? '0') - parseInt(row.rows[0]?.reserved ?? '0'));
-    await syncSkuToMedusa(sku, available);
   }
 
   console.log(`✓ Pick list ${pickListNumber} created for order ${medusaOrderId} (${order.items?.length ?? 0} lines)`);
@@ -220,13 +215,14 @@ async function handleOrderCancelled(order: any) {
 }
 
 /**
- * handleOrderReturned — Receive returned items and add stock back
+ * handleOrderReturned — Optionally redeem returned items back to warehouse
  *
  * When a return is initiated for an order:
  *   1. Find the original pick list
- *   2. For each returned item, add quantity back to warehouse_inventory
- *   3. Create a return record for audit trail
- *   4. Sync available qty back to Medusa
+ *   2. If return.metadata.redeem_to_warehouse == true: add qty back to warehouse_inventory
+ *   3. Sync updated available qty to Medusa (only if redeemed)
+ * 
+ * If not redeemed, items are discarded (e.g., damaged, hygiene, etc.) and NOT added back.
  */
 async function handleOrderReturned(order: any) {
   const medusaOrderId = order.id;
@@ -242,11 +238,18 @@ async function handleOrderReturned(order: any) {
   const pickListId = plResult.rows[0].id;
 
   // Medusa return data format:
-  // order.returns is an array of return objects
+  // order.returns is an array of return objects, each with metadata.redeem_to_warehouse
   const returns = order.returns ?? [];
   const affectedSkus = new Set<string>();
 
   for (const ret of returns) {
+    // Only process if explicitly marked for warehouse redemption
+    const shouldRedeem = ret.metadata?.redeem_to_warehouse === true;
+    if (!shouldRedeem) {
+      console.log(`[webhooks] Return ${ret.id} not marked for warehouse redemption, skipping`);
+      continue;
+    }
+
     const returnItems = ret.items ?? [];
 
     for (const returnItem of returnItems) {
@@ -270,10 +273,11 @@ async function handleOrderReturned(order: any) {
       );
 
       affectedSkus.add(sku);
+      console.log(`✓ Redeemed ${qty}x ${sku} from return ${ret.id}`);
     }
   }
 
-  // Sync updated available quantities back to Medusa
+  // Sync updated available quantities to Medusa (only for redeemed SKUs)
   for (const sku of affectedSkus) {
     const row = await query(
       `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
@@ -282,6 +286,7 @@ async function handleOrderReturned(order: any) {
     const available = Math.max(0, parseInt(row.rows[0]?.qty ?? '0') - parseInt(row.rows[0]?.reserved ?? '0'));
     await syncSkuToMedusa(sku, available);
   }
+
 
   console.log(`✓ Return processed for order ${medusaOrderId} — ${affectedSkus.size} SKUs restocked`);
 }

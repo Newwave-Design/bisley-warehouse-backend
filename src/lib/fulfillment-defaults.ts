@@ -74,13 +74,13 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     metadata: {
       ready_for_api: false,
       category: 'parcel',
-      integration_type: 'weight_size_tiers',
+      integration_type: 'weight_tiers',
       zone: 'A',
       postcode_ranges: ['All UK Postcodes in England & Wales (except PO30–PO41, TR21–TR25)'],
       surcharge_areas: [{ name: 'Isle of Wight', codes: 'PO30–PO41', surcharge_gbp: 5.99 }, { name: 'Isle of Scilly', codes: 'TR21–TR25', surcharge_gbp: 5.99 }],
-      tiers: [
-        { name: 'Up to 25kg (NWD)', max_weight_kg: 25, service_level: 'next_working_day', cost_gbp: 5.75, per_kg_over: 0.29 },
-        { name: 'Up to 25kg (2nd+)', max_weight_kg: 25, service_level: 'standard', cost_gbp: 4.50, per_kg_over: 0.29 },
+      weight_tiers: [
+        { name: 'Up to 25kg (NWD)', max_weight_kg: 25, cost_gbp: 5.75 },
+        { name: 'Up to 25kg (2nd+)', max_weight_kg: 25, cost_gbp: 4.50 },
       ],
       timed_services: [
         { name: 'Next Working Day By Noon', surcharge_gbp: 5.71 },
@@ -140,12 +140,12 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     metadata: {
       ready_for_api: false,
       category: 'parcel',
-      integration_type: 'weight_size_tiers',
+      integration_type: 'weight_tiers',
       zone: 'B',
       postcode_ranges: ['DD', 'DG', 'EH', 'FK1–FK16', 'G', 'KA (exc KA27 & KA28)', 'KY', 'ML', 'TD'],
-      tiers: [
-        { name: 'Up to 25kg (NWD)', max_weight_kg: 25, service_level: 'next_working_day', cost_gbp: 5.75, per_kg_over: 0.29 },
-        { name: 'Up to 25kg (2nd+)', max_weight_kg: 25, service_level: 'standard', cost_gbp: 4.50, per_kg_over: 0.29 },
+      weight_tiers: [
+        { name: 'Up to 25kg (NWD)', max_weight_kg: 25, cost_gbp: 5.75 },
+        { name: 'Up to 25kg (2nd+)', max_weight_kg: 25, cost_gbp: 4.50 },
       ],
       timed_services: [
         { name: 'Next Working Day By Noon', surcharge_gbp: 5.71 },
@@ -205,12 +205,12 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     metadata: {
       ready_for_api: false,
       category: 'parcel',
-      integration_type: 'weight_size_tiers',
+      integration_type: 'weight_tiers',
       zone: 'C',
-      postcode_ranges: ['BT'],
-      tiers: [
-        { name: 'Up to 25kg (NWD)', max_weight_kg: 25, service_level: 'next_working_day', cost_gbp: 9.00, per_kg_over: 0.55 },
-        { name: 'Up to 25kg (2nd+)', max_weight_kg: 25, service_level: 'standard', cost_gbp: 7.00, per_kg_over: 0.55 },
+      postcode_ranges: ['BT (all Northern Ireland postcodes)'],
+      weight_tiers: [
+        { name: 'Up to 25kg (NWD)', max_weight_kg: 25, cost_gbp: 9.00 },
+        { name: 'Up to 25kg (2nd+)', max_weight_kg: 25, cost_gbp: 7.00 },
       ],
       timed_services: [
         { name: 'Next Working Day By Noon', surcharge_gbp: 5.71 },
@@ -270,12 +270,12 @@ export const DEFAULT_SHIPPING_SERVICES: ShippingService[] = [
     metadata: {
       ready_for_api: false,
       category: 'parcel',
-      integration_type: 'weight_size_tiers',
+      integration_type: 'weight_tiers',
       zone: 'D',
       postcode_ranges: ['AB31–AB38', 'AB41–AB56', 'FK17–FK21', 'HS', 'IV', 'KA27–KA28', 'KW', 'PA20–PA50', 'PA60–PA78', 'PA80', 'PH14–PH44', 'PH49–PH50', 'ZE1–ZE3', 'Isle of Man (IM1–IM9)', 'Guernsey (GY1–GY10)', 'Jersey (JE1–JE5)'],
-      tiers: [
-        { name: 'Up to 25kg (NWD)', max_weight_kg: 25, service_level: 'next_working_day', cost_gbp: 12.75, per_kg_over: 0.75 },
-        { name: 'Up to 25kg (2nd+)', max_weight_kg: 25, service_level: 'standard', cost_gbp: 10.75, per_kg_over: 0.75 },
+      weight_tiers: [
+        { name: 'Up to 25kg (NWD)', max_weight_kg: 25, cost_gbp: 12.75 },
+        { name: 'Up to 25kg (2nd+)', max_weight_kg: 25, cost_gbp: 10.75 },
       ],
       timed_services: [
         { name: 'Next Working Day By Noon', surcharge_gbp: 5.71 },

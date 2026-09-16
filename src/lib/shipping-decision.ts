@@ -50,45 +50,34 @@ export interface AitAssignment {
   estimated_cost_gbp: number | null;
 }
 
-/** A flat DHL rate band — a named parcel size (Small/Medium/...) with its own weight AND dimension caps. */
+/** A flat DHL rate band — weight-based only (no dimension tiers for DHL Parcel UK). */
 export interface DhlTier {
   name: string;
   max_weight_kg: number;
-  max_length_mm: number;
-  max_width_mm: number;
-  max_height_mm: number;
   cost_gbp: number;
 }
 
-/** Parses/validates the dhl_parcel service's metadata.tiers into a validated tier list. */
+/** Parses/validates the dhl_parcel service's metadata.weight_tiers into a validated tier list. */
 export function parseDhlTiers(metadata: unknown): DhlTier[] | null {
-  const raw = (metadata as { tiers?: unknown } | null | undefined)?.tiers;
+  const raw = (metadata as { weight_tiers?: unknown } | null | undefined)?.weight_tiers;
   if (!Array.isArray(raw) || !raw.length) return null;
   const tiers = raw
     .map((t) => ({
       name: String((t as any)?.name ?? ''),
       max_weight_kg: Number((t as any)?.max_weight_kg),
-      max_length_mm: Number((t as any)?.max_length_mm),
-      max_width_mm: Number((t as any)?.max_width_mm),
-      max_height_mm: Number((t as any)?.max_height_mm),
       cost_gbp: Number((t as any)?.cost_gbp),
     }))
     .filter((t) =>
       Number.isFinite(t.max_weight_kg) && t.max_weight_kg > 0 &&
-      Number.isFinite(t.max_length_mm) && t.max_length_mm > 0 &&
-      Number.isFinite(t.max_width_mm) && t.max_width_mm > 0 &&
-      Number.isFinite(t.max_height_mm) && t.max_height_mm > 0 &&
       Number.isFinite(t.cost_gbp) && t.cost_gbp >= 0
-    );
+    )
+    .sort((a, b) => a.max_weight_kg - b.max_weight_kg);
   return tiers.length ? tiers : null;
 }
 
-/** Finds the cheapest DHL tier whose weight AND (orientation-agnostic) size caps both fit the packed item. */
-function findFittingDhlTier(tiers: DhlTier[], weightKg: number, longestMm: number, middleMm: number, shortestMm: number): DhlTier | null {
-  const fitting = tiers.filter((t) => {
-    const tierDims = [t.max_length_mm, t.max_width_mm, t.max_height_mm].sort((a, b) => b - a);
-    return weightKg <= t.max_weight_kg && longestMm <= tierDims[0] && middleMm <= tierDims[1] && shortestMm <= tierDims[2];
-  });
+/** Finds the cheapest DHL tier whose weight cap fits the packed item. */
+function findFittingDhlTier(tiers: DhlTier[], weightKg: number): DhlTier | null {
+  const fitting = tiers.filter((t) => weightKg <= t.max_weight_kg);
   if (!fitting.length) return null;
   fitting.sort((a, b) => a.cost_gbp - b.cost_gbp);
   return fitting[0];
@@ -201,10 +190,9 @@ export async function decideShippingForPackedItem(input: ShippingDecisionInput):
     return { preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason, liveQuotes, liveQuoteError, liveQuoteConfigRequired, aitQuote, dhlQuote };
   }
 
-  // DHL is tried first for everything else — flat rate per weight+size band, no live API yet.
+  // DHL is tried first for everything else — flat rate per weight band, no dimensions needed.
   if (dhlServiceCode && dhlTiers && dhlTiers.length) {
-    const [longestMm, middleMm, shortestMm] = [lengthMm, widthMm, heightMm].sort((a, b) => b - a);
-    const tier = findFittingDhlTier(dhlTiers, weightGrams / 1000, longestMm, middleMm, shortestMm);
+    const tier = findFittingDhlTier(dhlTiers, weightGrams / 1000);
     if (tier) {
       dhlQuote = { service_code: dhlServiceCode, service_name: dhlServiceName ?? 'DHL', tier_name: tier.name, estimated_cost_gbp: tier.cost_gbp };
       preferredServiceCode = dhlServiceCode;

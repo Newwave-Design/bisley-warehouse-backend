@@ -470,12 +470,21 @@ function calculateDhlCostBreakdown(
   const weightKg = weightGrams / 1000;
   const surcharges: { name: string; amount_gbp: number }[] = [];
   
-  // 1. Find base rate tier (up to 25kg)
+  // 1. Find base rate tier (weight-only matching for DHL Parcel UK)
   const baseTier = dhlTiers.find(t => weightKg <= t.max_weight_kg);
-  const baseCost = baseTier ? baseTier.cost_gbp : dhlTiers[dhlTiers.length - 1]?.cost_gbp ?? 0;
+  if (!baseTier) {
+    return {
+      base_cost_gbp: 0,
+      surcharges: [],
+      total_cost_gbp: 0,
+      calculation_summary: `ERROR: Product weight ${weightKg.toFixed(2)}kg exceeds all configured DHL tiers`,
+    };
+  }
+  
+  const baseCost = baseTier.cost_gbp;
   
   // 2. Heavy weight surcharge (weight > 5kg)
-  if (weightKg > 5 && dhlSurcharges.heavy_weight_kg) {
+  if (weightKg > 5 && dhlSurcharges?.heavy_weight_kg && Array.isArray(dhlSurcharges.heavy_weight_kg)) {
     const heavyBand = (dhlSurcharges.heavy_weight_kg as any[]).find(
       b => weightKg >= b.min_kg && weightKg <= b.max_kg
     );
@@ -484,9 +493,9 @@ function calculateDhlCostBreakdown(
     }
   }
   
-  // 3. Long length surcharge (length > 100cm)
+  // 3. Long length surcharge (max dimension > 100cm)
   const maxDim = Math.max(lengthMm, widthMm, heightMm) / 10;
-  if (maxDim > 100 && dhlSurcharges.long_length_cm) {
+  if (maxDim > 100 && dhlSurcharges?.long_length_cm && Array.isArray(dhlSurcharges.long_length_cm)) {
     const lengthBand = (dhlSurcharges.long_length_cm as any[]).find(
       b => maxDim >= b.min_cm && maxDim <= b.max_cm
     );
@@ -710,9 +719,6 @@ async function runUpsAutoTagJob() {
         const packageWeightGrams = estimate?.package_weight_grams ?? 0;
         const hasCompletePackedDims = lengthMm > 0 && widthMm > 0 && heightMm > 0 && packageWeightGrams > 0;
 
-        // Courier eligibility and service choice come from a REAL live UPS Rating API quote for
-        // this exact packed size/weight — not a static constraint table. Whatever UPS actually
-        // accepts (or rejects) is the final word.
         let preferredServiceCode: string | null = null;
         let preferredCostAmount: number | null = null;
         let preferredCostCurrency: string | null = null;
@@ -723,20 +729,19 @@ async function runUpsAutoTagJob() {
         } else if (!hasCompletePackedDims) {
           manualReviewReason = 'Manual review required - no packaging profile could be resolved for this item\'s dimensions.';
         } else {
-          const decisionResult = await decideShippingForPackedItem({
-            lengthMm, widthMm, heightMm, weightGrams: packageWeightGrams,
-            priceGbp: asNumber(row.price_gbp),
-            isMultidesk: Boolean(row.is_kit),
-            upsServices: services,
-            dhlServiceCode, dhlServiceName, dhlTiers,
-            aitServiceCode, aitServiceName, aitWeightTiers, aitPercentageOfPrice,
-            upsConfigured: true,
-            getUpsQuotes: getCachedUpsRates,
-          });
-          preferredServiceCode = decisionResult.preferredServiceCode;
-          preferredCostAmount = decisionResult.preferredCostAmount;
-          preferredCostCurrency = decisionResult.preferredCostCurrency;
-          manualReviewReason = decisionResult.manualReviewReason;
+          // FORCE DHL assignment for all standard parcels (no UPS/AIT fallback in auto-tag)
+          const weightKg = packageWeightGrams / 1000;
+          const dhlTierForWeight = dhlTiers && dhlTiers.length ? dhlTiers.find(t => weightKg <= t.max_weight_kg) : null;
+          
+          if (dhlTierForWeight && dhlServiceCode) {
+            preferredServiceCode = dhlServiceCode;
+            preferredCostAmount = dhlTierForWeight.cost_gbp;
+            preferredCostCurrency = 'GBP';
+            // Will be updated with surcharge breakdown below when building pack_instructions
+          } else {
+            // Weight exceeds DHL limit (>25kg) — needs manual review
+            manualReviewReason = `Manual review required - product weight ${weightKg.toFixed(2)}kg exceeds DHL Parcel UK limit (25kg). Use AIT freight shipping or manual quote.`;
+          }
         }
 
         decision = { estimate, preferredServiceCode, preferredCostAmount, preferredCostCurrency, manualReviewReason };
@@ -748,20 +753,13 @@ async function runUpsAutoTagJob() {
       if (!preferredServiceCode) noEligible++;
       const needsManual = Boolean(manualReviewReason);
       if (needsManual) manualReview++;
-      // Checklist template follows the REAL assigned courier, not the packaging-profile-fit
-      // heuristic (which is just a physical box-size check and can flag a small item as "doesn't
-      // fit a standard carton" without it actually shipping via freight).
-      const checklistTemplateCode = preferredServiceCode === aitServiceCode ? 'PALLET-FREIGHT' : 'STD-PARCEL';
+      const checklistTemplateCode = 'STD-PARCEL';
 
-      // Build pack instructions with cost breakdown for DHL
-      let packInstructions = manualReviewReason ?? (preferredServiceCode === aitServiceCode
-        ? `Auto-tagged for AIT freight shipping - flat £${Number(preferredCostAmount).toFixed(2)}.`
-        : preferredServiceCode === dhlServiceCode
-          ? `Auto-tagged for DHL ${dhlZoneA?.zone || 'A'} - £${Number(preferredCostAmount).toFixed(2)} (calculated below).`
-          : 'Auto-tagged using a live UPS Rating API quote for packed dimensions (+140 mm).');
-
-      // If DHL, add surcharge breakdown
-      if (preferredServiceCode === dhlServiceCode && estimate?.packaged_dimensions) {
+      // Build pack instructions with DHL cost breakdown (including surcharges)
+      let packInstructions = manualReviewReason ?? '';
+      let finalCostGbp = preferredCostAmount ?? 0;
+      
+      if (preferredServiceCode === dhlServiceCode && estimate?.packaged_dimensions && !manualReviewReason && dhlTiers) {
         try {
           const breakdown = calculateDhlCostBreakdown(
             estimate.package_weight_grams,
@@ -777,9 +775,10 @@ async function runUpsAutoTagJob() {
               .map(s => `${s.name} £${s.amount_gbp.toFixed(2)}`)
               .join(', ');
           }
+          finalCostGbp = breakdown.total_cost_gbp;
         } catch (e) {
-          // Fallback to simple message if breakdown fails
-          packInstructions = `Auto-tagged for DHL ${dhlZoneA?.zone || 'A'} - £${Number(preferredCostAmount).toFixed(2)}.`;
+          // Fallback to base cost if breakdown fails
+          packInstructions = `DHL Zone ${dhlZoneA?.zone || 'A'}: Base rate £${Number(preferredCostAmount).toFixed(2)}`;
         }
       }
 
@@ -815,10 +814,10 @@ async function runUpsAutoTagJob() {
           checklistTemplateCode,
           preferredServiceCode,
           needsManual,
-          JSON.stringify(needsManual ? ['ups-manual-review'] : ['ups-auto-tagged']),
+          JSON.stringify(preferredServiceCode === dhlServiceCode ? ['dhl-zone-a'] : needsManual ? ['manual-review'] : ['auto-tagged']),
           packInstructions,
-          preferredCostAmount,
-          preferredCostCurrency,
+          finalCostGbp,
+          'GBP',
         ]
       );
 
