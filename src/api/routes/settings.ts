@@ -276,6 +276,74 @@ router.get('/product-fulfillment-map', authMiddleware, async (_req: AuthRequest,
   }
 });
 
+/** PUT /api/settings/product-fulfillment-map/:productSku — update estimated shipping cost for a product */
+router.put('/product-fulfillment-map/:productSku', authMiddleware, requirePermission('manage_settings'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { estimated_shipping_cost_gbp, estimated_shipping_currency } = req.body;
+    
+    if (estimated_shipping_cost_gbp === undefined || estimated_shipping_cost_gbp === null) {
+      return res.status(400).json({ error: 'estimated_shipping_cost_gbp is required' });
+    }
+    
+    const result = await query(
+      `UPDATE product_fulfillment_profiles
+       SET estimated_shipping_cost_gbp = $1,
+           estimated_shipping_currency = $2,
+           updated_at = NOW()
+       WHERE product_sku = $3
+       RETURNING *`,
+      [Number(estimated_shipping_cost_gbp), estimated_shipping_currency ?? 'GBP', req.params.productSku]
+    );
+    
+    if (!result.rows.length) {
+      return res.status(404).json({ error: 'Product not found in fulfillment profiles' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update product fulfillment cost' });
+  }
+});
+
+/** GET /api/settings/dhl-zones — DHL zone info with postcodes and region summary */
+router.get('/dhl-zones', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT service_code, service_name, metadata
+       FROM shipping_services
+       WHERE courier_code = 'dhl' AND is_active = true
+       ORDER BY metadata->>'zone' ASC`
+    );
+    
+    const zones = result.rows.map((row: any) => {
+      const metadata = row.metadata || {};
+      const zone = metadata.zone || '';
+      let region_summary = '';
+      
+      if (zone === 'A') region_summary = 'England & Wales (excluding Isle of Wight and Isles of Scilly)';
+      else if (zone === 'B') region_summary = 'Scotland Central (Lowlands & Central Belt)';
+      else if (zone === 'C') region_summary = 'Northern Ireland';
+      else if (zone === 'D') region_summary = 'Remote & Islands (Scotland Highlands, Islands, Crown Dependencies)';
+      
+      return {
+        zone,
+        service_code: row.service_code,
+        service_name: row.service_name,
+        region_summary,
+        postcode_ranges: metadata.postcode_ranges || [],
+        surcharge_areas: metadata.surcharge_areas || [],
+        base_rates: metadata.tiers ? metadata.tiers.slice(0, 2) : [], // NWD and Standard
+      };
+    });
+    
+    res.json({ zones });
+  } catch (err) {
+    if (isMissingRelationError(err)) return res.json({ zones: [] });
+    console.error(err);
+    res.status(500).json({ error: 'Failed to load DHL zones' });
+  }
+});
 
 router.post('/shipping-services/ups-sync', authMiddleware, requirePermission('system_admin'), async (_req: AuthRequest, res: Response) => {
   try {
