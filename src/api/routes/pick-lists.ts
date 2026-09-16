@@ -488,26 +488,90 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
     }
 
     // Raise (or top up) a pending reorder request per backordered SKU
+    // AND automatically create supplier orders (no manager approval needed)
     let reorderRequestsCreated = 0;
+    let supplierOrdersCreated = 0;
+    
     for (const { item, shortQty } of shortItems) {
+      const [stockRow, productRow] = await Promise.all([
+        query(`SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE product_sku = $1`, [item.product_sku]),
+        query(`SELECT product_title FROM wms_products WHERE variant_sku = $1`, [item.product_sku]),
+      ]);
+
+      // Check if pending_reorder already exists for this backorder
       const existing = await query(
-        `SELECT id FROM pending_reorders WHERE sku = $1 AND origin_pick_list_id = $2 AND status IN ('PENDING', 'DELAYED')`,
+        `SELECT id, supplier_order_id FROM pending_reorders WHERE sku = $1 AND origin_pick_list_id = $2 AND status IN ('PENDING', 'DELAYED')`,
         [item.product_sku, pickListId]
       );
+
+      let prId: string;
       if (existing.rows[0]) {
-        await query(`UPDATE pending_reorders SET qty_to_order = qty_to_order + $1, updated_at = NOW() WHERE id = $2`, [shortQty, existing.rows[0].id]);
-      } else {
-        const [stockRow, productRow] = await Promise.all([
-          query(`SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE product_sku = $1`, [item.product_sku]),
-          query(`SELECT product_title FROM wms_products WHERE variant_sku = $1`, [item.product_sku]),
-        ]);
+        // Update existing pending_reorder with additional qty
         await query(
+          `UPDATE pending_reorders SET qty_to_order = qty_to_order + $1, updated_at = NOW() WHERE id = $2`,
+          [shortQty, existing.rows[0].id]
+        );
+        prId = existing.rows[0].id;
+      } else {
+        // Create new pending_reorder
+        const prResult = await query(
           `INSERT INTO pending_reorders (sku, product_name, qty_to_order, current_stock, reorder_point, source, origin_pick_list_id)
-           VALUES ($1, $2, $3, $4, 0, 'BACKORDER', $5)`,
+           VALUES ($1, $2, $3, $4, 0, 'BACKORDER', $5)
+           RETURNING id`,
           [item.product_sku, productRow.rows[0]?.product_title ?? null, shortQty, stockRow.rows[0].qty, pickListId]
         );
+        prId = prResult.rows[0].id;
+        reorderRequestsCreated++;
       }
-      reorderRequestsCreated++;
+
+      // Create or find supplier order for this backorder
+      // Use a consistent order number per day to consolidate same-day backorders
+      const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      const orderNum = `ORD-BACKORDER-${today}`;
+      
+      let soResult = await query(`SELECT id FROM supplier_orders WHERE order_number = $1`, [orderNum]);
+      let soId: string;
+      
+      if (!soResult.rows[0]) {
+        // Create new supplier order for backorders
+        const newSo = await query(
+          `INSERT INTO supplier_orders (order_number, status, supplier, created_by, notes, created_at, updated_at)
+           VALUES ($1, 'PENDING', 'New Wave', 'system', 'Auto-created from backorder split', NOW(), NOW())
+           RETURNING id`,
+          [orderNum]
+        );
+        soId = newSo.rows[0].id;
+        supplierOrdersCreated++;
+      } else {
+        soId = soResult.rows[0].id;
+      }
+
+      // Add or update line item in supplier order
+      const existingLineItem = await query(
+        `SELECT id, quantity_ordered FROM supplier_order_items WHERE supplier_order_id = $1 AND product_sku = $2`,
+        [soId, item.product_sku]
+      );
+      
+      if (existingLineItem.rows[0]) {
+        // Update existing line item quantity
+        await query(
+          `UPDATE supplier_order_items SET quantity_ordered = quantity_ordered + $1, updated_at = NOW() WHERE id = $2`,
+          [shortQty, existingLineItem.rows[0].id]
+        );
+      } else {
+        // Create new line item
+        await query(
+          `INSERT INTO supplier_order_items (supplier_order_id, product_sku, quantity_ordered, status, created_at, updated_at)
+           VALUES ($1, $2, $3, 'PENDING', NOW(), NOW())`,
+          [soId, item.product_sku, shortQty]
+        );
+      }
+
+      // Link pending_reorder to supplier order
+      await query(
+        `UPDATE pending_reorders SET supplier_order_id = $1, updated_at = NOW() WHERE id = $2`,
+        [soId, prId]
+      );
     }
 
     return res.json({
@@ -516,6 +580,7 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
       child_pick_list_number: childPickListNumber,
       backordered_skus: shortItems.map(s => s.item.product_sku),
       reorder_requests_created: reorderRequestsCreated,
+      supplier_orders_created: supplierOrdersCreated,
     });
   } catch (error) {
     console.error('Split backorder error:', error);
