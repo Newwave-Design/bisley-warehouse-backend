@@ -496,8 +496,8 @@ function calculateDhlCostBreakdown(
   
   const baseCost = baseTier.cost_gbp;
   
-  // 2. Heavy weight surcharge (weight > 5kg)
-  if (weightKg > 5 && dhlSurcharges?.heavy_weight_kg && Array.isArray(dhlSurcharges.heavy_weight_kg)) {
+  // 2. Heavy weight surcharge (weight > 25kg, applied from 25.01kg onwards)
+  if (weightKg > 25 && dhlSurcharges?.heavy_weight_kg && Array.isArray(dhlSurcharges.heavy_weight_kg)) {
     const heavyBand = (dhlSurcharges.heavy_weight_kg as any[]).find(
       b => weightKg >= b.min_kg && weightKg <= b.max_kg
     );
