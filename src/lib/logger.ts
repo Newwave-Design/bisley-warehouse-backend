@@ -5,7 +5,8 @@ export type ErrorSource =
   | 'GENERO_SUBMIT' | 'GENERO_POLL'
   | 'MEDUSA_SYNC' | 'WEBHOOK'
   | 'MOBILE' | 'INVENTORY_SYNC'
-  | 'REORDER_CHECK' | 'DISCREPANCY_CHECK' | 'SYSTEM';
+  | 'REORDER_CHECK' | 'DISCREPANCY_CHECK' | 'SYSTEM'
+  | 'SHIPPING_SYNC' | 'AUTO_TAG';
 
 export type ErrorSeverity = 'ERROR' | 'WARNING' | 'INFO';
 

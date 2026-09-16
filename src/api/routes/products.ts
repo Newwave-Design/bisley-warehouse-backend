@@ -13,6 +13,7 @@ import { getMedusaToken, MEDUSA_URL } from '../../lib/medusa-client.js';
 import { query } from '../../db/index.js';
 import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
+import { logError, logWarning } from '../../lib/logger.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured, type UpsRateQuote } from '../../lib/ups.js';
 import { decideShippingForPackedItem, parseAitWeightTiers, parseDhlTiers, type AitAssignment, type AitWeightTier, type DhlAssignment, type DhlTier } from '../../lib/shipping-decision.js';
 
@@ -459,7 +460,9 @@ async function runSyncJob() {
           if (row.is_insert) inserted++; else updated++;
         }
       } catch (err: any) {
-        errors.push(`Batch ${Math.floor(i / BATCH_SIZE)}: ${err.message?.slice(0, 80)}`);
+        const msg = `Batch ${Math.floor(i / BATCH_SIZE)}: ${err.message?.slice(0, 80)}`;
+        errors.push(msg);
+        await logError('MEDUSA_SYNC', msg, { batch_index: Math.floor(i / BATCH_SIZE), batch_size: batch.length });
       }
 
       syncState.progress = `Writing ${totalVariants} variants to DB… (${Math.min(i + BATCH_SIZE, variantRows.length)} / ${variantRows.length})`;
@@ -499,7 +502,9 @@ async function runSyncJob() {
         `, params);
         barcodesSynced += batch.length;
       } catch (err: any) {
-        errors.push(`Barcodes batch ${Math.floor(i / BATCH_SIZE)}: ${err.message?.slice(0, 80)}`);
+        const msg = `Barcodes batch ${Math.floor(i / BATCH_SIZE)}: ${err.message?.slice(0, 80)}`;
+        errors.push(msg);
+        await logError('MEDUSA_SYNC', msg, { batch_index: Math.floor(i / BATCH_SIZE), batch_size: batch.length });
       }
     }
 
@@ -533,10 +538,14 @@ async function runSyncJob() {
       }
     };
     syncState.error = null;
+    if (errors.length > 0) {
+      await logWarning('MEDUSA_SYNC', `Product sync completed with ${errors.length} batch error(s)`, { inserted, updated, skipped, errors: errors.slice(0, 20) });
+    }
   } catch (err: any) {
     console.error('Sync job error:', err);
     syncState.error = err.message;
     syncState.result = { inserted, updated, errors, error_count: errors.length };
+    await logError('MEDUSA_SYNC', `Product sync job failed: ${err.message}`, { inserted, updated, errors: errors.slice(0, 20) }, 'ERROR', err.stack);
   } finally {
     syncState.running = false;
     syncState.finished_at = new Date();

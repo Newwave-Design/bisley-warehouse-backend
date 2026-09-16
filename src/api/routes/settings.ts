@@ -10,6 +10,7 @@ import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelatio
 import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured } from '../../lib/ups.js';
 import { decideShippingForPackedItem, parseAitWeightTiers, parseDhlTiers, type DhlTier } from '../../lib/shipping-decision.js';
+import { logError, logWarning } from '../../lib/logger.js';
 
 const router = express.Router();
 
@@ -446,8 +447,9 @@ router.post('/shipping-services/ups-sync', authMiddleware, requirePermission('sy
       upserted_services: upserted,
       active_ups_services: servicesAfter.rows,
     });
-  } catch (err) {
+  } catch (err: any) {
     console.error(err);
+    await logError('SHIPPING_SYNC', `Shipping services sync failed: ${err.message}`, undefined, 'ERROR', err.stack);
     res.status(500).json({ error: 'Failed to sync UPS services' });
   }
 });
@@ -478,14 +480,17 @@ function calculateDhlCostBreakdown(
   let lengthBracket: string | undefined;
   
   // 1. Find base rate tier (weight-only matching for DHL Parcel UK)
-  const baseTier = dhlTiers.find(t => weightKg <= t.max_weight_kg);
+  // Weight tiers only cover up to 25kg — anything heavier still uses the highest
+  // tier as its base cost, with the excess weight covered by the surcharge bands below.
+  const baseTier = dhlTiers.find(t => weightKg <= t.max_weight_kg)
+    ?? dhlTiers.reduce((max, t) => (!max || t.max_weight_kg > max.max_weight_kg ? t : max), null as any);
   if (!baseTier) {
     return {
       base_cost_gbp: 0,
       weight_surcharge_gbp: 0,
       length_surcharge_gbp: 0,
       total_cost_gbp: 0,
-      calculation_summary: `ERROR: Product weight ${weightKg.toFixed(2)}kg exceeds all configured DHL tiers`,
+      calculation_summary: `ERROR: No DHL weight tiers configured`,
     };
   }
   
@@ -739,19 +744,24 @@ async function runUpsAutoTagJob() {
         } else if (!estimate || !estimate.packaged_dimensions) {
           manualReviewReason = 'Manual review required - no packaging profile could be resolved for this item\'s dimensions.';
         } else {
-          // FORCE DHL assignment for all standard parcels (no UPS/AIT fallback in auto-tag)
+          // FORCE DHL assignment for all standard parcels (no UPS/AIT fallback in auto-tag).
+          // Weight tiers only cover the base rate up to 25kg — anything heavier still gets DHL,
+          // with the excess covered by the heavy-weight/long-length surcharge bands (up to 500kg/deep lengths).
           const packageWeightGrams = estimate?.package_weight_grams ?? 0;
           const weightKg = packageWeightGrams / 1000;
-          const dhlTierForWeight = dhlTiers && dhlTiers.length ? dhlTiers.find(t => weightKg <= t.max_weight_kg) : null;
-          
+          const dhlTierForWeight = dhlTiers && dhlTiers.length
+            ? (dhlTiers.find(t => weightKg <= t.max_weight_kg)
+                ?? dhlTiers.reduce((max, t) => (!max || t.max_weight_kg > max.max_weight_kg ? t : max), null as any))
+            : null;
+
           if (dhlTierForWeight && dhlServiceCode) {
             preferredServiceCode = dhlServiceCode;
             preferredCostAmount = dhlTierForWeight.cost_gbp;
             preferredCostCurrency = 'GBP';
             // Will be updated with surcharge breakdown below when building pack_instructions
           } else {
-            // Weight exceeds DHL limit (>25kg) — needs manual review
-            manualReviewReason = `Manual review required - product weight ${weightKg.toFixed(2)}kg exceeds DHL Parcel UK limit (25kg). Use AIT freight shipping or manual quote.`;
+            // No DHL weight tiers configured at all — genuinely needs manual review
+            manualReviewReason = 'Manual review required - no DHL weight tiers are configured for this service.';
           }
         }
 
@@ -855,9 +865,15 @@ async function runUpsAutoTagJob() {
       sample: sample.rows,
     };
     autoTagState.error = null;
+    if (manualReview > 0 || noEligible > 0) {
+      await logWarning('AUTO_TAG', `DHL auto-tag completed with ${manualReview} manual-review and ${noEligible} no-eligible-service SKU(s)`, {
+        tagged, manual_review_count: manualReview, no_eligible_count: noEligible, missing_dimension_count: missingDims,
+      });
+    }
   } catch (err: any) {
     console.error('UPS auto-tag job error:', err);
     autoTagState.error = err.message || 'Failed to auto-tag products with UPS options';
+    await logError('AUTO_TAG', `DHL auto-tag job failed: ${autoTagState.error}`, undefined, 'ERROR', err.stack);
   } finally {
     autoTagState.running = false;
     autoTagState.finished_at = new Date();
