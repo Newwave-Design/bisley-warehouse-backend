@@ -23,6 +23,7 @@ import { authMiddleware, requirePermission, AuthRequest } from '../../middleware
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { getLogger } from '../../lib/logger.js';
+import { getProductDetails } from '../../lib/inventory-sync-service.js';
 
 const router = express.Router();
 const logger = getLogger('receiving');
@@ -181,7 +182,11 @@ router.post('/queue/:id/stock', authMiddleware, async (req: AuthRequest, res: Re
     const sku = medusa_sku || nw_code;
     const defaultLiability = await getDefaultLiabilityStatus();
 
-    logger.info(`Receiving ${quantity}x ${sku} (colour: ${colour || 'default'}) into location ${location_id}`);
+    // Fetch product details for richer logging
+    const productDetails = await getProductDetails(sku);
+    const productDisplay = productDetails ? `${productDetails.name} (${productDetails.dimensions || 'unknown dims'})` : sku;
+
+    logger.info(`Receiving ${quantity}x ${productDisplay}, colour: ${colour || 'default'}, location: ${location_id}`);
 
     // Upsert into warehouse_inventory
     await query(`
@@ -191,7 +196,7 @@ router.post('/queue/:id/stock', authMiddleware, async (req: AuthRequest, res: Re
       DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
     `, [location_id, sku, colour || '', quantity, defaultLiability]);
 
-    logger.info(`✓ Inserted ${quantity}x ${sku} into warehouse_inventory at location ${location_id}`);
+    logger.info(`✓ Stocked: ${quantity}x ${productDisplay}`);
 
     await query(
       `UPDATE requires_location_queue SET status='STOCKED', stocked_at=NOW(), updated_at=NOW() WHERE id=$1`,
@@ -205,13 +210,13 @@ router.post('/queue/:id/stock', authMiddleware, async (req: AuthRequest, res: Re
     );
     const newTotal = Math.max(0, parseInt(totalResult.rows[0]?.qty ?? '0') - parseInt(totalResult.rows[0]?.reserved ?? '0'));
     
-    logger.info(`Syncing ${sku} to Medusa (available qty: ${newTotal})`);
+    logger.info(`Pushing to Medusa: ${productDisplay} → ${newTotal} units available`);
     const syncResult = await syncSkuToMedusa(sku, newTotal);
     
     if (!syncResult.ok) {
-      logger.error(`Medusa sync failed for ${sku}: ${syncResult.error}`);
+      logger.error(`❌ Medusa sync failed: ${syncResult.error}`);
     } else {
-      logger.info(`✓ Medusa sync successful: ${sku} now has ${newTotal} units available`);
+      logger.info(`✅ Medusa synced: ${productDisplay} now at ${newTotal} units`);
     }
     
     const unblocked = await unblockBackorderedPickLists([sku]);
@@ -242,10 +247,13 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
     const syncedSkus = new Set<string>();
     const defaultLiability = await getDefaultLiabilityStatus();
 
-    logger.info(`Bulk-stocking ${assigned.rows.length} items from queue`);
+    logger.info(`Bulk-stocking ${assigned.rows.length} items...`);
 
     for (const item of assigned.rows) {
       const sku = item.medusa_sku || item.nw_code;
+      const productDetails = await getProductDetails(sku);
+      const productDisplay = productDetails ? `${productDetails.name} (${productDetails.dimensions || 'n/a'})` : sku;
+
       await query(`
         INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
@@ -259,7 +267,7 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
       );
       syncedSkus.add(sku);
       stocked++;
-      logger.info(`✓ Stocked ${item.quantity}x ${sku} at location ${item.location_id}`);
+      logger.info(`  ✓ ${item.quantity}x ${productDisplay}`);
     }
 
     // Push updated totals for all affected SKUs to Medusa
@@ -434,7 +442,7 @@ router.patch('/inventory/liability', authMiddleware, requirePermission('manage_s
  *   - status: filter by sync status (PENDING, SYNCED, FAILED, SKIPPED)
  *   - sku: filter by product_sku (contains search)
  *
- * Returns both inventory_sync_log entries (Medusa pushes) and recent warehouse_inventory updates
+ * Returns inventory_sync_log entries with product name, dimensions, and Medusa sync details
  */
 router.get('/audit/logs', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
@@ -460,6 +468,8 @@ router.get('/audit/logs', authMiddleware, async (req: AuthRequest, res: Response
       `SELECT 
         id,
         product_sku,
+        product_name,
+        product_dimensions,
         medusa_variant_id,
         medusa_product_id,
         available_qty,

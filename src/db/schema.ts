@@ -142,16 +142,21 @@ CREATE TABLE IF NOT EXISTS inventory_sync_log (
   product_sku VARCHAR(100) NOT NULL,
   medusa_variant_id VARCHAR(100),
   medusa_product_id VARCHAR(100),
+  product_name VARCHAR(255),                    -- Human-readable product name for audit trail
+  product_dimensions VARCHAR(100),              -- Format: WxDxH in mm (e.g., '1050x600x25')
   available_qty INTEGER NOT NULL DEFAULT 0,
   stocked_qty_before INTEGER,
   stocked_qty_after INTEGER,
-  status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'SYNCED', 'FAILED')),
+  status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'SYNCED', 'FAILED', 'SKIPPED')),
   error_message TEXT,
   retry_count INTEGER NOT NULL DEFAULT 0,
   last_retry_at TIMESTAMP,
   created_at TIMESTAMP NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+-- Add product_name and product_dimensions columns to existing installations (safe to re-run)
+ALTER TABLE inventory_sync_log ADD COLUMN IF NOT EXISTS product_name VARCHAR(255);
+ALTER TABLE inventory_sync_log ADD COLUMN IF NOT EXISTS product_dimensions VARCHAR(100);
 
 CREATE INDEX IF NOT EXISTS idx_inventory_sync_log_status ON inventory_sync_log(status);
 CREATE INDEX IF NOT EXISTS idx_inventory_sync_log_created ON inventory_sync_log(created_at DESC);
