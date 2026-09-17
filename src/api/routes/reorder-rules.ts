@@ -39,16 +39,50 @@ router.get('/', authMiddleware, requirePermission('manage_reorder_rules'), async
         CASE 
           WHEN rr.benchmark_quantity > 0 THEN ROUND(rr.benchmark_quantity * 0.6)
           ELSE rr.reorder_point
-        END as calculated_trigger_point
+        END as calculated_trigger_point,
+        COALESCE(SUM(pli.quantity) FILTER (WHERE pl.status = 'COMPLETED' 
+          AND pl.completed_at >= NOW() - INTERVAL '60 days'), 0)::int AS sales_60d
       FROM reorder_rules rr
       LEFT JOIN warehouse_inventory wi ON wi.product_sku = rr.sku
       LEFT JOIN pending_reorders pr ON pr.reorder_rule_id = rr.id
       LEFT JOIN wms_products wp ON wp.variant_sku = rr.sku
+      LEFT JOIN pick_list_items pli ON pli.product_sku = rr.sku
+      LEFT JOIN pick_lists pl ON pl.id = pli.pick_list_id
       WHERE COALESCE(wp.product_status, 'draft') = 'published'
       GROUP BY rr.id, wp.product_status
       ORDER BY rr.family, rr.sku
     `);
-    res.json({ rules: r.rows, total: r.rows.length });
+    
+    // Add recommendations based on sales velocity
+    const items = r.rows.map((row: any) => {
+      const sales_60d = row.sales_60d || 0;
+      const benchmark = row.benchmark_quantity || 0;
+      const monthly_avg = Math.round(sales_60d / 2);
+      
+      let recommendation = 'No sales data';
+      let recommendation_class = 'text-gray-400';
+      
+      if (sales_60d > 0 && benchmark > 0) {
+        const ratio = sales_60d / benchmark;
+        if (ratio > 1.5) {
+          recommendation = `INCREASE benchmark (${Math.round(ratio * 100)}% of current)`;
+          recommendation_class = 'text-red-600';
+        } else if (ratio < 0.5) {
+          recommendation = `DECREASE benchmark (${Math.round(ratio * 100)}% of current)`;
+          recommendation_class = 'text-yellow-600';
+        } else {
+          recommendation = 'Benchmark aligned ✓';
+          recommendation_class = 'text-green-600';
+        }
+      } else if (benchmark === 0) {
+        recommendation = 'Benchmark not set';
+        recommendation_class = 'text-gray-400';
+      }
+      
+      return { ...row, monthly_avg, recommendation, recommendation_class };
+    });
+    
+    res.json({ rules: items, total: items.length });
   } catch (err) { res.status(500).json({ error: 'Failed to load rules' }); }
 });
 

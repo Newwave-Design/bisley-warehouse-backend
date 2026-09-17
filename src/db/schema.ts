@@ -332,6 +332,10 @@ ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS parent_pick_list_id UUID REFEREN
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS medusa_fulfillment_id VARCHAR(100);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS tracking_number VARCHAR(100);
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS tracking_url VARCHAR(500);
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS carrier VARCHAR(50);
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS synced_to_medusa_at TIMESTAMP;
 CREATE INDEX IF NOT EXISTS idx_pick_lists_parent ON pick_lists(parent_pick_list_id);
 CREATE INDEX IF NOT EXISTS idx_pick_lists_archived ON pick_lists(is_archived);
 

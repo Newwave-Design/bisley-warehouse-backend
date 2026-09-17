@@ -1427,6 +1427,111 @@ router.delete('/:pickListId', authMiddleware, requirePermission('manage_operatio
 });
 
 /**
+ * PATCH /api/pick-lists/:pickListId/dispatch
+ * Mark pick list as shipped with tracking info, deduct stock, and notify Medusa
+ *
+ * Input: {
+ *   tracking_number: "1Z999AA10123456784",
+ *   carrier: "DHL",
+ *   tracking_url?: "https://tracking.dhl.com/..."
+ * }
+ *
+ * Flow:
+ *   1. Update pick_lists table with tracking info and set status=DISPATCHED
+ *   2. For each item, deduct quantity_available and release quantity_reserved
+ *   3. POST to Medusa fulfillment API with tracking (if fulfillment ID exists)
+ *   4. Set synced_to_medusa_at timestamp
+ *
+ * Response: { success: true, pick_list, medusa_sync }
+ */
+router.patch('/:pickListId/dispatch', authMiddleware, requirePermission('manage_operations'), async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    const { tracking_number, carrier, tracking_url } = req.body;
+
+    if (!tracking_number || !carrier) {
+      return res.status(400).json({ error: 'tracking_number and carrier are required' });
+    }
+
+    // Get pick list and all items
+    const plResult = await query(
+      `SELECT id, medusa_order_id, medusa_fulfillment_id, status FROM pick_lists WHERE id = $1`,
+      [pickListId]
+    );
+
+    if (!plResult.rows[0]) {
+      return res.status(404).json({ error: 'Pick list not found' });
+    }
+
+    const pickList = plResult.rows[0];
+
+    // Get all items in this pick list
+    const itemsResult = await query(
+      `SELECT id, product_sku, quantity_required FROM pick_list_items WHERE pick_list_id = $1`,
+      [pickListId]
+    );
+
+    // Update pick list with tracking info
+    const updatedPL = await query(
+      `UPDATE pick_lists
+       SET tracking_number = $1, carrier = $2, tracking_url = $3, 
+           dispatched_at = NOW(), status = 'DISPATCHED', updated_at = NOW()
+       WHERE id = $4
+       RETURNING *`,
+      [tracking_number, carrier, tracking_url || null, pickListId]
+    );
+
+    // Deduct stock for each item (quantity_available down, quantity_reserved down)
+    for (const item of itemsResult.rows) {
+      await query(
+        `UPDATE warehouse_inventory
+         SET quantity_available = quantity_available - $1,
+             quantity_reserved = quantity_reserved - $1,
+             updated_at = NOW()
+         WHERE product_sku = $2 AND quantity_reserved >= $1`,
+        [item.quantity_required, item.product_sku]
+      );
+    }
+
+    let medusaSync = { success: false, message: 'No Medusa fulfillment ID found' };
+
+    // If we have a fulfillment ID and Medusa auth is available, sync tracking to Medusa
+    if (pickList.medusa_fulfillment_id) {
+      try {
+        const { medusaPost } = await import('../../lib/medusa-client.js');
+        medusaSync = await medusaPost(
+          `/admin/fulfillments/${pickList.medusa_fulfillment_id}`,
+          {
+            tracking_numbers: [tracking_number],
+            no_notification: false, // let Medusa send the email
+          }
+        );
+
+        // Mark as synced
+        await query(
+          `UPDATE pick_lists SET synced_to_medusa_at = NOW() WHERE id = $1`,
+          [pickListId]
+        );
+      } catch (medusaErr) {
+        console.error(`Failed to sync to Medusa fulfillment ${pickList.medusa_fulfillment_id}:`, medusaErr);
+        medusaSync = { error: medusaErr instanceof Error ? medusaErr.message : String(medusaErr) };
+      }
+    }
+
+    console.log(`✓ Dispatched pick list ${pickListId} with tracking ${tracking_number} (${carrier})`);
+    res.json({
+      success: true,
+      pick_list: updatedPL.rows[0],
+      medusa_sync: medusaSync,
+      message: `Pick list dispatched with tracking ${tracking_number}`,
+    });
+  } catch (error) {
+    console.error('Dispatch error:', error);
+    res.status(500).json({ error: 'Failed to dispatch pick list' });
+  }
+});
+
+/**
  * POST /api/pick-lists/:pickListId/sync-to-medusa
  *
  * Create a fulfillment in Medusa for this pick list.
