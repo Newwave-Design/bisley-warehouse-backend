@@ -1,10 +1,18 @@
 /**
  * Reorder Rules & Pending Reorders API
+ * 
+ * SIMPLIFIED MODEL: 
+ * - Benchmark Quantity: 2-month stock quantity (set on init from order, editable)
+ * - Trigger Point: Automatically 60% of benchmark (read-only, derived)
+ * - Order Quantity: Automatically = benchmark (read-only, derived)
+ * - Lead Time: Fixed 8 weeks (2 months for replenishment)
+ * 
+ * Logic: When current_stock < (benchmark * 0.60) → Create pending reorder for (benchmark qty)
  *
  * GET  /api/reorder-rules              — list all rules
- * POST /api/reorder-rules/init         — generate rules from an order (order_qty/2 = monthly demand)
- * PUT  /api/reorder-rules/:id          — update a rule
- * POST /api/reorder-rules/check        — run check: compare WMS stock vs reorder points
+ * POST /api/reorder-rules/init         — generate rules from an order (benchmark = order qty)
+ * PUT  /api/reorder-rules/:id          — update benchmark_quantity and/or is_active
+ * POST /api/reorder-rules/check        — run check: compare WMS stock vs 60% of benchmark
  *
  * GET  /api/pending-reorders           — list pending/delayed reorders
  * POST /api/pending-reorders/:id/approve — approve → creates/appends to a DRAFT supplier order
