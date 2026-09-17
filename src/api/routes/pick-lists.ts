@@ -52,7 +52,7 @@ const UNFULFILLED_STATUSES = ['PENDING', 'IN_PROGRESS', 'PICKED', 'PACKING', 'PA
  */
 router.get('/', authMiddleware, async (req: Request, res: Response) => {
   try {
-    const { status = 'PENDING,IN_PROGRESS', limit = '50', offset = '0', search, sku, sort } = req.query;
+    const { status = 'UNFULFILLED', limit = '50', offset = '0', search, sku, sort } = req.query;
 
     const statusParam = (status as string).toUpperCase();
     const statuses = statusParam === 'ALL' ? null
