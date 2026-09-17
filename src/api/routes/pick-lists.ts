@@ -40,6 +40,53 @@ router.post('/sandbox/reset', authMiddleware, async (req: Request, res: Response
 const UNFULFILLED_STATUSES = ['PENDING', 'IN_PROGRESS', 'PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED', 'AWAITING_STOCK'];
 
 /**
+ * Helper: Calculate stock availability for a pick list
+ * Returns { total_required, total_available, items_with_shortage, progress_percent }
+ */
+async function getPickListStockStatus(pickListId: string) {
+  const itemsResult = await query(
+    `SELECT product_sku, quantity_required, quantity_picked FROM pick_list_items WHERE pick_list_id = $1`,
+    [pickListId]
+  );
+  const items = itemsResult.rows;
+  
+  let totalRequired = 0;
+  let totalAvailable = 0;
+  const itemsWithShortage = [];
+  
+  for (const item of items) {
+    const remaining = item.quantity_required - item.quantity_picked;
+    totalRequired += remaining;
+    
+    const stockRow = await query(
+      `SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE product_sku = $1`,
+      [item.product_sku]
+    );
+    const available = Math.min(remaining, stockRow.rows[0].qty);
+    totalAvailable += available;
+    
+    if (available < remaining) {
+      itemsWithShortage.push({
+        sku: item.product_sku,
+        required: remaining,
+        available,
+        short: remaining - available,
+      });
+    }
+  }
+  
+  const progressPercent = totalRequired > 0 ? Math.round((totalAvailable / totalRequired) * 100) : 100;
+  
+  return {
+    total_required: totalRequired,
+    total_available: totalAvailable,
+    items_with_shortage: itemsWithShortage,
+    progress_percent: progressPercent,
+    is_fully_available: itemsWithShortage.length === 0,
+  };
+}
+
+/**
  * GET /api/pick-lists
  * List all active pick lists (with status filtering, customer/order search, and SKU lookup)
  *
@@ -112,8 +159,16 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
       countParams
     );
 
+    // Enrich each pick list with stock status
+    const enrichedPickLists = await Promise.all(
+      result.rows.map(async (pl: any) => ({
+        ...pl,
+        stock_status: await getPickListStockStatus(pl.id),
+      }))
+    );
+
     return res.json({
-      pickLists: result.rows,
+      pickLists: enrichedPickLists,
       total: countResult.rows[0]?.total ?? result.rows.length,
       limit: parseInt(limit as string),
       offset: parseInt(offset as string),
@@ -390,8 +445,11 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
       query(`SELECT id, pick_list_number, status FROM pick_lists WHERE parent_pick_list_id = $1`, [pickListId]),
     ]);
 
+    const stockStatus = await getPickListStockStatus(pickListId);
+
     return res.json({
       pickList,
+      stock_status: stockStatus,
       items: itemsResult.rows,
       packages: packagesResult.rows,
       parentPickList: parentResult.rows[0] ?? null,
@@ -586,6 +644,143 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
   } catch (error) {
     console.error('Split backorder error:', error);
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to split backorder' });
+  }
+});
+
+/**
+ * POST /api/pick-lists/:pickListId/split-for-picking
+ *
+ * Split the pick list into available and unavailable items:
+ * - Available items → new PENDING pick list (can be picked immediately)
+ * - Unavailable items → new list (derived as awaiting-stock based on inventory check)
+ *
+ * This is a DYNAMIC split — no hardcoded AWAITING_STOCK status, just calculated state.
+ */
+router.post('/:pickListId/split-for-picking', authMiddleware, requirePermission('manage_operations'), async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+
+    const header = await query(`SELECT * FROM pick_lists WHERE id = $1`, [pickListId]);
+    if (!header.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+    const pl = header.rows[0];
+
+    if (!['PENDING', 'IN_PROGRESS'].includes(pl.status)) {
+      return res.status(400).json({ error: `Cannot split a pick list with status ${pl.status}` });
+    }
+
+    const itemsResult = await query(
+      `SELECT * FROM pick_list_items WHERE pick_list_id = $1 ORDER BY line_number`,
+      [pickListId]
+    );
+    const items = itemsResult.rows;
+
+    const availableItems: any[] = [];
+    const unavailableItems: any[] = [];
+
+    // Check stock for each item
+    for (const item of items) {
+      const remaining = item.quantity_required - item.quantity_picked;
+      const stockRow = await query(
+        `SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE product_sku = $1`,
+        [item.product_sku]
+      );
+      const available = stockRow.rows[0].qty;
+
+      if (available >= remaining) {
+        availableItems.push(item);
+      } else {
+        unavailableItems.push(item);
+      }
+    }
+
+    if (unavailableItems.length === 0) {
+      return res.status(400).json({
+        error: 'All items have sufficient stock — nothing to split',
+        message: 'Use normal picking workflow',
+      });
+    }
+
+    if (availableItems.length === 0) {
+      return res.status(400).json({
+        error: 'No items have sufficient stock — cannot split',
+        short_items: unavailableItems.map(i => ({
+          sku: i.product_sku,
+          required: i.quantity_required - i.quantity_picked,
+        })),
+      });
+    }
+
+    // Create "ready to pick" pick list with available items
+    const suffix = Date.now().toString(36).slice(-4).toUpperCase();
+    const readyPickListNumber = `${pl.pick_list_number}-R`; // -R for "Ready"
+    const readyChild = await query(
+      `INSERT INTO pick_lists (
+         medusa_order_id, pick_list_number, status, parent_pick_list_id,
+         customer_name, customer_email, shipping_method_name, shipping_method_code, shipping_address,
+         is_sandbox, notes, created_at, updated_at
+       )
+       VALUES ($1, $2, 'PENDING', $3, $4, $5, $6, $7, $8::jsonb, $9, $10, NOW(), NOW())
+       RETURNING id`,
+      [
+        pl.medusa_order_id,
+        readyPickListNumber,
+        pickListId,
+        pl.customer_name,
+        pl.customer_email,
+        pl.shipping_method_name,
+        pl.shipping_method_code,
+        JSON.stringify(pl.shipping_address || {}),
+        pl.is_sandbox,
+        `Split from ${pl.pick_list_number} — ready to pick`,
+      ]
+    );
+    const readyChildId = readyChild.rows[0].id;
+
+    // Add available items to ready list
+    let readyLineNumber = 1;
+    for (const item of availableItems) {
+      await query(
+        `INSERT INTO pick_list_items (pick_list_id, line_number, product_sku, colour_code, quantity_required, quantity_picked, status, is_sandbox, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', $7, NOW(), NOW())`,
+        [readyChildId, readyLineNumber++, item.product_sku, item.colour_code, item.quantity_required, item.quantity_picked, pl.is_sandbox]
+      );
+    }
+
+    // Remove available items from source list
+    for (const item of availableItems) {
+      await query(`DELETE FROM pick_list_items WHERE id = $1`, [item.id]);
+    }
+
+    // If source list is now empty, mark it complete; otherwise it stays as the "awaiting" list
+    const remainingCount = await query(
+      `SELECT COUNT(*) as c FROM pick_list_items WHERE pick_list_id = $1`,
+      [pickListId]
+    );
+
+    if (remainingCount.rows[0].c === 0) {
+      // All items could be picked, original list is now empty - remove it or mark as completed
+      await query(`DELETE FROM pick_lists WHERE id = $1`, [pickListId]);
+    }
+
+    return res.json({
+      success: true,
+      ready_pick_list_number: readyPickListNumber,
+      ready_pick_list_id: readyChildId,
+      available_items_count: availableItems.length,
+      unavailable_items_count: unavailableItems.length,
+      unavailable_items: unavailableItems.map(i => {
+        const remaining = i.quantity_required - i.quantity_picked;
+        return {
+          sku: i.product_sku,
+          required: remaining,
+          colour_code: i.colour_code,
+        };
+      }),
+      message: `Split complete: ${availableItems.length} items ready to pick, ${unavailableItems.length} awaiting stock`,
+    });
+  } catch (error) {
+    console.error('Split for picking error:', error);
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to split for picking' });
   }
 });
 
