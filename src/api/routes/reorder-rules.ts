@@ -26,18 +26,28 @@ router.get('/', authMiddleware, requirePermission('manage_reorder_rules'), async
     const r = await query(`
       SELECT rr.*,
         COALESCE(SUM(wi.quantity), 0)::int AS current_stock,
-        COUNT(pr.id) FILTER (WHERE pr.status = 'PENDING')::int AS pending_count
+        COUNT(pr.id) FILTER (WHERE pr.status = 'PENDING')::int AS pending_count,
+        wp.product_status,
+        CASE 
+          WHEN rr.benchmark_quantity > 0 THEN ROUND(rr.benchmark_quantity * 0.6)
+          ELSE rr.reorder_point
+        END as calculated_trigger_point
       FROM reorder_rules rr
       LEFT JOIN warehouse_inventory wi ON wi.product_sku = rr.sku
       LEFT JOIN pending_reorders pr ON pr.reorder_rule_id = rr.id
-      GROUP BY rr.id
+      LEFT JOIN wms_products wp ON wp.variant_sku = rr.sku
+      WHERE COALESCE(wp.product_status, 'draft') = 'published'
+      GROUP BY rr.id, wp.product_status
       ORDER BY rr.family, rr.sku
     `);
     res.json({ rules: r.rows, total: r.rows.length });
   } catch (err) { res.status(500).json({ error: 'Failed to load rules' }); }
 });
 
-/** POST /api/reorder-rules/init — generate rules from an order's line items */
+/** POST /api/reorder-rules/init — generate rules from an order's line items 
+ * Sets benchmark_quantity = order line quantity (2-month stock baseline)
+ * Derives trigger point (60% of benchmark) and order quantity (= benchmark)
+ */
 router.post('/init', authMiddleware, requirePermission('manage_reorder_rules'), async (req: AuthRequest, res: Response) => {
   try {
     const { order_id, months_of_stock = 2 } = req.body;
@@ -52,29 +62,36 @@ router.post('/init', authMiddleware, requirePermission('manage_reorder_rules'), 
 
     let created = 0, updated = 0;
     for (const line of lines.rows) {
-      const monthlyDemand = line.quantity_ordered / months_of_stock;
-      const reorderPoint = Math.max(1, Math.round(monthlyDemand));
-      // ROQ = 2 months worth, minimum of 2
-      const reorderQty = Math.max(2, Math.round(monthlyDemand * months_of_stock));
+      // benchmark = total 2-month quantity from order
+      const benchmark = line.quantity_ordered;
+      // trigger point = 60% of benchmark
+      const triggerPoint = Math.round(benchmark * 0.6);
+      // order quantity = benchmark (replenish back to 2-month level)
+      const orderQty = benchmark;
 
       const existing = await query('SELECT id FROM reorder_rules WHERE sku=$1', [line.sku]);
       if (existing.rows[0]) {
         await query(`
-          UPDATE reorder_rules SET reorder_point=$1, reorder_qty=$2, monthly_demand=$3,
-            product_name=$4, family=$5, updated_at=NOW()
+          UPDATE reorder_rules SET 
+            benchmark_quantity=$1, 
+            reorder_point=$2, 
+            reorder_qty=$3,
+            product_name=$4, 
+            family=$5, 
+            updated_at=NOW()
           WHERE sku=$6
-        `, [reorderPoint, reorderQty, monthlyDemand, line.product_name, line.family, line.sku]);
+        `, [benchmark, triggerPoint, orderQty, line.product_name, line.family, line.sku]);
         updated++;
       } else {
         await query(`
-          INSERT INTO reorder_rules (sku, product_name, family, reorder_point, reorder_qty, monthly_demand, lead_time_weeks)
+          INSERT INTO reorder_rules (sku, product_name, family, benchmark_quantity, reorder_point, reorder_qty, lead_time_weeks)
           VALUES ($1,$2,$3,$4,$5,$6,8)
-        `, [line.sku, line.product_name, line.family, reorderPoint, reorderQty, monthlyDemand]);
+        `, [line.sku, line.product_name, line.family, benchmark, triggerPoint, orderQty]);
         created++;
       }
     }
 
-    res.json({ created, updated, total: lines.rows.length, months_of_stock });
+    res.json({ created, updated, total: lines.rows.length, months_of_stock, note: 'Benchmark set to order quantity. Trigger point = 60% of benchmark. Order quantity = benchmark.' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -82,17 +99,35 @@ router.post('/init', authMiddleware, requirePermission('manage_reorder_rules'), 
 
 router.put('/:id', authMiddleware, requirePermission('manage_reorder_rules'), async (req: AuthRequest, res: Response) => {
   try {
-    const { reorder_point, reorder_qty, lead_time_weeks, is_active, notes } = req.body;
-    const r = await query(`
+    const { benchmark_quantity, is_active, notes } = req.body;
+    
+    // If benchmark_quantity is provided, recalculate trigger point and order qty
+    let updateQuery = `
       UPDATE reorder_rules SET
-        reorder_point = COALESCE($1, reorder_point),
-        reorder_qty   = COALESCE($2, reorder_qty),
-        lead_time_weeks = COALESCE($3, lead_time_weeks),
-        is_active     = COALESCE($4, is_active),
-        notes         = COALESCE($5, notes),
+        is_active     = COALESCE($1, is_active),
+        notes         = COALESCE($2, notes),
         updated_at    = NOW()
-      WHERE id=$6 RETURNING *
-    `, [reorder_point, reorder_qty, lead_time_weeks, is_active, notes, req.params.id]);
+    `;
+    const params: any[] = [is_active, notes];
+    
+    if (benchmark_quantity !== undefined && benchmark_quantity > 0) {
+      const triggerPoint = Math.round(benchmark_quantity * 0.6);
+      updateQuery = `
+        UPDATE reorder_rules SET
+          benchmark_quantity = $1,
+          reorder_point = $2,
+          reorder_qty = $3,
+          is_active = COALESCE($4, is_active),
+          notes = COALESCE($5, notes),
+          updated_at = NOW()
+      `;
+      params.unshift(benchmark_quantity, triggerPoint, benchmark_quantity);
+    }
+    
+    updateQuery += ` WHERE id=$${params.length + 1} RETURNING *`;
+    params.push(req.params.id);
+    
+    const r = await query(updateQuery, params);
     if (!r.rows[0]) return res.status(404).json({ error: 'Rule not found' });
     res.json(r.rows[0]);
   } catch (err) { res.status(500).json({ error: 'Update failed' }); }
@@ -109,15 +144,21 @@ router.post('/check', authMiddleware, requirePermission('manage_reorder_rules'),
 });
 
 export async function runReorderCheck(): Promise<string[]> {
-  // Get all active rules with current stock
+  // Get all active rules with current stock — only published products
+  // Trigger when: current_stock < (benchmark * 0.60)
   const rules = await query(`
-    SELECT rr.id, rr.sku, rr.product_name, rr.reorder_point, rr.reorder_qty,
-           COALESCE(SUM(wi.quantity), 0)::int AS current_stock
+    SELECT rr.id, rr.sku, rr.product_name, rr.benchmark_quantity,
+           COALESCE(SUM(wi.quantity), 0)::int AS current_stock,
+           wp.product_status,
+           ROUND(rr.benchmark_quantity * 0.6)::int as trigger_point
     FROM reorder_rules rr
     LEFT JOIN warehouse_inventory wi ON wi.product_sku = rr.sku
+    LEFT JOIN wms_products wp ON wp.variant_sku = rr.sku
     WHERE rr.is_active = true
-    GROUP BY rr.id
-    HAVING COALESCE(SUM(wi.quantity), 0) <= rr.reorder_point
+      AND rr.benchmark_quantity > 0
+      AND COALESCE(wp.product_status, 'draft') = 'published'
+    GROUP BY rr.id, wp.product_status
+    HAVING COALESCE(SUM(wi.quantity), 0) < ROUND(rr.benchmark_quantity * 0.6)
   `);
 
   const triggered: string[] = [];
@@ -136,10 +177,11 @@ export async function runReorderCheck(): Promise<string[]> {
     );
     if (delayed.rows.length > 0) continue;
 
+    // Order quantity = benchmark_quantity (replenish back to 2-month stock level)
     await query(`
       INSERT INTO pending_reorders (reorder_rule_id, sku, product_name, qty_to_order, current_stock, reorder_point)
       VALUES ($1,$2,$3,$4,$5,$6)
-    `, [rule.id, rule.sku, rule.product_name, rule.reorder_qty, rule.current_stock, rule.reorder_point]);
+    `, [rule.id, rule.sku, rule.product_name, rule.benchmark_quantity, rule.current_stock, rule.trigger_point]);
 
     await query(`UPDATE reorder_rules SET last_triggered_at=NOW() WHERE id=$1`, [rule.id]);
     triggered.push(rule.sku);

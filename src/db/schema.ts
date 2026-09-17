@@ -893,16 +893,24 @@ CREATE TABLE IF NOT EXISTS reorder_rules (
   sku VARCHAR(100) NOT NULL UNIQUE,
   product_name VARCHAR(255),
   family VARCHAR(100),
+  -- Benchmark: 2-month stock quantity set on first initialization or manually edited
+  benchmark_quantity INTEGER NOT NULL DEFAULT 0,
+  -- Derived from benchmark: reorder when current_stock < (benchmark * 0.60)
+  -- Kept for backwards compatibility / audit, not user-edited
   reorder_point INTEGER NOT NULL DEFAULT 1,
+  -- Derived from benchmark: order quantity = benchmark
   reorder_qty INTEGER NOT NULL DEFAULT 2,
-  lead_time_weeks INTEGER NOT NULL DEFAULT 8,
+  -- Deprecated: kept for audit trail only
   monthly_demand DECIMAL(8,2),
+  lead_time_weeks INTEGER NOT NULL DEFAULT 8,
   is_active BOOLEAN DEFAULT true,
   notes TEXT,
   last_triggered_at TIMESTAMP,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
+-- Add benchmark_quantity to existing installations (idempotent)
+ALTER TABLE reorder_rules ADD COLUMN IF NOT EXISTS benchmark_quantity INTEGER NOT NULL DEFAULT 0;
 
 -- ================================================================================
 -- PENDING REORDERS (Triggered suggestions awaiting approval)
