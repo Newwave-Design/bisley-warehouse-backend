@@ -330,7 +330,10 @@ ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS packing_notes TEXT;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_sandbox BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS parent_pick_list_id UUID REFERENCES pick_lists(id) ON DELETE SET NULL;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS medusa_fulfillment_id VARCHAR(100);
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
 CREATE INDEX IF NOT EXISTS idx_pick_lists_parent ON pick_lists(parent_pick_list_id);
+CREATE INDEX IF NOT EXISTS idx_pick_lists_archived ON pick_lists(is_archived);
 
 -- ================================================================================
 -- PICK LIST ITEMS (Individual line items in a pick list)
@@ -361,6 +364,9 @@ ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS unit_cost_gbp DECIMAL(10,2)
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS medusa_order_line_item_id VARCHAR(100);
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS medusa_variant_id VARCHAR(100);
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS medusa_product_id VARCHAR(100);
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
+CREATE INDEX IF NOT EXISTS idx_pick_list_items_archived ON pick_list_items(is_archived);
 
 -- ================================================================================
 -- PICK SCANS (Individual scan history — supports partial-quantity picking,

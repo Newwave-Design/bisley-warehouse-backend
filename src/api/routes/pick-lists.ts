@@ -88,10 +88,11 @@ async function getPickListStockStatus(pickListId: string) {
 
 /**
  * GET /api/pick-lists
- * List all active pick lists (with status filtering, customer/order search, and SKU lookup)
+ * List all pick lists (with status filtering, customer/order search, and SKU lookup)
  *
  * Query params:
  *   status=PENDING,IN_PROGRESS   comma list, or ALL, or UNFULFILLED (everything but DISPATCHED/CANCELLED)
+ *   is_archived=true|false       filter by archive status (default false = show active lists only)
  *   search=smith                 matches customer name/email, pick list number or Medusa order id
  *   sku=H2910NL-av1              only pick lists containing this SKU (also returns per-line qty for it)
  *   sort=asc|desc                default asc (oldest-first picking queue); Customer Orders view uses desc
@@ -99,7 +100,7 @@ async function getPickListStockStatus(pickListId: string) {
  */
 router.get('/', authMiddleware, async (req: Request, res: Response) => {
   try {
-    const { status = 'UNFULFILLED', limit = '50', offset = '0', search, sku, sort } = req.query;
+    const { status = 'UNFULFILLED', is_archived = 'false', limit = '50', offset = '0', search, sku, sort } = req.query;
 
     const statusParam = (status as string).toUpperCase();
     const statuses = statusParam === 'ALL' ? null
@@ -114,6 +115,16 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
       params.push(statuses);
       conditions.push(`pl.status = ANY($${params.length}::text[])`);
     }
+    
+    // Filter by archive status (default: show active/non-archived lists)
+    const isArchiveQuery = (is_archived as string).toLowerCase();
+    if (isArchiveQuery === 'true') {
+      conditions.push(`pl.is_archived = true`);
+    } else if (isArchiveQuery === 'false') {
+      conditions.push(`pl.is_archived = false`);
+    }
+    // If is_archived='all', don't filter by archive status at all
+    
     if (search) {
       params.push(`%${(search as string).trim()}%`);
       conditions.push(`(pl.customer_name ILIKE $${params.length} OR pl.customer_email ILIKE $${params.length} OR pl.pick_list_number ILIKE $${params.length} OR pl.medusa_order_id ILIKE $${params.length})`);
@@ -141,6 +152,8 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.customer_email,
          pl.shipping_method_name,
          pl.dispatched_at,
+         pl.is_archived,
+         pl.archived_at,
          COUNT(pli.id) as item_count,
          SUM(CASE WHEN pli.status = 'PICKED' THEN 1 ELSE 0 END) as items_picked
          ${skuParamIndex > 0 ? `, MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_required END) as sku_quantity_required
@@ -1262,20 +1275,154 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: Request, res: 
   }
 });
 
-/** DELETE /api/pick-lists/:pickListId — cancel a pending or in-progress pick list */
+/**
+ * POST /api/pick-lists/:pickListId/archive
+ * Archive a pick list and all its items (soft delete — data retained forever)
+ * 
+ * Sets is_archived=true, archived_at=NOW() on pick list and all items
+ * Pick list becomes hidden from active views but remains in database
+ * 
+ * Response: { success: true, archived_pick_list_id, archived_item_count }
+ */
+router.post('/:pickListId/archive', authMiddleware, requirePermission('manage_operations'), async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    
+    // Get pick list
+    const existing = await query(
+      `SELECT id, is_archived FROM pick_lists WHERE id = $1`,
+      [pickListId]
+    );
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+    
+    const pickList = existing.rows[0];
+    if (pickList.is_archived) {
+      return res.status(400).json({ error: 'Pick list is already archived' });
+    }
+    
+    // Archive the pick list
+    await query(
+      `UPDATE pick_lists
+       SET is_archived = true, archived_at = NOW(), updated_at = NOW()
+       WHERE id = $1`,
+      [pickListId]
+    );
+    
+    // Archive all related items (cascade)
+    const itemsResult = await query(
+      `UPDATE pick_list_items
+       SET is_archived = true, archived_at = NOW(), updated_at = NOW()
+       WHERE pick_list_id = $1
+       RETURNING id`,
+      [pickListId]
+    );
+    
+    console.log(`✓ Archived pick list ${pickListId} with ${itemsResult.rows.length} items`);
+    res.json({
+      success: true,
+      archived_pick_list_id: pickListId,
+      archived_item_count: itemsResult.rows.length,
+    });
+  } catch (error) {
+    console.error('Archive error:', error);
+    res.status(500).json({ error: 'Failed to archive pick list' });
+  }
+});
+
+/**
+ * POST /api/pick-lists/:pickListId/restore
+ * Restore an archived pick list and all its items back to PENDING status
+ * 
+ * Sets is_archived=false, archived_at=NULL, status=PENDING on pick list and items
+ * Items retain their existing quantity_picked values
+ * 
+ * Response: { success: true, restored_pick_list_id, restored_item_count }
+ */
+router.post('/:pickListId/restore', authMiddleware, requirePermission('manage_operations'), async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    
+    // Get archived pick list
+    const existing = await query(
+      `SELECT id, is_archived FROM pick_lists WHERE id = $1`,
+      [pickListId]
+    );
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+    
+    const pickList = existing.rows[0];
+    if (!pickList.is_archived) {
+      return res.status(400).json({ error: 'Pick list is not archived' });
+    }
+    
+    // Restore the pick list
+    await query(
+      `UPDATE pick_lists
+       SET is_archived = false, archived_at = NULL, status = 'PENDING', updated_at = NOW()
+       WHERE id = $1`,
+      [pickListId]
+    );
+    
+    // Restore all related items to PENDING (cascade)
+    const itemsResult = await query(
+      `UPDATE pick_list_items
+       SET is_archived = false, archived_at = NULL, status = 'PENDING', updated_at = NOW()
+       WHERE pick_list_id = $1
+       RETURNING id`,
+      [pickListId]
+    );
+    
+    console.log(`✓ Restored pick list ${pickListId} with ${itemsResult.rows.length} items`);
+    res.json({
+      success: true,
+      restored_pick_list_id: pickListId,
+      restored_item_count: itemsResult.rows.length,
+    });
+  } catch (error) {
+    console.error('Restore error:', error);
+    res.status(500).json({ error: 'Failed to restore pick list' });
+  }
+});
+
+/**
+ * DELETE /api/pick-lists/:pickListId
+ * Permanently delete a pick list (admin only, requires confirm=PERMANENT_DELETE parameter)
+ * 
+ * Warning: This is irreversible and removes all data including archived history
+ * Use POST /archive for soft delete (recommended)
+ * 
+ * Query params:
+ *   confirm=PERMANENT_DELETE  required to proceed
+ * 
+ * Response: { success: true, message: "Pick list permanently deleted" }
+ */
 router.delete('/:pickListId', authMiddleware, requirePermission('manage_operations'), async (req: Request, res: Response) => {
   try {
     const { pickListId } = req.params;
-    const existing = await query(`SELECT status FROM pick_lists WHERE id = $1`, [pickListId]);
+    const { confirm } = req.query;
+    
+    // Require explicit confirmation parameter
+    if (confirm !== 'PERMANENT_DELETE') {
+      return res.status(400).json({
+        error: 'Permanent deletion requires ?confirm=PERMANENT_DELETE parameter',
+        hint: 'Use POST /archive for soft delete (recommended) or provide confirm parameter for permanent deletion',
+      });
+    }
+    
+    const existing = await query(
+      `SELECT id FROM pick_lists WHERE id = $1`,
+      [pickListId]
+    );
     if (!existing.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
     
-    // Permanently delete the pick list and cascade delete all associated items
-    await query(`DELETE FROM pick_list_items WHERE pick_list_id = $1`, [pickListId]);
+    // Cascade delete all associated items (pick_list_items has ON DELETE CASCADE)
+    // then delete the pick list
     await query(`DELETE FROM pick_lists WHERE id = $1`, [pickListId]);
     
-    return res.json({ success: true, message: 'Pick list permanently deleted' });
+    console.log(`✓ Permanently deleted pick list ${pickListId}`);
+    res.json({ success: true, message: 'Pick list permanently deleted' });
   } catch (error) {
-    return res.status(500).json({ error: 'Failed to delete pick list' });
+    console.error('Permanent delete error:', error);
+    res.status(500).json({ error: 'Failed to permanently delete pick list' });
   }
 });
 
