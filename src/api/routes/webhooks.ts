@@ -12,7 +12,7 @@
 
 import express, { Request, Response } from 'express';
 import crypto from 'crypto';
-import { query } from '../../db/index.js';
+import { query, getPool } from '../../db/index.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 
 const router = express.Router();
@@ -84,52 +84,80 @@ async function handleOrderPlaced(order: any) {
     phone: shippingAddress.phone ?? null,
   } : {};
 
-  // Check if pick list already exists for this order
-  const existing = await query(`SELECT id FROM pick_lists WHERE medusa_order_id = $1`, [medusaOrderId]);
-  if (existing.rows.length > 0) return; // idempotent
-
   const pickListNumber = `PL-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${String(displayId).padStart(4, '0')}`;
 
-  const plResult = await query(`
-    INSERT INTO pick_lists (
-      medusa_order_id, pick_list_number, status,
-      customer_name, customer_email,
-      shipping_method_name, shipping_method_code, shipping_address,
-      created_at, updated_at
-    )
-    VALUES ($1, $2, 'PENDING', $3, $4, $5, $6, $7::jsonb, NOW(), NOW())
-    RETURNING id
-  `, [
-    medusaOrderId,
-    pickListNumber,
-    customerName,
-    order.email ?? order.customer?.email ?? null,
-    primaryShippingMethod?.name ?? primaryShippingMethod?.shipping_option?.name ?? null,
-    primaryShippingMethod?.id ?? primaryShippingMethod?.shipping_option_id ?? null,
-    JSON.stringify(shippingSnapshot),
-  ]);
+  // Everything below runs in one transaction: a failed item insert must not
+  // leave behind an empty pick_lists row that then silently blocks retries
+  // via the idempotency check.
+  const client = await getPool().connect();
+  let pickListId: string;
+  try {
+    await client.query('BEGIN');
 
-  const pickListId = plResult.rows[0].id;
-  let lineNumber = 1;
+    const existing = await client.query(`SELECT id FROM pick_lists WHERE medusa_order_id = $1`, [medusaOrderId]);
+    if (existing.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return; // idempotent
+    }
 
-  for (const item of order.items ?? []) {
-    const sku = item.variant?.sku ?? item.variant_sku ?? item.sku;
-    if (!sku) continue;
+    const plResult = await client.query(`
+      INSERT INTO pick_lists (
+        medusa_order_id, pick_list_number, status,
+        customer_name, customer_email,
+        shipping_method_name, shipping_method_code, shipping_address,
+        created_at, updated_at
+      )
+      VALUES ($1, $2, 'PENDING', $3, $4, $5, $6, $7::jsonb, NOW(), NOW())
+      RETURNING id
+    `, [
+      medusaOrderId,
+      pickListNumber,
+      customerName,
+      order.email ?? order.customer?.email ?? null,
+      primaryShippingMethod?.name ?? primaryShippingMethod?.shipping_option?.name ?? null,
+      primaryShippingMethod?.id ?? primaryShippingMethod?.shipping_option_id ?? null,
+      JSON.stringify(shippingSnapshot),
+    ]);
 
-    const colourCode = sku.split('-').pop()?.match(/[a-z]{2}\d/) ? sku.split('-').pop() : null;
+    pickListId = plResult.rows[0].id;
+    let lineNumber = 1;
 
-    // Extract Medusa IDs for fulfillment sync
-    const medusaLineItemId = item.id;
-    const medusaVariantId = item.variant?.id ?? item.variant_id;
-    const medusaProductId = item.product?.id ?? item.product_id;
+    for (const item of order.items ?? []) {
+      const sku = item.variant?.sku ?? item.variant_sku ?? item.sku;
+      if (!sku) {
+        console.warn(`[webhooks] order.placed ${medusaOrderId}: item ${item.id} has no sku, skipping line`);
+        continue;
+      }
 
-    await query(`
-      INSERT INTO pick_list_items
-        (pick_list_id, line_number, product_sku, colour_code, quantity_required, status, 
-         medusa_order_line_item_id, medusa_variant_id, medusa_product_id,
-         created_at, updated_at)
-      VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8, NOW(), NOW())
-    `, [pickListId, lineNumber++, sku, colourCode, item.quantity, medusaLineItemId, medusaVariantId, medusaProductId]);
+      // quantity is a Medusa BigNumber-derived value — coerce defensively in
+      // case an upstream query is missing the paired raw_quantity field.
+      const quantity = Number(item.quantity) || 1;
+      if (!item.quantity) {
+        console.warn(`[webhooks] order.placed ${medusaOrderId}: item ${item.id} (${sku}) missing quantity, defaulting to 1`);
+      }
+
+      const colourCode = sku.split('-').pop()?.match(/[a-z]{2}\d/) ? sku.split('-').pop() : null;
+
+      // Extract Medusa IDs for fulfillment sync
+      const medusaLineItemId = item.id;
+      const medusaVariantId = item.variant?.id ?? item.variant_id;
+      const medusaProductId = item.product?.id ?? item.product_id;
+
+      await client.query(`
+        INSERT INTO pick_list_items
+          (pick_list_id, line_number, product_sku, colour_code, quantity_required, status, 
+           medusa_order_line_item_id, medusa_variant_id, medusa_product_id,
+           created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8, NOW(), NOW())
+      `, [pickListId, lineNumber++, sku, colourCode, quantity, medusaLineItemId, medusaVariantId, medusaProductId]);
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
   }
 
   // Reserve the quantity immediately across all locations holding this SKU
@@ -138,12 +166,13 @@ async function handleOrderPlaced(order: any) {
   for (const item of order.items ?? []) {
     const sku = item.variant?.sku ?? item.variant_sku ?? item.sku;
     if (!sku) continue;
+    const quantity = Number(item.quantity) || 1;
 
     await query(
       `UPDATE warehouse_inventory
        SET quantity_reserved = quantity_reserved + $1, updated_at = NOW()
        WHERE product_sku = $2`,
-      [item.quantity, sku]
+      [quantity, sku]
     );
   }
 
