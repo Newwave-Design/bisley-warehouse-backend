@@ -150,13 +150,12 @@ router.post('/init-from-inventory', authMiddleware, requirePermission('manage_re
       SELECT 
         wp.variant_sku AS sku,
         wp.product_title AS product_name,
-        wp.product_family AS family,
         COALESCE(SUM(wi.quantity), 0)::int AS current_stock
       FROM wms_products wp
       LEFT JOIN warehouse_inventory wi ON wi.product_sku = wp.variant_sku
       WHERE wp.product_status = 'published'
-      GROUP BY wp.variant_sku, wp.product_title, wp.product_family
-      ORDER BY wp.product_family, wp.product_title
+      GROUP BY wp.variant_sku, wp.product_title
+      ORDER BY wp.product_title
     `);
 
     if (!products.rows.length) return res.status(400).json({ error: 'No published products found' });
@@ -178,16 +177,15 @@ router.post('/init-from-inventory', authMiddleware, requirePermission('manage_re
             reorder_point=$2, 
             reorder_qty=$3,
             product_name=$4, 
-            family=$5, 
             updated_at=NOW()
-          WHERE sku=$6
-        `, [benchmark, triggerPoint, orderQty, product.product_name, product.family, product.sku]);
+          WHERE sku=$5
+        `, [benchmark, triggerPoint, orderQty, product.product_name, product.sku]);
         updated++;
       } else {
         await query(`
-          INSERT INTO reorder_rules (sku, product_name, family, benchmark_quantity, reorder_point, reorder_qty, lead_time_weeks, is_active)
-          VALUES ($1,$2,$3,$4,$5,$6,8,true)
-        `, [product.sku, product.product_name, product.family, benchmark, triggerPoint, orderQty]);
+          INSERT INTO reorder_rules (sku, product_name, benchmark_quantity, reorder_point, reorder_qty, lead_time_weeks, is_active)
+          VALUES ($1,$2,$3,$4,$5,8,true)
+        `, [product.sku, product.product_name, benchmark, triggerPoint, orderQty]);
         created++;
       }
     }
