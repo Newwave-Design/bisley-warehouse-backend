@@ -371,4 +371,56 @@ router.get('/test-order', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * POST /api/webhooks/medusa/fulfillment-created
+ * 
+ * Receives fulfillment_created events from Medusa.
+ * Associates the fulfillment ID with the pick list so dispatch can use it.
+ *
+ * Payload: { event: "fulfillment.created", order_id, fulfillment_id, timestamp }
+ * Signature: x-medusa-signature header (HMAC SHA-256)
+ */
+router.post('/medusa/fulfillment-created', express.raw({ type: '*/*' }), async (req: Request, res: Response) => {
+  try {
+    const sig = (req.headers['x-medusa-signature'] as string) ?? '';
+    if (!WEBHOOK_SECRET || !verifySignature(req.body as Buffer, sig)) {
+      return res.status(401).json({ error: 'Invalid webhook signature' });
+    }
+
+    const payload = JSON.parse((req.body as Buffer).toString());
+    const { order_id, fulfillment_id } = payload;
+
+    if (!order_id || !fulfillment_id) {
+      return res.status(400).json({ error: 'Missing order_id or fulfillment_id' });
+    }
+
+    await handleFulfillmentCreated(order_id, fulfillment_id);
+    res.json({ received: true, event: 'fulfillment.created' });
+  } catch (err: any) {
+    console.error('[webhooks] fulfillment-created error:', err);
+    res.status(500).json({ error: 'Webhook processing failed' });
+  }
+});
+
+async function handleFulfillmentCreated(orderId: string, fulfillmentId: string) {
+  console.log(`[webhooks] Processing fulfillment.created for order ${orderId} fulfillment ${fulfillmentId}`);
+
+  // Update the pick list to associate it with the fulfillment
+  const result = await query(
+    `UPDATE pick_lists 
+     SET medusa_fulfillment_id = $1, updated_at = NOW()
+     WHERE medusa_order_id = $2
+     RETURNING id, pick_list_number`,
+    [fulfillmentId, orderId]
+  );
+
+  if (result.rows.length === 0) {
+    console.warn(`[webhooks] No pick list found for order ${orderId}, fulfillment ID not stored`);
+    return;
+  }
+
+  const pickList = result.rows[0];
+  console.log(`✓ Pick list ${pickList.pick_list_number} (${pickList.id}) associated with fulfillment ${fulfillmentId}`);
+}
+
 export default router;
