@@ -120,7 +120,8 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error('Pick list fetch error:', error);
-    return res.status(500).json({ error: 'Failed to fetch pick lists' });
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    return res.status(500).json({ error: 'Failed to fetch pick lists', details: errorMsg });
   }
 });
 
