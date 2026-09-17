@@ -139,6 +139,70 @@ router.post('/init', authMiddleware, requirePermission('manage_reorder_rules'), 
   }
 });
 
+/** POST /api/reorder-rules/init-from-inventory — generate rules from current warehouse stock
+ * Sets benchmark_quantity = current_stock for each published product
+ * Useful for initial setup: "what we have today IS our 2-month baseline"
+ */
+router.post('/init-from-inventory', authMiddleware, requirePermission('manage_reorder_rules'), async (req: AuthRequest, res: Response) => {
+  try {
+    // Get all published products with their current stock
+    const products = await query(`
+      SELECT 
+        wp.variant_sku AS sku,
+        wp.product_title AS product_name,
+        wp.product_family AS family,
+        COALESCE(SUM(wi.quantity), 0)::int AS current_stock
+      FROM wms_products wp
+      LEFT JOIN warehouse_inventory wi ON wi.product_sku = wp.variant_sku
+      WHERE wp.product_status = 'published'
+      GROUP BY wp.variant_sku, wp.product_title, wp.product_family
+      ORDER BY wp.product_family, wp.product_title
+    `);
+
+    if (!products.rows.length) return res.status(400).json({ error: 'No published products found' });
+
+    let created = 0, updated = 0;
+    for (const product of products.rows) {
+      // Only create rules for products with stock
+      if (product.current_stock === 0) continue;
+
+      const benchmark = product.current_stock;
+      const triggerPoint = Math.round(benchmark * 0.6);
+      const orderQty = benchmark;
+
+      const existing = await query('SELECT id FROM reorder_rules WHERE sku=$1', [product.sku]);
+      if (existing.rows[0]) {
+        await query(`
+          UPDATE reorder_rules SET 
+            benchmark_quantity=$1, 
+            reorder_point=$2, 
+            reorder_qty=$3,
+            product_name=$4, 
+            family=$5, 
+            updated_at=NOW()
+          WHERE sku=$6
+        `, [benchmark, triggerPoint, orderQty, product.product_name, product.family, product.sku]);
+        updated++;
+      } else {
+        await query(`
+          INSERT INTO reorder_rules (sku, product_name, family, benchmark_quantity, reorder_point, reorder_qty, lead_time_weeks, is_active)
+          VALUES ($1,$2,$3,$4,$5,$6,8,true)
+        `, [product.sku, product.product_name, product.family, benchmark, triggerPoint, orderQty]);
+        created++;
+      }
+    }
+
+    res.json({ 
+      created, 
+      updated, 
+      total: created + updated, 
+      note: `Created from current inventory. Benchmark = current stock. Trigger = 60% of current stock. Ready to monitor.` 
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.put('/:id', authMiddleware, requirePermission('manage_reorder_rules'), async (req: AuthRequest, res: Response) => {
   try {
     const { benchmark_quantity, is_active, notes } = req.body;
