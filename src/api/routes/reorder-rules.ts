@@ -48,7 +48,7 @@ router.get('/', authMiddleware, requirePermission('manage_reorder_rules'), async
       LEFT JOIN wms_products wp ON wp.variant_sku = rr.sku
       LEFT JOIN pick_list_items pli ON pli.product_sku = rr.sku
       LEFT JOIN pick_lists pl ON pl.id = pli.pick_list_id
-      WHERE COALESCE(wp.product_status, 'draft') = 'published'
+      WHERE COALESCE(wp.product_status, 'draft') = 'published' AND COALESCE(wp.is_archived, false) = false
       GROUP BY rr.id, wp.product_status
       ORDER BY rr.family, rr.sku
     `);

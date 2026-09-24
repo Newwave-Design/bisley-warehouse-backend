@@ -58,7 +58,7 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
     const wp = await query(
       `SELECT DISTINCT ON (product_title) variant_sku AS sku, colour_code, colour_name,
               product_title AS product_name, variant_thumbnail AS thumbnail
-       FROM wms_products WHERE variant_sku ILIKE $1 LIMIT 5`,
+       FROM wms_products WHERE variant_sku ILIKE $1 AND is_archived = false LIMIT 5`,
       [`%${q}%`]
     );
     if (wp.rows.length > 0) {

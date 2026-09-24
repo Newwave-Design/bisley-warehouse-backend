@@ -107,6 +107,21 @@ ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS variant_depth_mm INTEGER;
 -- so this is the correct place for cost (sku_mappings is paused/only for external supplier codes).
 ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS unit_cost_gbp DECIMAL(10,2);
 
+-- Archive (soft-delete) support: a full re-sync marks any row NOT seen in the current Medusa
+-- pull as archived rather than deleting it — preserves SKU-keyed side data (barcode_mappings,
+-- reorder_rules, product_fulfillment_profiles, historic pick_list_items) that references the
+-- SKU string directly with no FK to wms_products.id.
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
+CREATE INDEX IF NOT EXISTS idx_wms_products_archived ON wms_products(is_archived);
+-- Marks which sync run last touched a row — a plain string comparison, not a timestamp
+-- comparison, so it can never be corrupted by client/DB clock or timezone differences
+-- (last_synced_at is a "timestamp without time zone" column; comparing it against a JS Date
+-- parameter sent from a non-UTC machine silently shifted by the local UTC offset and archived
+-- almost the entire table on 2026-09-24 — never repeat that comparison).
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS last_sync_run_id VARCHAR(40);
+CREATE INDEX IF NOT EXISTS idx_wms_products_sync_run ON wms_products(last_sync_run_id);
+
 -- ================================================================================
 -- WAREHOUSE INVENTORY (Current stock levels by location)
 -- ================================================================================

@@ -41,6 +41,7 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
                variant_sku, COALESCE(variant_width_mm, width_mm) AS width_mm,
                COALESCE(variant_weight_grams, weight_grams) AS weight_grams, inventory_qty
         FROM wms_products
+        WHERE is_archived = false
       `),
     ]);
 

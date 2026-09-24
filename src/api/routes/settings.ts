@@ -269,7 +269,7 @@ router.get('/product-fulfillment-map', authMiddleware, async (_req: AuthRequest,
               pfp.pack_instructions
        FROM wms_products wp
        LEFT JOIN product_fulfillment_profiles pfp ON pfp.product_sku = wp.variant_sku
-       WHERE wp.variant_sku IS NOT NULL AND wp.variant_sku <> ''`
+       WHERE wp.variant_sku IS NOT NULL AND wp.variant_sku <> '' AND wp.is_archived = false`
     );
     res.json({ items: result.rows });
   } catch (err) {
@@ -581,7 +581,7 @@ async function runUpsAutoTagJob() {
                 COALESCE(variant_height_mm, height_mm) AS height_mm,
                 price_gbp
          FROM wms_products
-         WHERE variant_sku IS NOT NULL AND variant_sku <> ''`
+         WHERE variant_sku IS NOT NULL AND variant_sku <> '' AND is_archived = false`
       ),
       query(
         `SELECT service_code, service_name, metadata FROM shipping_services WHERE service_code = 'ait_freight' AND is_active = true LIMIT 1`

@@ -6,13 +6,18 @@ import { fileURLToPath } from 'url';
 const { Client } = pg;
 
 export async function runMigrations() {
-  // Try multiple database URLs in order: NEON_DATABASE_URL, DATABASE_URL, or WAREHOUSE_DATABASE_URL
-  const dbUrl = process.env.NEON_DATABASE_URL ||
+  // This app's schema (wms_products, warehouse_inventory, pick_lists, etc.) must ONLY ever be
+  // applied to the warehouse's own Postgres (Railway) — NEVER to Medusa's Neon database.
+  // WAREHOUSE_DATABASE_URL takes priority for exactly this reason: the monorepo's consolidated
+  // .env.local also defines NEON_DATABASE_URL/DATABASE_URL pointing at Medusa, and the old
+  // precedence order here would silently run this migration against production Medusa if both
+  // vars happened to be present in the same .env file.
+  const dbUrl = process.env.WAREHOUSE_DATABASE_URL ||
                 process.env.DATABASE_URL ||
-                process.env.WAREHOUSE_DATABASE_URL;
+                process.env.NEON_DATABASE_URL;
 
   if (!dbUrl) {
-    throw new Error('No database URL found. Set DATABASE_URL, NEON_DATABASE_URL, or WAREHOUSE_DATABASE_URL env var.');
+    throw new Error('No database URL found. Set WAREHOUSE_DATABASE_URL (preferred) or DATABASE_URL env var.');
   }
 
   const client = new Client({

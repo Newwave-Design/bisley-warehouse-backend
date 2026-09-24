@@ -21,10 +21,11 @@ router.get('/', authMiddleware, async (_req: AuthRequest, res: Response) => {
       inventory,
     ] = await Promise.all([
       query(`SELECT
-               COUNT(DISTINCT medusa_product_id)::int AS total_products,
-               COUNT(*)::int                          AS total_variants,
-               COUNT(*) FILTER (WHERE is_kit)::int    AS kit_variants,
-               MAX(last_synced_at)                    AS last_synced_at
+               COUNT(DISTINCT medusa_product_id) FILTER (WHERE NOT is_archived)::int AS total_products,
+               COUNT(*) FILTER (WHERE NOT is_archived)::int                          AS total_variants,
+               COUNT(*) FILTER (WHERE is_kit AND NOT is_archived)::int               AS kit_variants,
+               COUNT(*) FILTER (WHERE is_archived)::int                             AS archived_variants,
+               MAX(last_synced_at)                                                   AS last_synced_at
              FROM wms_products`),
       query(`SELECT
                COUNT(*) FILTER (WHERE status = 'DRAFT')::int      AS draft,

@@ -16,7 +16,7 @@ import skuMappingsRoutes from './api/routes/sku-mappings.js';
 import ordersRoutes from './api/routes/orders.js';
 import checkinRoutes from './api/routes/checkin.js';
 import receivingRoutes from './api/routes/receiving.js';
-import productsRoutes from './api/routes/products.js';
+import productsRoutes, { triggerScheduledCatalogueSync } from './api/routes/products.js';
 import boxSizesRoutes from './api/routes/box-sizes.js';
 import settingsRoutes from './api/routes/settings.js';
 import dashboardRoutes from './api/routes/dashboard.js';
@@ -203,6 +203,17 @@ async function start() {
       setInterval(() => { void runDailyChecks(); }, TWENTY_FOUR_HOURS);
       void runDailyChecks(); // also run once on boot rather than waiting a full day
       console.log('✓ Daily checks scheduled (weekly report + liability review, every 24h)');
+    }
+
+    // Scheduled catalogue sync — pulls new/changed Medusa products into the WMS automatically,
+    // so nobody has to remember to click "Sync Now" when a product is added in Medusa.
+    if (process.env.NODE_ENV === 'production') {
+      const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
+      setInterval(() => {
+        const r = triggerScheduledCatalogueSync();
+        console.log(`[scheduler] Catalogue sync ${r.started ? 'started' : `skipped (${r.reason})`}`);
+      }, TWENTY_FOUR_HOURS);
+      console.log('✓ Catalogue sync scheduled (every 24h) — not run on boot, to avoid a slow Medusa pull blocking startup');
     }
   } catch (error) {
     console.error('❌ Startup failed:', error);

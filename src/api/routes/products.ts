@@ -8,6 +8,7 @@
  */
 
 import express, { Response } from 'express';
+import { randomUUID } from 'node:crypto';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { getMedusaToken, MEDUSA_URL } from '../../lib/medusa-client.js';
 import { query } from '../../db/index.js';
@@ -41,6 +42,15 @@ function extractColourCode(sku: string): string | null {
   const lastSeg = sku.split('-').pop() ?? '';
   const m = /([a-z]{2}\d)$/.exec(lastSeg);
   return m ? m[1] : null;
+}
+
+// wms_products' dimension/weight columns are INTEGER, but Medusa allows decimals (e.g. 40.1kg) —
+// inserting a raw decimal string fails the whole 200-row batch it's in with a Postgres type error,
+// silently dropping ~200 unrelated variants along with it. Round instead of losing the batch.
+function toIntOrNull(v: unknown): number | null {
+  if (v == null) return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? Math.round(n) : null;
 }
 
 // ── Interfaces ────────────────────────────────────────────────────────────────
@@ -153,10 +163,10 @@ async function fetchAllProductsFromMedusa(forceRefresh = false): Promise<WmsProd
           const colour_code = extractColourCode(v.sku ?? '');
           const colour_name = COLOUR_NAMES[colour_code ?? ''] ?? v.title ?? null;
           // Use variant-level dimensions/weight if set, fall back to product-level
-          const weight_grams = v.weight ?? p.weight ?? null;
-          const height_mm = v.height ?? p.height ?? null;
-          const width_mm = v.width ?? p.width ?? null;
-          const depth_mm = v.length ?? p.length ?? null;
+          const weight_grams = toIntOrNull(v.weight ?? p.weight);
+          const height_mm = toIntOrNull(v.height ?? p.height);
+          const width_mm = toIntOrNull(v.width ?? p.width);
+          const depth_mm = toIntOrNull(v.length ?? p.length);
           // GBP price: find the GBP price entry and convert from stored amount (major units = pounds)
           const gbpPrice = (v.prices ?? []).find((pr: any) => pr.currency_code === 'gbp');
           const price_gbp = gbpPrice ? gbpPrice.amount : null;
@@ -171,8 +181,11 @@ async function fetchAllProductsFromMedusa(forceRefresh = false): Promise<WmsProd
             weight_grams, height_mm, width_mm, depth_mm,
           };
         })
-        // Only sync variants with full weight + dimensions so DHL costs can be calculated
-        .filter((v: WmsVariant) => v.weight_grams != null && v.height_mm != null && v.width_mm != null && v.depth_mm != null);
+        // Every variant with a real SKU must sync — a product used to be silently dropped from the
+        // whole WMS (no pick lists, no barcode, no inventory tracking) if weight/dims were missing.
+        // Incomplete dims now just mean DHL cost estimates fall back/skip for that SKU (handled
+        // downstream by resolveKitDimensions/estimateShippingForServices, both null-safe already).
+        .filter((v: WmsVariant) => !!v.sku);
 
       if (variants.length === 0) continue;
 
@@ -184,10 +197,10 @@ async function fetchAllProductsFromMedusa(forceRefresh = false): Promise<WmsProd
         material: p.material ?? null,
         gallery_images: gallery,
         metadata: p.metadata ?? {},
-        weight_grams: p.weight ?? null,
-        height_mm: p.height ?? null,
-        width_mm: p.width ?? null,
-        depth_mm: p.length ?? null,
+        weight_grams: toIntOrNull(p.weight),
+        height_mm: toIntOrNull(p.height),
+        width_mm: toIntOrNull(p.width),
+        depth_mm: toIntOrNull(p.length),
         variant_count: variants.length,
         kit_variant_count: variants.filter(v => v.is_kit).length,
         variants,
@@ -232,6 +245,7 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
   try {
     const search = ((req.query.search as string) ?? '').toLowerCase();
     const statusFilter = (req.query.status as string) ?? '';
+    const includeArchived = req.query.includeArchived === 'true';
 
     // GROUP BY product only — MAX() is safe since product-level columns are identical per product
     let sql = `
@@ -269,10 +283,12 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
           'kit_components',  kit_components,
           'inventory_qty',   inventory_qty
         ) ORDER BY variant_sku) AS variants,
-        MAX(last_synced_at) AS last_synced_at
+        MAX(last_synced_at) AS last_synced_at,
+        bool_and(is_archived) AS all_archived
       FROM wms_products WHERE 1=1`;
     const params: any[] = [];
     let pi = 1;
+    if (!includeArchived) sql += ` AND is_archived = false`;
     if (search) {
       sql += ` AND (product_title ILIKE $${pi} OR product_handle ILIKE $${pi} OR variant_sku ILIKE $${pi})`;
       params.push(`%${search}%`); pi++;
@@ -286,8 +302,9 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
                     COUNT(*)::int AS total_variants,
                     COUNT(*) FILTER (WHERE is_kit)::int AS kit_variants,
                     COUNT(DISTINCT medusa_product_id) FILTER (WHERE product_status='published')::int AS published,
+                    COUNT(*) FILTER (WHERE is_archived)::int AS archived_variants,
                     MAX(last_synced_at) AS last_synced_at
-             FROM wms_products`),
+             FROM wms_products WHERE is_archived = false OR $1`, [includeArchived]),
     ]);
 
     res.json({
@@ -310,6 +327,7 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
         kit_variant_count: row.kit_variant_count,
         variants: row.variants ?? [],
         last_synced_at: row.last_synced_at,
+        archived: row.all_archived === true,
       })),
       total: result.rows.length,
       stats: statsResult.rows[0] ?? null,
@@ -358,6 +376,13 @@ const syncState: SyncState = {
 
 async function runSyncJob() {
   const syncStart = new Date();
+  // A plain string token identifying this run — used instead of comparing timestamps to decide
+  // which rows to archive. `last_synced_at` is a `timestamp without time zone` column; comparing
+  // it against a JS Date parameter is NOT safe when the calling machine's local timezone isn't
+  // UTC (node-pg silently shifts naive-timestamp parameters by the local UTC offset), which once
+  // caused this step to archive almost the entire table. A run-id string comparison has no such
+  // failure mode.
+  const runId = randomUUID();
   let inserted = 0, updated = 0, skipped = 0, barcodesSynced = 0;
   const errors: string[] = [];
   const sampleChanges: any[] = []; // Track sample field changes
@@ -394,7 +419,7 @@ async function runSyncJob() {
       for (const row of batch) {
         const { product, v, kitJson } = row;
         valuePlaceholders.push(
-          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++}::jsonb,$${paramIdx++}::jsonb,$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++}::jsonb,$${paramIdx++},NOW())`
+          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++}::jsonb,$${paramIdx++}::jsonb,$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++}::jsonb,$${paramIdx++},$${paramIdx++},NOW())`
         );
         params.push(
           product.id, v.id,
@@ -405,7 +430,7 @@ async function runSyncJob() {
           v.sku, v.title, v.colour_code, v.colour_name, v.thumbnail,
           v.manage_inventory, v.allow_backorder, v.price_gbp, v.barcode,
           v.weight_grams, v.height_mm, v.width_mm, v.depth_mm,
-          v.is_kit, kitJson, v.inventory_qty
+          v.is_kit, kitJson, v.inventory_qty, runId
         );
       }
 
@@ -419,7 +444,7 @@ async function runSyncJob() {
              variant_sku, variant_title, colour_code, colour_name, variant_thumbnail,
              manage_inventory, allow_backorder, price_gbp, variant_barcode,
              variant_weight_grams, variant_height_mm, variant_width_mm, variant_depth_mm,
-             is_kit, kit_components, inventory_qty, last_synced_at)
+             is_kit, kit_components, inventory_qty, last_sync_run_id, last_synced_at)
           VALUES ${valuePlaceholders.join(',')}
           ON CONFLICT (medusa_variant_id) DO UPDATE SET
             product_title       = EXCLUDED.product_title,
@@ -451,8 +476,11 @@ async function runSyncJob() {
             is_kit              = EXCLUDED.is_kit,
             kit_components      = EXCLUDED.kit_components,
             inventory_qty       = EXCLUDED.inventory_qty,
+            last_sync_run_id    = EXCLUDED.last_sync_run_id,
             last_synced_at      = NOW(),
-            updated_at          = NOW()
+            updated_at          = NOW(),
+            is_archived         = false,
+            archived_at         = NULL
           RETURNING (xmax = 0) AS is_insert, medusa_variant_id, variant_sku
         `, params);
         
@@ -517,16 +545,29 @@ async function runSyncJob() {
       WHERE sm.medusa_sku = wmp.variant_sku AND sm.medusa_sku IS NOT NULL
     `);
 
-    const staleResult = await query(
-      `SELECT COUNT(*)::int AS stale_count FROM wms_products WHERE last_synced_at < $1`,
-      [syncStart]
+    // Archive (never delete) any row not touched by this run — its SKU no longer matches a live,
+    // published Medusa variant (deleted/unpublished/restructured). Side tables keyed by SKU string
+    // (barcode_mappings, reorder_rules, product_fulfillment_profiles, pick_list_items history) are
+    // untouched, so archiving is fully reversible if the SKU is re-published later (the upsert
+    // above already un-archives on conflict).
+    // Uses a per-run ID string comparison, NOT a timestamp comparison — comparing a JS Date
+    // parameter against a `timestamp without time zone` column silently shifts by the caller's
+    // local UTC offset (bit us once: archived almost the whole table when run from a non-UTC
+    // machine). A run-id string has no such failure mode.
+    const archiveResult = await query(
+      `UPDATE wms_products
+       SET is_archived = true, archived_at = NOW()
+       WHERE (last_sync_run_id IS DISTINCT FROM $1) AND is_archived = false
+       RETURNING variant_sku`,
+      [runId]
     );
 
     syncState.result = {
       inserted, updated, skipped,
       barcodes_synced: barcodesSynced,
       sku_mappings_enriched: enrichResult.rowCount ?? 0,
-      stale_rows: staleResult.rows[0]?.stale_count ?? 0,
+      archived_rows: archiveResult.rowCount ?? 0,
+      archived_skus: archiveResult.rows.map(r => r.variant_sku).slice(0, 50),
       errors: errors.length > 0 ? errors : [],
       error_count: errors.length,
       duration_ms: Date.now() - syncStart.getTime(),
@@ -538,6 +579,9 @@ async function runSyncJob() {
       }
     };
     syncState.error = null;
+    if (archiveResult.rowCount) {
+      await logWarning('MEDUSA_SYNC', `Archived ${archiveResult.rowCount} wms_products row(s) no longer live in Medusa`, { archived_skus: archiveResult.rows.map(r => r.variant_sku) });
+    }
     if (errors.length > 0) {
       await logWarning('MEDUSA_SYNC', `Product sync completed with ${errors.length} batch error(s)`, { inserted, updated, skipped, errors: errors.slice(0, 20) });
     }
@@ -923,5 +967,19 @@ router.get('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
     res.status(503).json({ error: 'Could not fetch product', detail: (err as Error).message });
   }
 });
+
+// Exposed so server.ts can trigger a full catalogue sync on a schedule, reusing the same
+// dedupe-by-medusa_variant_id/archive-stale logic as the manual "Sync Now" button.
+export function triggerScheduledCatalogueSync(): { started: boolean; reason?: string } {
+  if (syncState.running) return { started: false, reason: 'already running' };
+  syncState.running = true;
+  syncState.started_at = new Date();
+  syncState.finished_at = null;
+  syncState.result = null;
+  syncState.error = null;
+  syncState.progress = 'Starting (scheduled)…';
+  runSyncJob();
+  return { started: true };
+}
 
 export default router;
