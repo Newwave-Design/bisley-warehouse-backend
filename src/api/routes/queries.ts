@@ -293,8 +293,9 @@ router.get('/:id/matching-orders', async (req: Request, res: Response) => {
  * Body: { record_type, record_title, content, record_value }
  */
 router.post('/:id/records', async (req: Request, res: Response) => {
-  const client: PoolClient | undefined = await getPool().connect()
+  let client: PoolClient | undefined
   try {
+    client = await getPool().connect()
     const { id } = req.params
     const { record_type, record_title, content, record_value } = req.body
     const user_id = (req as any).user?.id
@@ -332,8 +333,9 @@ router.post('/:id/records', async (req: Request, res: Response) => {
  * Body: { action_type, action_value, action_description, linked_pick_list_id }
  */
 router.post('/:id/actions', async (req: Request, res: Response) => {
-  const client: PoolClient | undefined = await getPool().connect()
+  let client: PoolClient | undefined
   try {
+    client = await getPool().connect()
     const { id } = req.params
     const { action_type, action_value, action_description, linked_pick_list_id } = req.body
     const user_id = (req as any).user?.id
@@ -371,8 +373,9 @@ router.post('/:id/actions', async (req: Request, res: Response) => {
  * Body: { pick_list_id, medusa_order_id, order_status, order_value_gbp }
  */
 router.post('/:id/link-order', async (req: Request, res: Response) => {
-  const client: PoolClient | undefined = await getPool().connect()
+  let client: PoolClient | undefined
   try {
+    client = await getPool().connect()
     const { id } = req.params
     const { pick_list_id, medusa_order_id, order_status, order_value_gbp, customer_name_on_order } = req.body
 
@@ -381,12 +384,12 @@ router.post('/:id/link-order', async (req: Request, res: Response) => {
       return
     }
 
-    const result = await client!.query(
+    const result = await client.query(
       `INSERT INTO query_linked_orders (id, query_id, pick_list_id, medusa_order_id, customer_name_on_order, order_value_gbp, order_status)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (query_id, pick_list_id, medusa_order_id) DO UPDATE SET tagged_at = NOW()
        RETURNING *`,
-      [uuid(), id, pick_list_id || null, medusa_order_id || null, customer_name_on_order, order_value_gbp || null, order_status]
+      [uuid(), id, pick_list_id || null, medusa_order_id || null, customer_name_on_order || null, order_value_gbp || null, order_status || null]
     )
 
     res.status(201).json(result.rows[0])

@@ -41,6 +41,18 @@ import { query as dbQueryUtil } from './db/index.js';
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Safety net: an unguarded `await pool.connect()` (or any other unhandled async rejection)
+// anywhere in this codebase would otherwise CRASH THE ENTIRE SERVER on Node 20+ (unhandled
+// promise rejections terminate the process by default since Node 15). Found and fixed one
+// real instance of this in queries.ts (CRM link-order/records/actions) on 2026-09-24 — this
+// handler is the last line of defense against the same class of bug anywhere else in the app.
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️  UNHANDLED REJECTION (server kept running):', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('⚠️  UNCAUGHT EXCEPTION (server kept running):', err);
+});
+
 // Webhooks need the raw request body for HMAC signature verification — must be
 // mounted before the global express.json() below, or that middleware consumes
 // the body first and every signature check silently fails.
