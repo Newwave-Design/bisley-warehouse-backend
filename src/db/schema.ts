@@ -122,6 +122,12 @@ CREATE INDEX IF NOT EXISTS idx_wms_products_archived ON wms_products(is_archived
 ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS last_sync_run_id VARCHAR(40);
 CREATE INDEX IF NOT EXISTS idx_wms_products_sync_run ON wms_products(last_sync_run_id);
 
+-- Supplier (New Wave) part-number + colour code, e.g. "162-bx6" — lets a supplier order line or
+-- a physical box label be matched directly to a wms_products row without a sku_mappings join.
+-- Kept in sync with sku_mappings.nw_code (the canonical source) whenever an order PDF is parsed.
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS nw_code VARCHAR(50);
+CREATE INDEX IF NOT EXISTS idx_wms_products_nw_code ON wms_products(nw_code);
+
 -- ================================================================================
 -- WAREHOUSE INVENTORY (Current stock levels by location)
 -- ================================================================================

@@ -281,7 +281,8 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
           'weight_grams',    COALESCE(variant_weight_grams, weight_grams),
           'is_kit',          is_kit,
           'kit_components',  kit_components,
-          'inventory_qty',   inventory_qty
+          'inventory_qty',   inventory_qty,
+          'nw_code',         nw_code
         ) ORDER BY variant_sku) AS variants,
         MAX(last_synced_at) AS last_synced_at,
         bool_and(is_archived) AS all_archived
@@ -290,7 +291,7 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
     let pi = 1;
     if (!includeArchived) sql += ` AND is_archived = false`;
     if (search) {
-      sql += ` AND (product_title ILIKE $${pi} OR product_handle ILIKE $${pi} OR variant_sku ILIKE $${pi})`;
+      sql += ` AND (product_title ILIKE $${pi} OR product_handle ILIKE $${pi} OR variant_sku ILIKE $${pi} OR nw_code ILIKE $${pi})`;
       params.push(`%${search}%`); pi++;
     }
     if (statusFilter) { sql += ` AND product_status = $${pi}`; params.push(statusFilter); pi++; }

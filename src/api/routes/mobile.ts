@@ -39,8 +39,20 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
       return res.json({ found: true, source: 'barcode', ...bm.rows[0], stock });
     }
 
-    // 2. NW code in sku_mappings (LEGACY/PAUSED - table is expected to be empty until
-    // Genero is connected; barcode_mappings above is the live path)
+    // 2. NW code — checked directly against wms_products.nw_code first (the canonical mapping
+    // key populated per-product from sku_mappings whenever a New Wave order PDF is parsed),
+    // falling back to the sku_mappings join for any code not yet copied onto a product row.
+    const wpNw = await query(
+      `SELECT variant_sku AS sku, colour_code, colour_name, product_title AS product_name,
+              variant_thumbnail AS thumbnail
+       FROM wms_products WHERE UPPER(nw_code) = $1 AND is_archived = false LIMIT 1`,
+      [q]
+    );
+    if (wpNw.rows[0]) {
+      const stock = await getStock(wpNw.rows[0].sku, wpNw.rows[0].colour_code);
+      return res.json({ found: true, source: 'nw_code', ...wpNw.rows[0], stock });
+    }
+
     const sm = await query(
       `SELECT s.nw_code AS sku, s.colour AS colour_name, s.product_name,
               w.variant_thumbnail AS thumbnail, w.colour_code
