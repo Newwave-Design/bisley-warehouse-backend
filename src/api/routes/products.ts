@@ -616,12 +616,12 @@ async function runSyncJob() {
       [runId]
     );
 
-    syncState.result = {
     // Do not leave Medusa's available_quantity in the cache. The Inventory tab and this
     // column both mean warehouse on-hand. New rows were inserted at 0; existing rows keep
     // whatever the last receipt wrote until this refresh.
     await refreshCachedInventoryFromWarehouse();
 
+    syncState.result = {
       inserted, updated, skipped,
       barcodes_synced: barcodesSynced,
       sku_mappings_enriched: enrichResult.rowCount ?? 0,
