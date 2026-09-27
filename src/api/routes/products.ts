@@ -25,6 +25,60 @@ const router = express.Router();
 // no sales channel). Every inventory lookup MUST filter to this one or quantities double-count.
 const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY792H831KT3TKH4CYPF7FT9';
 
+// Floor stock for a variant. Kits have no bin of their own — buildable qty is the minimum
+// of component on-hand divided by required quantity. Missing bin rows are 0, not Medusa's number.
+function onHandQty(stock: Map<string, number>, variant: { sku?: string; is_kit?: boolean; kit_components?: any[] }): number {
+  const components = variant.kit_components;
+  if (variant.is_kit && Array.isArray(components) && components.length > 0) {
+    return Math.min(...components.map((c: any) => {
+      const need = Number(c.required_quantity) || 1;
+      return Math.floor((stock.get(c.sku) ?? 0) / need);
+    }));
+  }
+  return stock.get(variant.sku ?? '') ?? 0;
+}
+
+async function warehouseStockBySku(): Promise<Map<string, number>> {
+  const result = await query(
+    `SELECT product_sku, COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory GROUP BY product_sku`
+  );
+  return new Map(result.rows.map((r: any) => [r.product_sku, r.qty ?? 0]));
+}
+
+// Rewrite the catalogue cache column from warehouse_inventory. Catalogue sync must not
+// copy Medusa available_quantity into this column — that is what made the Inventory tab
+// show stock before the first receipt.
+async function refreshCachedInventoryFromWarehouse(): Promise<void> {
+  const stock = await warehouseStockBySku();
+  await query(`UPDATE wms_products SET inventory_qty = 0 WHERE inventory_qty IS DISTINCT FROM 0`);
+  if (stock.size === 0) return;
+
+  await query(
+    `UPDATE wms_products wp
+     SET inventory_qty = s.qty
+     FROM unnest($1::text[], $2::int[]) AS s(sku, qty)
+     WHERE wp.variant_sku = s.sku AND NOT wp.is_kit`,
+    [[...stock.keys()], [...stock.values()]]
+  );
+
+  const kits = await query(`SELECT id, kit_components FROM wms_products WHERE is_kit = true AND NOT is_archived`);
+  const ids: string[] = [];
+  const qtys: number[] = [];
+  for (const row of kits.rows) {
+    const qty = onHandQty(stock, { is_kit: true, kit_components: row.kit_components });
+    if (qty > 0) { ids.push(row.id); qtys.push(qty); }
+  }
+  if (ids.length) {
+    await query(
+      `UPDATE wms_products wp
+       SET inventory_qty = s.qty
+       FROM unnest($1::uuid[], $2::int[]) AS s(id, qty)
+       WHERE wp.id = s.id`,
+      [ids, qtys]
+    );
+  }
+}
+
 // ── Bisley colour code → display name lookup ──────────────────────────────────
 const COLOUR_NAMES: Record<string, string> = {
   av1: 'Black', aa3: 'Anthracite Grey', ba5: 'Traffic White',
@@ -297,7 +351,7 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
     if (statusFilter) { sql += ` AND product_status = $${pi}`; params.push(statusFilter); pi++; }
     sql += ` GROUP BY medusa_product_id ORDER BY MAX(product_title)`;
 
-    const [result, statsResult] = await Promise.all([
+    const [result, statsResult, stock] = await Promise.all([
       query(sql, params),
       query(`SELECT COUNT(DISTINCT medusa_product_id)::int AS total_products,
                     COUNT(*)::int AS total_variants,
@@ -306,6 +360,7 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
                     COUNT(*) FILTER (WHERE is_archived)::int AS archived_variants,
                     MAX(last_synced_at) AS last_synced_at
              FROM wms_products WHERE is_archived = false OR $1`, [includeArchived]),
+      warehouseStockBySku(),
     ]);
 
     res.json({
@@ -325,7 +380,7 @@ router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response)
         width_mm: row.width_mm ?? null,
         depth_mm: row.depth_mm ?? null,
         variant_count: row.variant_count,
-        kit_variant_count: row.kit_variant_count,
+        kit_varian(row.variants ?? []).map((v: any) => ({ ...v, inventory_qty: onHandQty(stock, v) }))ariant_count,
         variants: row.variants ?? [],
         last_synced_at: row.last_synced_at,
         archived: row.all_archived === true,
@@ -431,7 +486,7 @@ async function runSyncJob() {
           v.sku, v.title, v.colour_code, v.colour_name, v.thumbnail,
           v.manage_inventory, v.allow_backorder, v.price_gbp, v.barcode,
           v.weight_grams, v.height_mm, v.width_mm, v.depth_mm,
-          v.is_kit, kitJson, v.inventory_qty, runId
+          v.is_kit, kitJson, 0, runId
         );
       }
 
@@ -476,7 +531,6 @@ async function runSyncJob() {
             variant_depth_mm    = EXCLUDED.variant_depth_mm,
             is_kit              = EXCLUDED.is_kit,
             kit_components      = EXCLUDED.kit_components,
-            inventory_qty       = EXCLUDED.inventory_qty,
             last_sync_run_id    = EXCLUDED.last_sync_run_id,
             last_synced_at      = NOW(),
             updated_at          = NOW(),
@@ -564,6 +618,11 @@ async function runSyncJob() {
     );
 
     syncState.result = {
+    // Do not leave Medusa's available_quantity in the cache. The Inventory tab and this
+    // column both mean warehouse on-hand. New rows were inserted at 0; existing rows keep
+    // whatever the last receipt wrote until this refresh.
+    await refreshCachedInventoryFromWarehouse();
+
       inserted, updated, skipped,
       barcodes_synced: barcodesSynced,
       sku_mappings_enriched: enrichResult.rowCount ?? 0,
