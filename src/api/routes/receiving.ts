@@ -1,11 +1,19 @@
 /**
- * Discrepancy & Bay Assignment API — Phases 4 & 5
+ * Receiving & Bay Assignment API — Phases 4, 5, & 5.5
  *
  * Phase 4 — Discrepancies:
  * GET    /api/receiving/discrepancies           — List all flagged discrepancies
  * PATCH  /api/receiving/discrepancies/:id       — Accept or resolve with notes
  *
- * Phase 5 — Requires Location:
+ * Phase 5.5 — Pallets (grouping items during scanning):
+ * POST   /api/receiving/pallets                 — Create a new pallet (start pallet)
+ * GET    /api/receiving/pallets                 — List all pallets (open + completed)
+ * PATCH  /api/receiving/pallets/:id/add-item    — Add queue item to a pallet
+ * PATCH  /api/receiving/pallets/:id/complete    — Mark pallet as completed (finalize)
+ * PATCH  /api/receiving/pallets/:id/assign      — Assign entire pallet to a bay
+ * POST   /api/receiving/pallets/:id/stock       — Stock entire pallet to warehouse_inventory
+ *
+ * Phase 5 — Requires Location (individual item mode):
  * GET    /api/receiving/queue                   — Items awaiting bay assignment
  * GET    /api/receiving/locations               — Available warehouse bays
  * POST   /api/receiving/locations               — Create a new bay
@@ -33,6 +41,335 @@ async function getDefaultLiabilityStatus(): Promise<string> {
   const result = await query(`SELECT value FROM wms_settings WHERE key = 'default_liability_status'`);
   return result.rows[0]?.value ?? 'Bisley';
 }
+
+/** Generate unique pallet code */
+function generatePalletCode(): string {
+  return `PALLET-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+}
+
+// ================================================================================
+// PHASE 5.5: PALLETS (Grouping items during receiving)
+// ================================================================================
+
+/** POST /api/receiving/pallets — Create a new pallet (start pallet) */
+router.post('/pallets', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { session_id, order_id, notes } = req.body;
+    const pallet_code = generatePalletCode();
+
+    const result = await query(
+      `INSERT INTO receiving_pallets (pallet_code, session_id, order_id, notes, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW())
+       RETURNING *`,
+      [pallet_code, session_id || null, order_id || null, notes || null]
+    );
+
+    logger.info(`[pallet] Created new pallet: ${pallet_code}`);
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`Failed to create pallet: ${errMsg}`);
+    res.status(500).json({ error: 'Failed to create pallet' });
+  }
+});
+
+/** GET /api/receiving/pallets — List all pallets */
+router.get('/pallets', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { status = 'OPEN', limit = '50', offset = '0' } = req.query;
+
+    const result = await query(
+      `SELECT p.*, 
+        COUNT(q.id) as item_count,
+        COALESCE(SUM(q.quantity), 0) as total_qty
+       FROM receiving_pallets p
+       LEFT JOIN requires_location_queue q ON q.pallet_id = p.id
+       WHERE p.status = $1
+       GROUP BY p.id
+       ORDER BY p.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [status, parseInt(limit as string), parseInt(offset as string)]
+    );
+
+    const countResult = await query(
+      `SELECT COUNT(DISTINCT id) as count FROM receiving_pallets WHERE status = $1`,
+      [status]
+    );
+
+    res.json({
+      pallets: result.rows,
+      total: parseInt(countResult.rows[0].count),
+      limit: parseInt(limit as string),
+      offset: parseInt(offset as string),
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch pallets' });
+  }
+});
+
+/** GET /api/receiving/pallets/:id — Get a specific pallet with items */
+router.get('/pallets/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const pallet = await query(
+      `SELECT p.*, 
+        COUNT(q.id) as item_count,
+        COALESCE(SUM(q.quantity), 0) as total_qty
+       FROM receiving_pallets p
+       LEFT JOIN requires_location_queue q ON q.pallet_id = p.id
+       WHERE p.id = $1
+       GROUP BY p.id`,
+      [req.params.id]
+    );
+
+    if (!pallet.rows[0]) return res.status(404).json({ error: 'Pallet not found' });
+
+    const items = await query(
+      `SELECT * FROM requires_location_queue WHERE pallet_id = $1 ORDER BY created_at ASC`,
+      [req.params.id]
+    );
+
+    res.json({
+      pallet: pallet.rows[0],
+      items: items.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch pallet' });
+  }
+});
+
+/** PATCH /api/receiving/pallets/:id/add-item — Add queue item to pallet */
+router.patch('/pallets/:id/add-item', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { queue_item_id } = req.body;
+    if (!queue_item_id) return res.status(400).json({ error: 'queue_item_id required' });
+
+    const pallet = await query(`SELECT * FROM receiving_pallets WHERE id = $1`, [req.params.id]);
+    if (!pallet.rows[0]) return res.status(404).json({ error: 'Pallet not found' });
+    if (pallet.rows[0].status !== 'OPEN') {
+      return res.status(400).json({ error: 'Can only add items to OPEN pallets' });
+    }
+
+    const queueItem = await query(
+      `SELECT * FROM requires_location_queue WHERE id = $1`,
+      [queue_item_id]
+    );
+    if (!queueItem.rows[0]) return res.status(404).json({ error: 'Queue item not found' });
+
+    // Update queue item with pallet_id
+    const updated = await query(
+      `UPDATE requires_location_queue 
+       SET pallet_id = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING *`,
+      [req.params.id, queue_item_id]
+    );
+
+    // Update pallet totals
+    const totals = await query(
+      `SELECT COUNT(*) as item_count, COALESCE(SUM(quantity), 0) as total_qty
+       FROM requires_location_queue WHERE pallet_id = $1`,
+      [req.params.id]
+    );
+
+    await query(
+      `UPDATE receiving_pallets 
+       SET total_items = $1, total_qty = $2, updated_at = NOW()
+       WHERE id = $3`,
+      [
+        parseInt(totals.rows[0].item_count),
+        parseInt(totals.rows[0].total_qty),
+        req.params.id,
+      ]
+    );
+
+    logger.info(`[pallet] Added item ${queueItem.rows[0].nw_code} to pallet ${pallet.rows[0].pallet_code}`);
+    res.json(updated.rows[0]);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`Failed to add item to pallet: ${errMsg}`);
+    res.status(500).json({ error: 'Failed to add item to pallet' });
+  }
+});
+
+/** PATCH /api/receiving/pallets/:id/complete — Mark pallet as completed */
+router.patch('/pallets/:id/complete', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const pallet = await query(
+      `SELECT * FROM receiving_pallets WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!pallet.rows[0]) return res.status(404).json({ error: 'Pallet not found' });
+    if (pallet.rows[0].status !== 'OPEN') {
+      return res.status(400).json({ error: 'Can only complete OPEN pallets' });
+    }
+
+    const result = await query(
+      `UPDATE receiving_pallets 
+       SET status = 'COMPLETED', completed_at = NOW(), updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [req.params.id]
+    );
+
+    const itemCount = result.rows[0].total_items;
+    const itemQty = result.rows[0].total_qty;
+    logger.info(`[pallet] Completed pallet ${pallet.rows[0].pallet_code} with ${itemCount} items (${itemQty} units)`);
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`Failed to complete pallet: ${errMsg}`);
+    res.status(500).json({ error: 'Failed to complete pallet' });
+  }
+});
+
+/** PATCH /api/receiving/pallets/:id/assign — Assign entire pallet to a bay */
+router.patch('/pallets/:id/assign', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { location_id } = req.body;
+    if (!location_id) return res.status(400).json({ error: 'location_id required' });
+
+    const pallet = await query(
+      `SELECT * FROM receiving_pallets WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!pallet.rows[0]) return res.status(404).json({ error: 'Pallet not found' });
+
+    const loc = await query(
+      `SELECT * FROM warehouse_locations WHERE id = $1 AND is_active = true`,
+      [location_id]
+    );
+    if (!loc.rows[0]) return res.status(404).json({ error: 'Location not found' });
+
+    // Assign all queue items in this pallet to the same location
+    await query(
+      `UPDATE requires_location_queue 
+       SET location_id = $1, status = 'ASSIGNED', assigned_at = NOW(), assigned_by = $2, updated_at = NOW()
+       WHERE pallet_id = $3`,
+      [location_id, (req as any).user?.email || 'warehouse', req.params.id]
+    );
+
+    // Update pallet status
+    const result = await query(
+      `UPDATE receiving_pallets 
+       SET location_id = $1, status = 'ASSIGNED', assigned_at = NOW(), assigned_by = $2, updated_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [location_id, (req as any).user?.email || 'warehouse', req.params.id]
+    );
+
+    logger.info(`[pallet] Assigned pallet ${pallet.rows[0].pallet_code} to location ${loc.rows[0].location_code}`);
+    res.json(result.rows[0]);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`Failed to assign pallet: ${errMsg}`);
+    res.status(500).json({ error: 'Failed to assign pallet' });
+  }
+});
+
+/** POST /api/receiving/pallets/:id/stock — Stock entire pallet to warehouse_inventory */
+router.post('/pallets/:id/stock', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const pallet = await query(
+      `SELECT * FROM receiving_pallets WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!pallet.rows[0]) return res.status(404).json({ error: 'Pallet not found' });
+    if (!pallet.rows[0].location_id) {
+      return res.status(400).json({ error: 'Pallet must be assigned to a location first' });
+    }
+
+    // Get all items in this pallet
+    const items = await query(
+      `SELECT * FROM requires_location_queue WHERE pallet_id = $1`,
+      [req.params.id]
+    );
+
+    const defaultLiability = await getDefaultLiabilityStatus();
+    let stocked = 0;
+    const syncedSkus = new Set<string>();
+
+    logger.info(`[pallet] Stocking pallet ${pallet.rows[0].pallet_code} with ${items.rows.length} items...`);
+
+    for (const item of items.rows) {
+      const sku = item.medusa_sku || item.nw_code;
+      const productDetails = await getProductDetails(sku);
+      const productDisplay = productDetails ? `${productDetails.name} (${productDetails.dimensions || 'n/a'})` : sku;
+
+      // Insert into warehouse_inventory
+      await query(
+        `INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+         ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
+         DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()`,
+        [
+          pallet.rows[0].location_id,
+          sku,
+          item.colour || '',
+          item.quantity,
+          defaultLiability,
+        ]
+      );
+
+      // Mark queue item as stocked
+      await query(
+        `UPDATE requires_location_queue SET status = 'STOCKED', stocked_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        [item.id]
+      );
+
+      syncedSkus.add(sku);
+      stocked++;
+      logger.info(`  ✓ ${item.quantity}x ${productDisplay}`);
+    }
+
+    // Push updated totals for all SKUs to Medusa
+    const syncErrors: string[] = [];
+    logger.info(`[pallet] Syncing ${syncedSkus.size} unique SKUs to Medusa...`);
+
+    for (const sku of syncedSkus) {
+      const totalResult = await query(
+        `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
+        [sku]
+      );
+      const newTotal = Math.max(
+        0,
+        parseInt(totalResult.rows[0]?.qty ?? '0') - parseInt(totalResult.rows[0]?.reserved ?? '0')
+      );
+      const syncResult = await syncSkuToMedusa(sku, newTotal);
+      if (!syncResult.ok) {
+        const errMsg = `${sku}: ${syncResult.error}`;
+        syncErrors.push(errMsg);
+        logger.error(`[pallet] Medusa sync failed: ${errMsg}`);
+      } else {
+        logger.info(`[pallet] ✓ Medusa sync: ${sku} → ${newTotal} units`);
+      }
+    }
+
+    const unblocked = await unblockBackorderedPickLists([...syncedSkus]);
+    if (unblocked && unblocked.length > 0) {
+      logger.info(`[pallet] Unblocked ${unblocked.length} pick lists`);
+    }
+
+    // Mark pallet as stocked
+    await query(
+      `UPDATE receiving_pallets SET status = 'STOCKED', stocked_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [req.params.id]
+    );
+
+    res.json({
+      success: true,
+      pallet_code: pallet.rows[0].pallet_code,
+      stocked,
+      medusa_synced: syncedSkus.size - syncErrors.length,
+      sync_errors: syncErrors.length,
+      unblocked_pick_lists: unblocked,
+    });
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`[pallet] Failed to stock pallet: ${errMsg}`);
+    res.status(500).json({ error: 'Failed to stock pallet' });
+  }
+});
 
 // ================================================================================
 // PHASE 4: DISCREPANCIES
@@ -536,5 +873,219 @@ router.get('/audit/summary', authMiddleware, async (req: AuthRequest, res: Respo
   }
 });
 
+// ================================================================================
+// PHASE 5.5: NEW PALLET OPERATIONS (Pallet-focused scanning workflow)
+// ================================================================================
+
+/** GET /api/receiving/pallets/number/:number — Get pallet by auto-incremented number */
+router.get('/pallets/number/:number', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const pallet = await query(
+      `SELECT p.*, 
+        COUNT(q.id) as item_count,
+        COALESCE(SUM(q.quantity), 0) as total_qty
+       FROM receiving_pallets p
+       LEFT JOIN requires_location_queue q ON q.pallet_id = p.id
+       WHERE p.pallet_number = $1
+       GROUP BY p.id`,
+      [parseInt(req.params.number)]
+    );
+
+    if (!pallet.rows[0]) return res.status(404).json({ error: `Pallet #${req.params.number} not found` });
+
+    const items = await query(
+      `SELECT * FROM requires_location_queue WHERE pallet_id = $1 ORDER BY created_at ASC`,
+      [pallet.rows[0].id]
+    );
+
+    res.json({
+      pallet: pallet.rows[0],
+      items: items.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch pallet' });
+  }
+});
+
+/** POST /api/receiving/pallets/:id/add-queue-item — Create queue item and add to pallet */
+router.post('/pallets/:id/add-queue-item', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { nw_code, colour, quantity, session_id, order_id } = req.body;
+    if (!nw_code || !quantity) {
+      return res.status(400).json({ error: 'nw_code and quantity required' });
+    }
+
+    const pallet = await query(`SELECT * FROM receiving_pallets WHERE id = $1`, [req.params.id]);
+    if (!pallet.rows[0]) return res.status(404).json({ error: 'Pallet not found' });
+    if (pallet.rows[0].status !== 'OPEN') {
+      return res.status(400).json({ error: 'Can only add items to OPEN pallets' });
+    }
+
+    // Create queue item
+    const queueItem = await query(
+      `INSERT INTO requires_location_queue 
+       (nw_code, colour, quantity, pallet_id, session_id, order_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+       RETURNING *`,
+      [nw_code, colour || null, quantity, req.params.id, session_id || null, order_id || null]
+    );
+
+    // Update pallet totals
+    const totals = await query(
+      `SELECT COUNT(*) as item_count, COALESCE(SUM(quantity), 0) as total_qty
+       FROM requires_location_queue WHERE pallet_id = $1`,
+      [req.params.id]
+    );
+
+    await query(
+      `UPDATE receiving_pallets 
+       SET total_items = $1, total_qty = $2, updated_at = NOW()
+       WHERE id = $3`,
+      [
+        parseInt(totals.rows[0].item_count),
+        parseInt(totals.rows[0].total_qty),
+        req.params.id,
+      ]
+    );
+
+    logger.info(`[pallet] Added ${nw_code} (qty: ${quantity}) to pallet #${pallet.rows[0].pallet_number}`);
+    res.status(201).json(queueItem.rows[0]);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`Failed to add queue item to pallet: ${errMsg}`);
+    res.status(500).json({ error: 'Failed to add item to pallet' });
+  }
+});
+
+/** PATCH /api/receiving/queue/:id/move-to-pallet/:pallet_number — Move item to a pallet */
+router.patch('/queue/:id/move-to-pallet/:pallet_number', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const queueItem = await query(
+      `SELECT * FROM requires_location_queue WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!queueItem.rows[0]) return res.status(404).json({ error: 'Queue item not found' });
+
+    const pallet = await query(
+      `SELECT * FROM receiving_pallets WHERE pallet_number = $1`,
+      [parseInt(req.params.pallet_number)]
+    );
+    if (!pallet.rows[0]) return res.status(404).json({ error: `Pallet #${req.params.pallet_number} not found` });
+    if (pallet.rows[0].status !== 'OPEN') {
+      return res.status(400).json({ error: 'Can only add items to OPEN pallets' });
+    }
+
+    // Move item to new pallet
+    const updated = await query(
+      `UPDATE requires_location_queue 
+       SET pallet_id = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING *`,
+      [pallet.rows[0].id, req.params.id]
+    );
+
+    // Update totals for OLD pallet (if it had one)
+    if (queueItem.rows[0].pallet_id) {
+      const oldTotals = await query(
+        `SELECT COUNT(*) as item_count, COALESCE(SUM(quantity), 0) as total_qty
+         FROM requires_location_queue WHERE pallet_id = $1`,
+        [queueItem.rows[0].pallet_id]
+      );
+
+      await query(
+        `UPDATE receiving_pallets 
+         SET total_items = $1, total_qty = $2, updated_at = NOW()
+         WHERE id = $3`,
+        [
+          parseInt(oldTotals.rows[0].item_count),
+          parseInt(oldTotals.rows[0].total_qty),
+          queueItem.rows[0].pallet_id,
+        ]
+      );
+    }
+
+    // Update totals for NEW pallet
+    const newTotals = await query(
+      `SELECT COUNT(*) as item_count, COALESCE(SUM(quantity), 0) as total_qty
+       FROM requires_location_queue WHERE pallet_id = $1`,
+      [pallet.rows[0].id]
+    );
+
+    await query(
+      `UPDATE receiving_pallets 
+       SET total_items = $1, total_qty = $2, updated_at = NOW()
+       WHERE id = $3`,
+      [
+        parseInt(newTotals.rows[0].item_count),
+        parseInt(newTotals.rows[0].total_qty),
+        pallet.rows[0].id,
+      ]
+    );
+
+    logger.info(`[pallet] Moved ${queueItem.rows[0].nw_code} to pallet #${pallet.rows[0].pallet_number}`);
+    res.json(updated.rows[0]);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`Failed to move item to pallet: ${errMsg}`);
+    res.status(500).json({ error: 'Failed to move item to pallet' });
+  }
+});
+
+/** PATCH /api/receiving/queue/:id/move-to-bay — Move item directly to bay (remove from pallet if any) */
+router.patch('/queue/:id/move-to-bay', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { location_id } = req.body;
+    if (!location_id) return res.status(400).json({ error: 'location_id required' });
+
+    const queueItem = await query(
+      `SELECT * FROM requires_location_queue WHERE id = $1`,
+      [req.params.id]
+    );
+    if (!queueItem.rows[0]) return res.status(404).json({ error: 'Queue item not found' });
+
+    const loc = await query(
+      `SELECT * FROM warehouse_locations WHERE id = $1 AND is_active = true`,
+      [location_id]
+    );
+    if (!loc.rows[0]) return res.status(404).json({ error: 'Location not found' });
+
+    // Move to bay
+    const updated = await query(
+      `UPDATE requires_location_queue 
+       SET location_id = $1, status = 'ASSIGNED', pallet_id = NULL, 
+           assigned_at = NOW(), assigned_by = $2, updated_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [location_id, (req as any).user?.email || 'warehouse', req.params.id]
+    );
+
+    // Update pallet totals if item was in one
+    if (queueItem.rows[0].pallet_id) {
+      const totals = await query(
+        `SELECT COUNT(*) as item_count, COALESCE(SUM(quantity), 0) as total_qty
+         FROM requires_location_queue WHERE pallet_id = $1`,
+        [queueItem.rows[0].pallet_id]
+      );
+
+      await query(
+        `UPDATE receiving_pallets 
+         SET total_items = $1, total_qty = $2, updated_at = NOW()
+         WHERE id = $3`,
+        [
+          parseInt(totals.rows[0].item_count),
+          parseInt(totals.rows[0].total_qty),
+          queueItem.rows[0].pallet_id,
+        ]
+      );
+    }
+
+    logger.info(`[pallet] Moved ${queueItem.rows[0].nw_code} to bay ${loc.rows[0].location_code} (removed from pallet)`);
+    res.json(updated.rows[0]);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`Failed to move item to bay: ${errMsg}`);
+    res.status(500).json({ error: 'Failed to move item to bay' });
+  }
+});
 
 export default router;

@@ -647,12 +647,37 @@ VALUES
 ON CONFLICT (code) DO NOTHING;
 
 -- ================================================================================
+-- RECEIVING PALLETS (Phase 5.5: Grouping multiple items into a pallet)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS receiving_pallets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  pallet_number SERIAL UNIQUE,
+  pallet_code VARCHAR(50) NOT NULL UNIQUE,
+  session_id UUID REFERENCES checkin_sessions(id) ON DELETE SET NULL,
+  order_id UUID REFERENCES supplier_orders(id) ON DELETE SET NULL,
+  status TEXT CHECK (status IN ('OPEN', 'COMPLETED', 'ASSIGNED', 'STOCKED')) DEFAULT 'OPEN',
+  location_id UUID REFERENCES warehouse_locations(id) ON DELETE SET NULL,
+  total_items INT NOT NULL DEFAULT 0,
+  total_qty INT NOT NULL DEFAULT 0,
+  assigned_by VARCHAR,
+  assigned_at TIMESTAMP,
+  stocked_at TIMESTAMP,
+  completed_at TIMESTAMP,
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+-- Add pallet_number to existing installations (sequences will auto-continue)
+ALTER TABLE receiving_pallets ADD COLUMN IF NOT EXISTS pallet_number SERIAL UNIQUE;
+
+-- ================================================================================
 -- REQUIRES LOCATION QUEUE (Phase 5: Items checked in, awaiting bay assignment)
 -- ================================================================================
 CREATE TABLE IF NOT EXISTS requires_location_queue (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   session_id UUID REFERENCES checkin_sessions(id) ON DELETE SET NULL,
   order_id UUID REFERENCES supplier_orders(id) ON DELETE SET NULL,
+  pallet_id UUID REFERENCES receiving_pallets(id) ON DELETE CASCADE,
   nw_code VARCHAR NOT NULL,
   colour VARCHAR,
   medusa_sku VARCHAR,
@@ -666,6 +691,9 @@ CREATE TABLE IF NOT EXISTS requires_location_queue (
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
+
+-- Add pallet_id to existing requires_location_queue (safe for existing installations)
+ALTER TABLE requires_location_queue ADD COLUMN IF NOT EXISTS pallet_id UUID REFERENCES receiving_pallets(id) ON DELETE CASCADE;
 
 -- ================================================================================
 -- CHECKIN SESSIONS (Phase 3: Receiving sessions when stock arrives)
@@ -839,8 +867,12 @@ CREATE INDEX IF NOT EXISTS idx_checkin_sessions_order ON checkin_sessions(order_
 CREATE INDEX IF NOT EXISTS idx_checkin_sessions_status ON checkin_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_checkin_items_session ON checkin_items(session_id);
 CREATE INDEX IF NOT EXISTS idx_checkin_discrepancies_session ON checkin_discrepancies(session_id);
+CREATE INDEX IF NOT EXISTS idx_receiving_pallets_session ON receiving_pallets(session_id);
+CREATE INDEX IF NOT EXISTS idx_receiving_pallets_status ON receiving_pallets(status);
+CREATE INDEX IF NOT EXISTS idx_receiving_pallets_order ON receiving_pallets(order_id);
 CREATE INDEX IF NOT EXISTS idx_requires_location_session ON requires_location_queue(session_id);
 CREATE INDEX IF NOT EXISTS idx_requires_location_status ON requires_location_queue(status);
+CREATE INDEX IF NOT EXISTS idx_requires_location_pallet ON requires_location_queue(pallet_id);
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
