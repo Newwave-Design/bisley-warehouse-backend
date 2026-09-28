@@ -721,8 +721,11 @@ CREATE TABLE IF NOT EXISTS checkin_items (
   quantity_scanned INT NOT NULL DEFAULT 1,
   notes TEXT,
   scanned_at TIMESTAMP DEFAULT NOW(),
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
 );
+-- Add updated_at to existing installations
+ALTER TABLE checkin_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 
 -- ================================================================================
 -- CHECKIN DISCREPANCIES (Phase 3: Auto-flagged mismatches vs order)
