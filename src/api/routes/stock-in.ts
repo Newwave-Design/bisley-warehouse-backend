@@ -111,12 +111,12 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
         ci.quantity_scanned,
         ci.scanned_at,
         ci.created_at,
-        COALESCE(wp.product_title, bm.product_name, 'Unknown') as product_name,
+        COALESCE(bm.product_name, wp.product_title, 'Unknown') as product_name,
         COALESCE(bm.colour_code, wp.colour_code, '') as colour_code,
         COALESCE(bm.colour_name, wp.colour_name, ci.colour) as colour_name
        FROM checkin_items ci
-       LEFT JOIN wms_products wp ON wp.nw_code = ci.nw_code AND wp.colour_code = ci.colour
-       LEFT JOIN barcode_mappings bm ON bm.product_sku = ci.nw_code AND LOWER(bm.colour_name) = LOWER(ci.colour)
+       LEFT JOIN barcode_mappings bm ON bm.product_sku = ci.nw_code AND bm.is_active = true
+       LEFT JOIN wms_products wp ON wp.nw_code = ci.nw_code 
        WHERE ci.session_id = $1 
        ORDER BY ci.created_at DESC`,
       [req.params.id]
