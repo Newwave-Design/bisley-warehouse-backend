@@ -244,8 +244,9 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
       },
     });
   } catch (err) {
-    logger.error(`Scan failed: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
-    res.status(500).json({ error: 'Scan failed' });
+    const errorMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`Scan failed: ${errorMsg}`);
+    res.status(500).json({ error: `Scan failed: ${errorMsg}` });
   }
 });
 
