@@ -34,6 +34,7 @@ import groupsRoutes from './api/routes/groups.js';
 import queriesRoutes from './api/routes/queries.js';
 import returnsRoutes from './api/routes/returns.js';
 import stockInRoutes from './api/routes/stock-in.js';
+import barcodeTestRoutes from './api/routes/barcode-test.js';
 import shippingOptionsRoutes from './routes/shipping-options.js';
 import { createNotificationOnce } from './lib/notifications.js';
 import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
@@ -106,6 +107,7 @@ app.use('/api/users', usersRoutes);
 app.use('/api/groups', groupsRoutes);
 app.use('/api/queries', queriesRoutes);
 app.use('/api/returns', returnsRoutes);
+app.use('/api/barcode-test', barcodeTestRoutes);
 app.use('/api', shippingOptionsRoutes);
 
 // 404 handler
