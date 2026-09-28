@@ -23,7 +23,8 @@ router.use(authMiddleware);
  */
 router.get('/samples', async (req: AuthRequest, res: Response) => {
   try {
-    // Query real barcodes, grouped by product range, varying colours
+    // Query real barcodes from published products only
+    // Only select barcodes that have matching products in wms_products (curated published list)
     const result = await query(
       `SELECT DISTINCT ON (bm.product_sku)
         bm.barcode,
@@ -34,11 +35,11 @@ router.get('/samples', async (req: AuthRequest, res: Response) => {
         wp.variant_thumbnail,
         SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN bm.product_sku) - 1) as product_range
       FROM barcode_mappings bm
-      LEFT JOIN wms_products wp ON wp.variant_sku = bm.product_sku
+      INNER JOIN wms_products wp ON wp.variant_sku = bm.product_sku
       WHERE bm.is_active = true
-        AND bm.is_published = true
         AND bm.barcode IS NOT NULL
         AND bm.barcode <> ''
+        AND wp.is_archived = false
       ORDER BY bm.product_sku, bm.barcode
       LIMIT 50`
     );
@@ -86,7 +87,7 @@ router.get('/samples', async (req: AuthRequest, res: Response) => {
  */
 router.get('/balanced', async (req: AuthRequest, res: Response) => {
   try {
-    // Strategy: Pick 12 distinct SKU prefixes, then get 2-4 colour variants of each
+    // Strategy: Pick 12 distinct SKU prefixes from published products, then get 2-4 colour variants
     const result = await query(
       `WITH product_ranges AS (
         SELECT DISTINCT 
@@ -109,9 +110,9 @@ router.get('/balanced', async (req: AuthRequest, res: Response) => {
             ORDER BY bm.barcode
           ) as colour_order
         FROM barcode_mappings bm
-        LEFT JOIN wms_products wp ON wp.variant_sku = bm.product_sku
+        INNER JOIN wms_products wp ON wp.variant_sku = bm.product_sku
         WHERE bm.is_active = true
-          AND bm.is_published = true
+          AND wp.is_archived = false
           AND SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN bm.product_sku) - 1) IN (
             SELECT range_code FROM product_ranges
           )
