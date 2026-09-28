@@ -561,7 +561,7 @@ async function runSyncJob() {
         const { product, v } = row;
         valuePlaceholders.push(`($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`);
         params.push(
-          v.sku, v.sku, v.colour_code, v.colour_name, product.title,
+          v.barcode, v.sku, v.colour_code, v.colour_name, product.title,
           v.thumbnail ?? product.thumbnail, product.id, v.id
         );
       }
