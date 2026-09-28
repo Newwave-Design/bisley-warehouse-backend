@@ -24,7 +24,6 @@ router.use(authMiddleware);
 router.get('/samples', async (req: AuthRequest, res: Response) => {
   try {
     // Query real barcodes from published products only
-    // Only select barcodes that have matching products in wms_products (curated published list)
     const result = await query(
       `SELECT 
         bm.barcode,
