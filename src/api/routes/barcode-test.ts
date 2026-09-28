@@ -36,6 +36,7 @@ router.get('/samples', async (req: AuthRequest, res: Response) => {
       FROM barcode_mappings bm
       LEFT JOIN wms_products wp ON wp.variant_sku = bm.product_sku
       WHERE bm.is_active = true
+        AND bm.is_published = true
         AND bm.barcode IS NOT NULL
         AND bm.barcode <> ''
       ORDER BY bm.product_sku, bm.barcode
@@ -110,6 +111,7 @@ router.get('/balanced', async (req: AuthRequest, res: Response) => {
         FROM barcode_mappings bm
         LEFT JOIN wms_products wp ON wp.variant_sku = bm.product_sku
         WHERE bm.is_active = true
+          AND bm.is_published = true
           AND SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN bm.product_sku) - 1) IN (
             SELECT range_code FROM product_ranges
           )
