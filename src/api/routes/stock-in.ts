@@ -354,33 +354,15 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
       logger.info(`  ✓ Stocked ${item.quantity_scanned}x ${productDisplay}`);
     }
 
-    // Sync all unique SKUs to Medusa
-    logger.info(`[stock-in] Syncing ${syncedSkus.size} unique SKUs to Medusa...`);
-
-    for (const sku of syncedSkus) {
-      const totalResult = await query(
-        `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
-        [sku]
-      );
-      const newTotal = Math.max(
-        0,
-        parseInt(totalResult.rows[0]?.qty ?? '0') - parseInt(totalResult.rows[0]?.reserved ?? '0')
-      );
-      const syncResult = await syncSkuToMedusa(sku, newTotal);
-      if (!syncResult.ok) {
-        const errMsg = `${sku}: ${syncResult.error}`;
-        syncErrors.push(errMsg);
-        logger.error(`[stock-in] Medusa sync failed: ${errMsg}`);
-      } else {
-        logger.info(`[stock-in] ✓ Medusa synced: ${sku} → ${newTotal} units`);
-      }
-    }
-
     // Unblock any backorder pick lists that can now be fulfilled
     const unblocked = await unblockBackorderedPickLists([...syncedSkus]);
     if (unblocked && unblocked.length > 0) {
       logger.info(`[stock-in] Unblocked ${unblocked.length} pick lists`);
     }
+
+    // Note: Do NOT sync to Medusa here. Stock-in is a warehouse operation only.
+    // Medusa inventory changes only during fulfillment (when orders ship), not arrival.
+    logger.info(`[stock-in] Stocked ${stocked} items to warehouse_inventory. Medusa inventory unchanged.`);
 
     // Mark session complete
     await query(
@@ -393,10 +375,8 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
       session_id: req.params.id,
       items_stocked: stocked,
       unique_skus: syncedSkus.size,
-      medusa_synced: syncedSkus.size - syncErrors.length,
-      sync_errors: syncErrors.length,
-      error_details: syncErrors.length > 0 ? syncErrors : undefined,
       unblocked_pick_lists: unblocked?.length ?? 0,
+      note: 'Medusa inventory is NOT changed by stock-in. It only changes during fulfillment/shipment.',
     });
   } catch (err) {
     logger.error(`Confirm failed: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
