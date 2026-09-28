@@ -100,8 +100,25 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
 
     if (!session.rows[0]) return res.status(404).json({ error: 'Session not found' });
 
+    // Get enriched items with product details
     const items = await query(
-      `SELECT * FROM checkin_items WHERE session_id = $1 ORDER BY created_at DESC`,
+      `SELECT 
+        ci.id,
+        ci.session_id,
+        ci.nw_code as product_sku,
+        ci.colour,
+        ci.medusa_sku,
+        ci.quantity_scanned,
+        ci.scanned_at,
+        ci.created_at,
+        COALESCE(wp.product_title, bm.product_name, 'Unknown') as product_name,
+        COALESCE(bm.colour_code, wp.colour_code, '') as colour_code,
+        COALESCE(bm.colour_name, wp.colour_name, ci.colour) as colour_name
+       FROM checkin_items ci
+       LEFT JOIN wms_products wp ON wp.nw_code = ci.nw_code AND wp.colour_code = ci.colour
+       LEFT JOIN barcode_mappings bm ON bm.product_sku = ci.nw_code AND LOWER(bm.colour_name) = LOWER(ci.colour)
+       WHERE ci.session_id = $1 
+       ORDER BY ci.created_at DESC`,
       [req.params.id]
     );
 
@@ -218,9 +235,13 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
 
     res.json({
       success: true,
-      item,
-      product_name: productInfo.product_name,
-      colour_found: productInfo.colour_name || colour_used,
+      item: {
+        ...item,
+        product_sku: item.nw_code,
+        product_name: productInfo.product_name,
+        colour_name: productInfo.colour_name || colour_used,
+        colour_code: productInfo.colour_code || '',
+      },
     });
   } catch (err) {
     logger.error(`Scan failed: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
