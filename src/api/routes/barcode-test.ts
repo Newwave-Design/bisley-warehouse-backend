@@ -23,7 +23,8 @@ router.use(authMiddleware);
  */
 router.get('/samples', async (req: AuthRequest, res: Response) => {
   try {
-    // Query real barcodes from published products only
+    // Query real barcodes with published product details
+    // If wms_products has matching data, include it; otherwise return barcode_mappings directly
     const result = await query(
       `SELECT 
         bm.barcode,
@@ -31,14 +32,13 @@ router.get('/samples', async (req: AuthRequest, res: Response) => {
         bm.colour_code,
         bm.colour_name,
         bm.product_name,
-        wp.variant_thumbnail,
-        SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN bm.product_sku) - 1) as product_range
+        COALESCE(wp.variant_thumbnail, bm.thumbnail_url) as variant_thumbnail,
+        SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN COALESCE(bm.product_sku, '')) - 1) as product_range
       FROM barcode_mappings bm
-      INNER JOIN wms_products wp ON wp.variant_sku = bm.product_sku
+      LEFT JOIN wms_products wp ON wp.variant_sku = bm.product_sku
       WHERE bm.is_active = true
         AND bm.barcode IS NOT NULL
         AND bm.barcode <> ''
-        AND wp.is_archived = false
       ORDER BY bm.product_sku, bm.colour_name
       LIMIT 50`
     );
@@ -86,14 +86,18 @@ router.get('/samples', async (req: AuthRequest, res: Response) => {
  */
 router.get('/balanced', async (req: AuthRequest, res: Response) => {
   try {
-    // Strategy: Pick 12 distinct SKU prefixes from published products, then get 2-4 colour variants
+    // Strategy: Get top product ranges by barcode count, then 2-4 colour variants per range
     const result = await query(
-      `WITH product_ranges AS (
-        SELECT DISTINCT 
-          SUBSTRING(variant_sku FROM 1 FOR POSITION('-' IN variant_sku) - 1) as range_code
-        FROM wms_products
-        WHERE is_archived = false
-        ORDER BY range_code
+      `WITH range_counts AS (
+        SELECT 
+          SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN COALESCE(bm.product_sku, '')) - 1) as range_code,
+          COUNT(*) as barcode_count
+        FROM barcode_mappings bm
+        WHERE bm.is_active = true
+          AND bm.barcode IS NOT NULL
+          AND bm.barcode <> ''
+        GROUP BY range_code
+        ORDER BY barcode_count DESC
         LIMIT 12
       ),
       barcode_with_ranges AS (
@@ -103,18 +107,17 @@ router.get('/balanced', async (req: AuthRequest, res: Response) => {
           bm.colour_code,
           bm.colour_name,
           bm.product_name,
-          wp.variant_thumbnail,
-          SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN bm.product_sku) - 1) as product_range,
+          COALESCE(wp.variant_thumbnail, bm.thumbnail_url) as variant_thumbnail,
+          SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN COALESCE(bm.product_sku, '')) - 1) as product_range,
           ROW_NUMBER() OVER (
-            PARTITION BY SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN bm.product_sku) - 1)
+            PARTITION BY SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN COALESCE(bm.product_sku, '')) - 1)
             ORDER BY bm.product_sku ASC
           ) as colour_order
         FROM barcode_mappings bm
-        INNER JOIN wms_products wp ON wp.variant_sku = bm.product_sku
+        LEFT JOIN wms_products wp ON wp.variant_sku = bm.product_sku
         WHERE bm.is_active = true
           AND bm.barcode IS NOT NULL
           AND bm.barcode <> ''
-          AND wp.is_archived = false
       )
       SELECT 
         barcode,
@@ -126,7 +129,7 @@ router.get('/balanced', async (req: AuthRequest, res: Response) => {
         product_range,
         colour_order
       FROM barcode_with_ranges
-      WHERE product_range IN (SELECT range_code FROM product_ranges)
+      WHERE product_range IN (SELECT range_code FROM range_counts)
         AND colour_order <= 4
       ORDER BY product_range ASC, colour_order ASC`
     );
