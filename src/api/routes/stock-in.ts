@@ -101,8 +101,9 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
     if (!session.rows[0]) return res.status(404).json({ error: 'Session not found' });
 
     // Get enriched items with product details
+    // DISTINCT ON (ci.id) prevents duplicate rows if barcode_mappings or wms_products has multiple entries per SKU
     const items = await query(
-      `SELECT 
+      `SELECT DISTINCT ON (ci.id)
         ci.id,
         ci.session_id,
         ci.nw_code as product_sku,
@@ -118,7 +119,7 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
        LEFT JOIN barcode_mappings bm ON bm.product_sku = ci.nw_code AND bm.is_active = true
        LEFT JOIN wms_products wp ON wp.nw_code = ci.nw_code 
        WHERE ci.session_id = $1 
-       ORDER BY ci.created_at DESC`,
+       ORDER BY ci.id, ci.created_at DESC`,
       [req.params.id]
     );
 
