@@ -5,11 +5,13 @@
  * Returns barcodes grouped by product range, with colour and SKU info.
  */
 
-import { Router } from 'express';
-import { query } from '@/db/client';
-import { authMiddleware, requirePermission } from '@/middleware/auth';
+import express, { Response } from 'express';
+import { query } from '../../db/index.js';
+import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { getLogger } from '../../lib/logger.js';
 
-const router = Router();
+const router = express.Router();
+const logger = getLogger('barcode-test');
 
 router.use(authMiddleware);
 
@@ -19,19 +21,17 @@ router.use(authMiddleware);
  * Returns ~50 sample barcodes from real products, grouped by range.
  * Includes: barcode, product SKU, colour code, colour name, product name
  */
-router.get('/samples', async (req, res) => {
+router.get('/samples', async (req: AuthRequest, res: Response) => {
   try {
     // Query real barcodes, grouped by product range, varying colours
-    // Select diverse product types and colours for comprehensive testing
-    const barcodes = await query`
-      SELECT DISTINCT ON (bm.product_sku)
+    const result = await query(
+      `SELECT DISTINCT ON (bm.product_sku)
         bm.barcode,
         bm.product_sku,
         bm.colour_code,
         bm.colour_name,
         bm.product_name,
         wp.variant_thumbnail,
-        -- Extract product range prefix (e.g., "046P" from "046P-av1")
         SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN bm.product_sku) - 1) as product_range
       FROM barcode_mappings bm
       LEFT JOIN wms_products wp ON wp.variant_sku = bm.product_sku
@@ -39,8 +39,10 @@ router.get('/samples', async (req, res) => {
         AND bm.barcode IS NOT NULL
         AND bm.barcode <> ''
       ORDER BY bm.product_sku, bm.barcode
-      LIMIT 50
-    `;
+      LIMIT 50`
+    );
+
+    const barcodes = result.rows;
 
     if (barcodes.length === 0) {
       return res.json({ 
@@ -66,9 +68,9 @@ router.get('/samples', async (req, res) => {
       groups: Object.keys(grouped).length
     });
   } catch (err: any) {
-    console.error('Barcode test query failed:', err);
+    logger.error(`Barcode test query failed: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
     res.status(500).json({ 
-      error: err.message || 'Failed to fetch barcode samples'
+      error: 'Failed to fetch barcode samples'
     });
   }
 });
@@ -81,11 +83,11 @@ router.get('/samples', async (req, res) => {
  * - Varied colours per range (e.g., black, white, blue, custom)
  * - Balanced representation across product categories
  */
-router.get('/balanced', async (req, res) => {
+router.get('/balanced', async (req: AuthRequest, res: Response) => {
   try {
-    // Strategy: Pick 2-4 distinct SKU prefixes, then get 2-3 colour variants of each
-    const query1 = await query`
-      WITH product_ranges AS (
+    // Strategy: Pick 12 distinct SKU prefixes, then get 2-4 colour variants of each
+    const result = await query(
+      `WITH product_ranges AS (
         SELECT DISTINCT 
           SUBSTRING(product_sku FROM 1 FOR POSITION('-' IN product_sku) - 1) as range_code
         FROM wms_products
@@ -114,10 +116,12 @@ router.get('/balanced', async (req, res) => {
       )
       SELECT * FROM colour_samples
       WHERE colour_order <= 4
-      ORDER BY product_range, colour_order
-    `;
+      ORDER BY product_range, colour_order`
+    );
 
-    if (query1.length === 0) {
+    const samples = result.rows;
+
+    if (samples.length === 0) {
       return res.json({ 
         samples: [],
         grouped: {},
@@ -126,23 +130,23 @@ router.get('/balanced', async (req, res) => {
     }
 
     // Group by product range
-    const grouped: Record<string, typeof query1> = {};
-    query1.forEach(item => {
+    const grouped: Record<string, typeof samples> = {};
+    samples.forEach(item => {
       const range = item.product_range || 'Unknown';
       if (!grouped[range]) grouped[range] = [];
       grouped[range].push(item);
     });
 
     res.json({
-      samples: query1,
+      samples,
       grouped,
-      count: query1.length,
+      count: samples.length,
       groups: Object.keys(grouped).length
     });
   } catch (err: any) {
-    console.error('Balanced barcode query failed:', err);
+    logger.error(`Balanced barcode query failed: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
     res.status(500).json({ 
-      error: err.message || 'Failed to fetch balanced barcode samples'
+      error: 'Failed to fetch balanced barcode samples'
     });
   }
 });
