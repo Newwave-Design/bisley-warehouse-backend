@@ -26,7 +26,7 @@ router.get('/samples', async (req: AuthRequest, res: Response) => {
     // Query real barcodes from published products only
     // Only select barcodes that have matching products in wms_products (curated published list)
     const result = await query(
-      `SELECT DISTINCT ON (bm.product_sku)
+      `SELECT 
         bm.barcode,
         bm.product_sku,
         bm.colour_code,
@@ -40,7 +40,7 @@ router.get('/samples', async (req: AuthRequest, res: Response) => {
         AND bm.barcode IS NOT NULL
         AND bm.barcode <> ''
         AND wp.is_archived = false
-      ORDER BY bm.product_sku, bm.barcode
+      ORDER BY bm.product_sku, bm.colour_name
       LIMIT 50`
     );
 
@@ -91,13 +91,14 @@ router.get('/balanced', async (req: AuthRequest, res: Response) => {
     const result = await query(
       `WITH product_ranges AS (
         SELECT DISTINCT 
-          SUBSTRING(product_sku FROM 1 FOR POSITION('-' IN product_sku) - 1) as range_code
+          SUBSTRING(variant_sku FROM 1 FOR POSITION('-' IN variant_sku) - 1) as range_code
         FROM wms_products
         WHERE is_archived = false
+        ORDER BY range_code
         LIMIT 12
       ),
-      colour_samples AS (
-        SELECT DISTINCT ON (wp.product_sku)
+      barcode_with_ranges AS (
+        SELECT 
           bm.barcode,
           bm.product_sku,
           bm.colour_code,
@@ -107,19 +108,28 @@ router.get('/balanced', async (req: AuthRequest, res: Response) => {
           SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN bm.product_sku) - 1) as product_range,
           ROW_NUMBER() OVER (
             PARTITION BY SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN bm.product_sku) - 1)
-            ORDER BY bm.barcode
+            ORDER BY bm.product_sku ASC
           ) as colour_order
         FROM barcode_mappings bm
         INNER JOIN wms_products wp ON wp.variant_sku = bm.product_sku
         WHERE bm.is_active = true
+          AND bm.barcode IS NOT NULL
+          AND bm.barcode <> ''
           AND wp.is_archived = false
-          AND SUBSTRING(bm.product_sku FROM 1 FOR POSITION('-' IN bm.product_sku) - 1) IN (
-            SELECT range_code FROM product_ranges
-          )
       )
-      SELECT * FROM colour_samples
-      WHERE colour_order <= 4
-      ORDER BY product_range, colour_order`
+      SELECT 
+        barcode,
+        product_sku,
+        colour_code,
+        colour_name,
+        product_name,
+        variant_thumbnail,
+        product_range,
+        colour_order
+      FROM barcode_with_ranges
+      WHERE product_range IN (SELECT range_code FROM product_ranges)
+        AND colour_order <= 4
+      ORDER BY product_range ASC, colour_order ASC`
     );
 
     const samples = result.rows;
