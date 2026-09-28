@@ -360,9 +360,12 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
       logger.info(`[stock-in] Unblocked ${unblocked.length} pick lists`);
     }
 
-    // Note: Do NOT sync to Medusa here. Stock-in is a warehouse operation only.
-    // Medusa inventory changes only during fulfillment (when orders ship), not arrival.
-    logger.info(`[stock-in] Stocked ${stocked} items to warehouse_inventory. Medusa inventory unchanged.`);
+    // TODO: MEDUSA SYNC — Disabled for now (2026-09-28)
+    // FUTURE: Uncomment the Medusa sync block below to enable auto-sync of new stock to Medusa inventory.
+    // This will make incoming stock immediately visible on the storefront.
+    // For now, stock-in only updates warehouse_inventory. Medusa inventory stays unchanged.
+    // Picking/shipping (fulfillment) will later reduce WMS inventory and sync to Medusa.
+    logger.info(`[stock-in] Stocked ${stocked} items to warehouse_inventory. Medusa inventory unchanged (sync disabled for now).`);
 
     // Mark session complete
     await query(
