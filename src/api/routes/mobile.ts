@@ -305,10 +305,14 @@ router.get('/pick-lists', authMiddleware, async (_req: AuthRequest, res: Respons
   }
 });
 
-/** GET /api/mobile/pick-lists/:id — pick list detail with product thumbnails */
+/** GET /api/mobile/pick-lists/:id — pick list detail with product thumbnails, customer info, and kit components */
 router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const pl = await query(`SELECT * FROM pick_lists WHERE id = $1`, [req.params.id]);
+    const pl = await query(`
+      SELECT id, pick_list_number, medusa_order_id, status, created_at,
+             customer_name, customer_email, shipping_address
+      FROM pick_lists WHERE id = $1
+    `, [req.params.id]);
     if (!pl.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
 
     const items = await query(`
@@ -322,6 +326,10 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
         COALESCE(wp.variant_width_mm, wp.width_mm) AS width_mm,
         COALESCE(wp.variant_height_mm, wp.height_mm) AS height_mm,
         COALESCE(wp.variant_depth_mm, wp.depth_mm) AS depth_mm,
+        -- Kit detection and components
+        CASE WHEN wp.kit_components IS NOT NULL AND jsonb_array_length(wp.kit_components) > 0 
+          THEN true ELSE false END AS is_kit,
+        wp.kit_components,
         -- Show where this SKU is in the warehouse
         (SELECT json_agg(json_build_object('location_code', wl.location_code, 'qty', wi.quantity) ORDER BY wi.quantity DESC)
          FROM warehouse_inventory wi
@@ -373,12 +381,13 @@ async function recomputePickItem(pickListId: string, itemId: string) {
 
 /**
  * POST /api/mobile/pick-lists/:id/scan — scan any item in the list, in any order.
+ * For kit products: requires scanning individual kit components instead of the parent SKU.
  * Resolves the scanned barcode to whichever pending line it belongs to (rather than
  * trusting the client's "pick next" ordering), then picks its full remaining quantity.
  */
 router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { scanned_barcode, location_code, quantity } = req.body;
+    const { scanned_barcode, location_code, quantity, scanned_component_sku } = req.body;
     const { id: pickListId } = req.params;
     if (!scanned_barcode) return res.status(400).json({ error: 'scanned_barcode required' });
 
@@ -388,42 +397,125 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
       `SELECT product_sku FROM barcode_mappings WHERE barcode = $1 AND is_active = true LIMIT 1`,
       [scanned_barcode]
     );
-    const sku = bm.rows[0]?.product_sku ?? scanned_barcode;
+    const scannedSku = bm.rows[0]?.product_sku ?? scanned_barcode;
 
-    const candidates = await query(
-      `SELECT * FROM pick_list_items WHERE pick_list_id = $1 AND product_sku = $2 ORDER BY line_number ASC`,
-      [pickListId, sku]
+    // First, check if this scanned SKU is a kit component that's part of a pending pick item
+    let candidates: any[] = [];
+    let isKitComponentScan = false;
+    
+    // Get all pending items with their kit components
+    const allItems = await query(
+      `SELECT pli.id, pli.product_sku, pli.quantity_required, pli.quantity_picked, pli.status,
+              wp.kit_components,
+              CASE WHEN wp.kit_components IS NOT NULL AND jsonb_array_length(wp.kit_components) > 0 
+                THEN true ELSE false END AS is_kit
+       FROM pick_list_items pli
+       LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
+       WHERE pli.pick_list_id = $1 AND pli.status != 'PICKED'
+       ORDER BY pli.line_number ASC`,
+      [pickListId]
     );
-    if (!candidates.rows.length) {
-      return res.status(404).json({ error: `${sku} is not part of this order` });
-    }
-    const item = candidates.rows.find((row: any) => row.status !== 'PICKED');
-    if (!item) return res.status(400).json({ error: 'Already picked' });
 
-    const remainingQty = item.quantity_required - item.quantity_picked;
-    const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : remainingQty;
-    if (qty > remainingQty) {
-      return res.status(400).json({ error: `Only ${remainingQty} remaining — reduce the quantity` });
-    }
-
-    let locationId: string | null = null;
-    if (location_code) {
-      const loc = await query(`SELECT id FROM warehouse_locations WHERE location_code = $1`, [location_code.toUpperCase()]);
-      locationId = loc.rows[0]?.id ?? null;
+    // Check if the scanned SKU is a kit component
+    for (const item of allItems) {
+      if (item.is_kit && item.kit_components) {
+        const components = (item.kit_components as any[]);
+        const matchingComponent = components.find((c: any) => c.sku === scannedSku);
+        if (matchingComponent) {
+          isKitComponentScan = true;
+          // This is a kit item and the scan matches one of its components
+          candidates = [item];
+          break;
+        }
+      }
     }
 
-    await query(
-      `INSERT INTO pick_scans (pick_list_id, pick_list_item_id, quantity, location_id, scanned_barcode, performed_by)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [pickListId, item.id, qty, locationId, scanned_barcode, toUuidOrNull(req.user?.id)]
-    );
-    if (locationId) {
-      await query(`UPDATE pick_list_items SET picked_from_location_id = $1 WHERE id = $2`, [locationId, item.id]);
+    // If not a kit component scan, try direct SKU match
+    if (!isKitComponentScan) {
+      candidates = await query(
+        `SELECT * FROM pick_list_items WHERE pick_list_id = $1 AND product_sku = $2 ORDER BY line_number ASC`,
+        [pickListId, scannedSku]
+      );
     }
 
-    const { item: updatedItem, allPicked } = await recomputePickItem(pickListId, item.id);
+    if (!candidates.length) {
+      return res.status(404).json({ 
+        error: `${scannedSku} is not part of this order`,
+        scannedSku,
+        isKitComponentScan
+      });
+    }
 
-    res.json({ success: true, all_picked: allPicked, item: updatedItem });
+    const item = candidates[0];
+    if (item.status === 'PICKED') return res.status(400).json({ error: 'Already picked' });
+
+    // If this is a kit item and we're trying to scan a component
+    if (isKitComponentScan && item.is_kit) {
+      // For kits, we accept the component scan and record it
+      // The picker must scan all components to complete the kit pick
+      const remainingQty = item.quantity_required - item.quantity_picked;
+      const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : remainingQty;
+      if (qty > remainingQty) {
+        return res.status(400).json({ error: `Only ${remainingQty} remaining — reduce the quantity` });
+      }
+
+      let locationId: string | null = null;
+      if (location_code) {
+        const loc = await query(`SELECT id FROM warehouse_locations WHERE location_code = $1`, [location_code.toUpperCase()]);
+        locationId = loc.rows[0]?.id ?? null;
+      }
+
+      await query(
+        `INSERT INTO pick_scans (pick_list_id, pick_list_item_id, quantity, location_id, scanned_barcode, performed_by)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [pickListId, item.id, qty, locationId, scanned_barcode, toUuidOrNull(req.user?.id)]
+      );
+      if (locationId) {
+        await query(`UPDATE pick_list_items SET picked_from_location_id = $1 WHERE id = $2`, [locationId, item.id]);
+      }
+
+      const { item: updatedItem, allPicked } = await recomputePickItem(pickListId, item.id);
+
+      res.json({ 
+        success: true, 
+        all_picked: allPicked, 
+        item: updatedItem,
+        note: `Kit component ${scannedSku} scanned. Scan remaining components to complete this kit.`
+      });
+    } else if (item.is_kit) {
+      // Trying to scan the parent kit SKU directly - not allowed
+      return res.status(400).json({ 
+        error: `This is a kit product. You must scan its individual components instead.`,
+        components: item.kit_components || [],
+        instruction: 'Scan each component SKU separately to complete this pick.'
+      });
+    } else {
+      // Regular non-kit item
+      const remainingQty = item.quantity_required - item.quantity_picked;
+      const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : remainingQty;
+      if (qty > remainingQty) {
+        return res.status(400).json({ error: `Only ${remainingQty} remaining — reduce the quantity` });
+      }
+
+      let locationId: string | null = null;
+      if (location_code) {
+        const loc = await query(`SELECT id FROM warehouse_locations WHERE location_code = $1`, [location_code.toUpperCase()]);
+        locationId = loc.rows[0]?.id ?? null;
+      }
+
+      await query(
+        `INSERT INTO pick_scans (pick_list_id, pick_list_item_id, quantity, location_id, scanned_barcode, performed_by)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [pickListId, item.id, qty, locationId, scanned_barcode, toUuidOrNull(req.user?.id)]
+      );
+      if (locationId) {
+        await query(`UPDATE pick_list_items SET picked_from_location_id = $1 WHERE id = $2`, [locationId, item.id]);
+      }
+
+      const { item: updatedItem, allPicked } = await recomputePickItem(pickListId, item.id);
+
+      res.json({ success: true, all_picked: allPicked, item: updatedItem });
+    }
   } catch (err: any) {
     res.status(500).json({ error: err.message ?? 'Pick failed' });
   }
