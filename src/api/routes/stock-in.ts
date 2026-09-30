@@ -45,6 +45,21 @@ async function getReceivingLocation(): Promise<string> {
   return created.rows[0].id;
 }
 
+/**
+ * warehouse_inventory.colour_code is VARCHAR(20), but checkin_items.colour can hold a
+ * longer colour_name (scan step falls back to name when no short code is known).
+ * Resolve the real short code from wms_products; truncate as a last resort so the
+ * insert never fails on a length constraint.
+ */
+async function resolveColourCode(sku: string, checkinColour: string | null): Promise<string> {
+  const result = await query(
+    `SELECT colour_code FROM wms_products WHERE variant_sku = $1 AND colour_code IS NOT NULL LIMIT 1`,
+    [sku]
+  );
+  const code = result.rows[0]?.colour_code || checkinColour || '';
+  return code.slice(0, 20);
+}
+
 /** List all sessions (active + recent) */
 router.get('/sessions', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
@@ -355,7 +370,11 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
           ? `${productDetails.name} (${productDetails.dimensions || 'n/a'})`
           : sku;
 
-        logger.debug(`[stock-in] Stocking item ${i + 1}/${items.rows.length}: ${sku} qty=${item.quantity_scanned} colour=${item.colour || 'none'}`);
+        // checkin_items.colour may hold a long colour_name rather than a short code —
+        // resolve the real code (variant-specific) and fall back to truncating it.
+        const colourCode = await resolveColourCode(sku, item.colour);
+
+        logger.debug(`[stock-in] Stocking item ${i + 1}/${items.rows.length}: ${sku} qty=${item.quantity_scanned} colour=${colourCode || 'none'}`);
 
         // Upsert into warehouse_inventory
         const insertResult = await query(
@@ -367,7 +386,7 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
           [
             receivingLocationId,
             sku,
-            item.colour || '',
+            colourCode,
             item.quantity_scanned,
             defaultLiability,
           ]
