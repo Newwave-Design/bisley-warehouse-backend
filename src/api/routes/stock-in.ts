@@ -297,94 +297,161 @@ router.delete('/sessions/:id/items/:itemId', authMiddleware, async (req: AuthReq
 /** POST /api/stock-in/sessions/:id/confirm — Commit stock to warehouse_inventory + sync to Medusa */
 router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
+    const sessionId = req.params.id;
+    logger.info(`[stock-in] Confirm request for session ${sessionId}`);
+
     const session = await query(
       `SELECT * FROM checkin_sessions WHERE id = $1`,
-      [req.params.id]
+      [sessionId]
     );
 
-    if (!session.rows[0]) return res.status(404).json({ error: 'Session not found' });
+    if (!session.rows[0]) {
+      logger.warn(`[stock-in] Session not found: ${sessionId}`);
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
     if (session.rows[0].status !== 'OPEN') {
+      logger.warn(`[stock-in] Session ${sessionId} not open, status: ${session.rows[0].status}`);
       return res.status(400).json({ error: 'Session is not open' });
     }
 
     // Get all scanned items
     const items = await query(
       `SELECT * FROM checkin_items WHERE session_id = $1`,
-      [req.params.id]
+      [sessionId]
     );
 
     if (items.rows.length === 0) {
+      logger.warn(`[stock-in] No items in session ${sessionId}`);
       return res.status(400).json({ error: 'No items scanned' });
     }
 
-    // Get or create RECEIVING location
-    const receivingLocationId = await getReceivingLocation();
+    logger.info(`[stock-in] Confirming ${items.rows.length} items to warehouse from session ${sessionId}`);
 
-    const defaultLiability = 'Bisley'; // Default for new stock-in
+    // Get or create RECEIVING location
+    let receivingLocationId: string;
+    try {
+      receivingLocationId = await getReceivingLocation();
+      logger.info(`[stock-in] Using receiving location: ${receivingLocationId}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : JSON.stringify(err);
+      logger.error(`[stock-in] Failed to get receiving location: ${msg}`);
+      return res.status(500).json({ error: `Failed to get receiving location: ${msg}` });
+    }
+
+    const defaultLiability = 'Bisley';
     let stocked = 0;
     const syncedSkus = new Set<string>();
-    const syncErrors: string[] = [];
-
-    logger.info(`[stock-in] Confirming ${items.rows.length} items to warehouse from session ${req.params.id}`);
+    const failedItems: string[] = [];
 
     // Stock each item to warehouse_inventory
-    for (const item of items.rows) {
+    for (let i = 0; i < items.rows.length; i++) {
+      const item = items.rows[i];
       const sku = item.medusa_sku || item.nw_code;
-      const productDetails = await getProductDetails(sku);
-      const productDisplay = productDetails
-        ? `${productDetails.name} (${productDetails.dimensions || 'n/a'})`
-        : sku;
+      
+      try {
+        const productDetails = await getProductDetails(sku);
+        const productDisplay = productDetails
+          ? `${productDetails.name} (${productDetails.dimensions || 'n/a'})`
+          : sku;
 
-      // Upsert into warehouse_inventory
-      await query(
-        `INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-         ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
-         DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()`,
-        [
-          receivingLocationId,
-          sku,
-          item.colour || '',
-          item.quantity_scanned,
-          defaultLiability,
-        ]
-      );
+        logger.debug(`[stock-in] Stocking item ${i + 1}/${items.rows.length}: ${sku} qty=${item.quantity_scanned} colour=${item.colour || 'none'}`);
 
-      syncedSkus.add(sku);
-      stocked++;
-      logger.info(`  ✓ Stocked ${item.quantity_scanned}x ${productDisplay}`);
+        // Upsert into warehouse_inventory
+        const insertResult = await query(
+          `INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+           ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
+           DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
+           RETURNING id, quantity`,
+          [
+            receivingLocationId,
+            sku,
+            item.colour || '',
+            item.quantity_scanned,
+            defaultLiability,
+          ]
+        );
+
+        if (!insertResult.rows[0]) {
+          throw new Error('Insert returned no rows');
+        }
+
+        syncedSkus.add(sku);
+        stocked++;
+        logger.info(`  ✓ Stocked ${item.quantity_scanned}x ${productDisplay} (new quantity: ${insertResult.rows[0].quantity})`);
+      } catch (itemErr) {
+        const itemMsg = itemErr instanceof Error ? itemErr.message : JSON.stringify(itemErr);
+        logger.error(`[stock-in] Failed to stock item ${i + 1}: ${sku} - ${itemMsg}`);
+        failedItems.push(`Item ${i + 1} (${sku}): ${itemMsg}`);
+      }
     }
+
+    if (failedItems.length > 0) {
+      logger.error(`[stock-in] Failed to stock ${failedItems.length} items: ${failedItems.join('; ')}`);
+      return res.status(500).json({ 
+        error: `Failed to stock items: ${failedItems[0]}`,
+        details: failedItems,
+        items_stocked: stocked,
+        note: 'Some items failed to stock. Your session is saved and you can retry.'
+      });
+    }
+
+    if (stocked === 0) {
+      logger.error(`[stock-in] No items were successfully stocked in session ${sessionId}`);
+      return res.status(500).json({ error: 'No items were successfully stocked' });
+    }
+
+    logger.info(`[stock-in] Successfully stocked ${stocked} items, attempting to unblock pick lists...`);
 
     // Unblock any backorder pick lists that can now be fulfilled
-    const unblocked = await unblockBackorderedPickLists([...syncedSkus]);
-    if (unblocked && unblocked.length > 0) {
-      logger.info(`[stock-in] Unblocked ${unblocked.length} pick lists`);
+    let unblocked: string[] = [];
+    try {
+      unblocked = await unblockBackorderedPickLists([...syncedSkus]);
+      if (unblocked && unblocked.length > 0) {
+        logger.info(`[stock-in] Unblocked ${unblocked.length} pick lists: ${unblocked.join(', ')}`);
+      }
+    } catch (unlockErr) {
+      const unlockMsg = unlockErr instanceof Error ? unlockErr.message : JSON.stringify(unlockErr);
+      logger.error(`[stock-in] Failed to unblock pick lists: ${unlockMsg}`);
+      // Non-fatal - continue to mark session complete
     }
 
-    // TODO: MEDUSA SYNC — Disabled for now (2026-09-28)
-    // FUTURE: Uncomment the Medusa sync block below to enable auto-sync of new stock to Medusa inventory.
-    // This will make incoming stock immediately visible on the storefront.
-    // For now, stock-in only updates warehouse_inventory. Medusa inventory stays unchanged.
-    // Picking/shipping (fulfillment) will later reduce WMS inventory and sync to Medusa.
     logger.info(`[stock-in] Stocked ${stocked} items to warehouse_inventory. Medusa inventory unchanged (sync disabled for now).`);
 
     // Mark session complete
-    await query(
-      `UPDATE checkin_sessions SET status = 'COMPLETE', completed_at = NOW(), updated_at = NOW() WHERE id = $1`,
-      [req.params.id]
-    );
+    try {
+      const updateResult = await query(
+        `UPDATE checkin_sessions SET status = 'COMPLETE', completed_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING id`,
+        [sessionId]
+      );
+      if (!updateResult.rows[0]) {
+        throw new Error('Session update returned no rows');
+      }
+      logger.info(`[stock-in] Session ${sessionId} marked COMPLETE`);
+    } catch (completeErr) {
+      const completeMsg = completeErr instanceof Error ? completeErr.message : JSON.stringify(completeErr);
+      logger.error(`[stock-in] Failed to mark session complete: ${completeMsg}`);
+      return res.status(500).json({ 
+        error: `Failed to mark session complete: ${completeMsg}`,
+        items_stocked: stocked,
+        note: 'Items were stocked but session completion failed. Your items are safe.'
+      });
+    }
 
     res.json({
       success: true,
-      session_id: req.params.id,
+      session_id: sessionId,
       items_stocked: stocked,
       unique_skus: syncedSkus.size,
       unblocked_pick_lists: unblocked?.length ?? 0,
       note: 'Medusa inventory is NOT changed by stock-in. It only changes during fulfillment/shipment.',
     });
   } catch (err) {
-    logger.error(`Confirm failed: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
-    res.status(500).json({ error: 'Failed to confirm stock-in' });
+    const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+    logger.error(`[stock-in] Confirm failed with unhandled error: ${errMsg}`);
+    logger.error(`[stock-in] Stack trace: ${err instanceof Error ? err.stack : 'N/A'}`);
+    res.status(500).json({ error: `Failed to confirm stock-in: ${errMsg}` });
   }
 });
 
