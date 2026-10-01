@@ -163,6 +163,23 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
   }
 });
 
+/** POST /api/stock-in/sessions/:id/abandon — cancel an open session; nothing is stocked */
+router.post('/sessions/:id/abandon', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(
+      `UPDATE checkin_sessions SET status = 'CANCELLED', updated_at = NOW() WHERE id = $1 AND status = 'OPEN' RETURNING id`,
+      [req.params.id]
+    );
+    if (!result.rows[0]) return res.status(400).json({ error: 'Session not found or not open' });
+
+    logger.info(`[stock-in] Abandoned session ${req.params.id}`);
+    res.json({ success: true });
+  } catch (err) {
+    logger.error(`Failed to abandon session: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
+    res.status(500).json({ error: 'Failed to abandon session' });
+  }
+});
+
 /** POST /api/stock-in/scan — Lookup barcode/NW code + scan item (cumulative per SKU+colour) */
 router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {

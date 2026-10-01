@@ -701,13 +701,16 @@ ALTER TABLE requires_location_queue ADD COLUMN IF NOT EXISTS pallet_id UUID REFE
 CREATE TABLE IF NOT EXISTS checkin_sessions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   order_id UUID REFERENCES supplier_orders(id) ON DELETE SET NULL,
-  status TEXT CHECK (status IN ('OPEN', 'COMPARING', 'COMPLETE')) DEFAULT 'OPEN',
+  status TEXT CHECK (status IN ('OPEN', 'COMPARING', 'COMPLETE', 'CANCELLED')) DEFAULT 'OPEN',
   started_by VARCHAR,
   notes TEXT,
   completed_at TIMESTAMP,
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
+-- Abandoned sessions are stored as CANCELLED; widen the constraint on existing databases
+ALTER TABLE checkin_sessions DROP CONSTRAINT IF EXISTS checkin_sessions_status_check;
+ALTER TABLE checkin_sessions ADD CONSTRAINT checkin_sessions_status_check CHECK (status IN ('OPEN', 'COMPARING', 'COMPLETE', 'CANCELLED'));
 
 -- ================================================================================
 -- CHECKIN ITEMS (Phase 3: Items scanned during a check-in session)
