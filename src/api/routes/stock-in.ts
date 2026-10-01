@@ -6,7 +6,7 @@
  * 3. Review (table of scanned items, editable quantities)
  * 4. Confirm (commit to warehouse_inventory + Medusa sync)
  *
- * GET    /api/stock-in/sessions              — List active sessions
+ * GET    /api/stock-in/sessions              — List sessions (?status=OPEN default, ?status=ALL for history)
  * POST   /api/stock-in/start-session         — Create new stock-in session
  * GET    /api/stock-in/sessions/:id          — Get session + all scanned items
  * POST   /api/stock-in/scan                  — Lookup barcode/NW code + scan/increment item
@@ -64,18 +64,19 @@ async function resolveColourCode(sku: string, checkinColour: string | null): Pro
 router.get('/sessions', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { status = 'OPEN', limit = '50', offset = '0' } = req.query;
+    const statusFilter = status === 'ALL' ? null : status;
     
     const result = await query(
       `SELECT s.*,
         COUNT(ci.id) as items_count,
         COALESCE(SUM(ci.quantity_scanned), 0) as total_units
        FROM checkin_sessions s
-       LEFT JOIN checkin_items ci ON ci.session_id = s.id
-       WHERE s.status = $1
+       LEFT JOIN checkin_items ci ON ci.session_id = s.id AND ci.removed_at IS NULL
+       WHERE ($1::text IS NULL OR s.status = $1)
        GROUP BY s.id
        ORDER BY s.created_at DESC
        LIMIT $2 OFFSET $3`,
-      [status, parseInt(limit as string), parseInt(offset as string)]
+      [statusFilter, parseInt(limit as string), parseInt(offset as string)]
     );
 
     res.json({ sessions: result.rows });
@@ -126,6 +127,7 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
         ci.medusa_sku,
         ci.quantity_scanned,
         ci.scanned_at,
+        ci.removed_at,
         ci.created_at,
         COALESCE(bm.product_name, wp.product_title, 'Unknown') as product_name,
         COALESCE(bm.colour_code, wp.colour_code, '') as colour_code,
@@ -138,14 +140,21 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
       [req.params.id]
     );
 
+    const scans = await query(
+      `SELECT id, item_id, quantity, scanned_at FROM checkin_scans
+       WHERE session_id = $1 ORDER BY scanned_at DESC LIMIT 500`,
+      [req.params.id]
+    );
+
     const summary = await query(
-      `SELECT COUNT(*) as item_count, SUM(quantity_scanned) as total_qty FROM checkin_items WHERE session_id = $1`,
+      `SELECT COUNT(*) as item_count, SUM(quantity_scanned) as total_qty FROM checkin_items WHERE session_id = $1 AND removed_at IS NULL`,
       [req.params.id]
     );
 
     res.json({
       session: session.rows[0],
       items: items.rows,
+      scans: scans.rows,
       summary: summary.rows[0],
     });
   } catch (err) {
@@ -221,7 +230,7 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
     // Check if this nw_code+colour already scanned in this session
     const existing = await query(
       `SELECT id, quantity_scanned FROM checkin_items
-       WHERE session_id = $1 AND nw_code = $2 AND LOWER(COALESCE(colour, '')) = LOWER($3)`,
+       WHERE session_id = $1 AND nw_code = $2 AND LOWER(COALESCE(colour, '')) = LOWER($3) AND removed_at IS NULL`,
       [session_id, nw_code, colour_used]
     );
 
@@ -249,8 +258,14 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
       logger.info(`[stock-in] Scanned ${quantity}x ${nw_code} (${colour_used}) into session ${session_id}`);
     }
 
+    const scanLog = await query(
+      `INSERT INTO checkin_scans (session_id, item_id, quantity) VALUES ($1, $2, $3) RETURNING id, item_id, quantity, scanned_at`,
+      [session_id, item.id, quantity]
+    );
+
     res.json({
       success: true,
+      scan: scanLog.rows[0],
       item: {
         ...item,
         product_sku: item.nw_code,
@@ -293,11 +308,11 @@ router.patch('/sessions/:id/items/:itemId', authMiddleware, async (req: AuthRequ
   }
 });
 
-/** DELETE /api/stock-in/sessions/:id/items/:itemId — Remove item from review */
+/** DELETE /api/stock-in/sessions/:id/items/:itemId — Soft-remove an item (kept for scan history, restorable) */
 router.delete('/sessions/:id/items/:itemId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     await query(
-      `DELETE FROM checkin_items WHERE id = $1 AND session_id = $2`,
+      `UPDATE checkin_items SET removed_at = NOW(), updated_at = NOW() WHERE id = $1 AND session_id = $2`,
       [req.params.itemId, req.params.id]
     );
 
@@ -306,6 +321,44 @@ router.delete('/sessions/:id/items/:itemId', authMiddleware, async (req: AuthReq
   } catch (err) {
     logger.error(`Failed to remove item: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
     res.status(500).json({ error: 'Failed to remove item' });
+  }
+});
+
+/** POST /api/stock-in/sessions/:id/items/:itemId/restore — Undo a removal; merges into the live row if the item was re-scanned since */
+router.post('/sessions/:id/items/:itemId/restore', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const session = await query(`SELECT status FROM checkin_sessions WHERE id = $1`, [req.params.id]);
+    if (session.rows[0]?.status !== 'OPEN') return res.status(400).json({ error: 'Session is not open' });
+
+    const removed = await query(
+      `SELECT * FROM checkin_items WHERE id = $1 AND session_id = $2 AND removed_at IS NOT NULL`,
+      [req.params.itemId, req.params.id]
+    );
+    const item = removed.rows[0];
+    if (!item) return res.status(404).json({ error: 'Removed item not found' });
+
+    const live = await query(
+      `SELECT id FROM checkin_items
+       WHERE session_id = $1 AND nw_code = $2 AND LOWER(COALESCE(colour, '')) = LOWER($3) AND removed_at IS NULL LIMIT 1`,
+      [req.params.id, item.nw_code, item.colour || '']
+    );
+
+    if (live.rows[0]) {
+      await query(
+        `UPDATE checkin_items SET quantity_scanned = quantity_scanned + $1, updated_at = NOW() WHERE id = $2`,
+        [item.quantity_scanned, live.rows[0].id]
+      );
+      await query(`UPDATE checkin_scans SET item_id = $1 WHERE item_id = $2`, [live.rows[0].id, item.id]);
+      await query(`DELETE FROM checkin_items WHERE id = $1`, [item.id]);
+    } else {
+      await query(`UPDATE checkin_items SET removed_at = NULL, updated_at = NOW() WHERE id = $1`, [item.id]);
+    }
+
+    logger.info(`[stock-in] Restored item ${item.id} in session ${req.params.id}`);
+    res.json({ success: true });
+  } catch (err) {
+    logger.error(`Failed to restore item: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
+    res.status(500).json({ error: 'Failed to restore item' });
   }
 });
 
@@ -332,7 +385,7 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
 
     // Get all scanned items
     const items = await query(
-      `SELECT * FROM checkin_items WHERE session_id = $1`,
+      `SELECT * FROM checkin_items WHERE session_id = $1 AND removed_at IS NULL`,
       [sessionId]
     );
 

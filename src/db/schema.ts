@@ -726,6 +726,23 @@ CREATE TABLE IF NOT EXISTS checkin_items (
 );
 -- Add updated_at to existing installations
 ALTER TABLE checkin_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+-- Soft delete: stock-in 'remove' keeps the row (struck through in scan history) so it can be restored
+ALTER TABLE checkin_items ADD COLUMN IF NOT EXISTS removed_at TIMESTAMP;
+
+-- One row per individual stock-in scan (checkin_items stays one cumulative row per SKU+colour)
+CREATE TABLE IF NOT EXISTS checkin_scans (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id UUID NOT NULL REFERENCES checkin_sessions(id) ON DELETE CASCADE,
+  item_id UUID NOT NULL REFERENCES checkin_items(id) ON DELETE CASCADE,
+  quantity INT NOT NULL DEFAULT 1,
+  scanned_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_checkin_scans_session ON checkin_scans(session_id, scanned_at DESC);
+-- Seed one history row for items in still-open sessions that pre-date scan logging
+INSERT INTO checkin_scans (session_id, item_id, quantity, scanned_at)
+SELECT ci.session_id, ci.id, ci.quantity_scanned, COALESCE(ci.updated_at, ci.scanned_at, NOW())
+FROM checkin_items ci JOIN checkin_sessions s ON s.id = ci.session_id
+WHERE s.status = 'OPEN' AND NOT EXISTS (SELECT 1 FROM checkin_scans cs WHERE cs.item_id = ci.id);
 
 -- ================================================================================
 -- CHECKIN DISCREPANCIES (Phase 3: Auto-flagged mismatches vs order)

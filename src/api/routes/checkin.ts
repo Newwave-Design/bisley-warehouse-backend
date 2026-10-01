@@ -82,7 +82,7 @@ router.get('/sessions', authMiddleware, async (req: AuthRequest, res: Response) 
         COUNT(cd.id) as discrepancy_count
       FROM checkin_sessions s
       LEFT JOIN supplier_orders o ON o.id = s.order_id
-      LEFT JOIN checkin_items ci ON ci.session_id = s.id
+      LEFT JOIN checkin_items ci ON ci.session_id = s.id AND ci.removed_at IS NULL
       LEFT JOIN checkin_discrepancies cd ON cd.session_id = s.id
       GROUP BY s.id, o.order_number
       ORDER BY s.created_at DESC
@@ -139,7 +139,7 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
     if (!session.rows[0]) return res.status(404).json({ error: 'Session not found' });
 
     const items = await query(
-      `SELECT * FROM checkin_items WHERE session_id = $1 ORDER BY scanned_at DESC`,
+      `SELECT * FROM checkin_items WHERE session_id = $1 AND removed_at IS NULL ORDER BY scanned_at DESC`,
       [req.params.id]
     );
 
@@ -183,7 +183,7 @@ router.post('/sessions/:id/scan', authMiddleware, async (req: AuthRequest, res: 
 
     // Check if this nw_code+colour already scanned — if so, increment
     const existing = await query(
-      `SELECT id, quantity_scanned FROM checkin_items WHERE session_id = $1 AND nw_code = $2 AND LOWER(colour) = LOWER($3)`,
+      `SELECT id, quantity_scanned FROM checkin_items WHERE session_id = $1 AND nw_code = $2 AND LOWER(colour) = LOWER($3) AND removed_at IS NULL`,
       [req.params.id, nw_code, colour || '']
     );
 
@@ -263,7 +263,7 @@ router.post('/sessions/:id/compare', authMiddleware, async (req: AuthRequest, re
     await query(`DELETE FROM checkin_discrepancies WHERE session_id = $1`, [req.params.id]);
 
     // Get scanned items
-    const scanned = await query(`SELECT * FROM checkin_items WHERE session_id = $1`, [req.params.id]);
+    const scanned = await query(`SELECT * FROM checkin_items WHERE session_id = $1 AND removed_at IS NULL`, [req.params.id]);
     const scannedMap = new Map<string, number>();
     scanned.rows.forEach(i => scannedMap.set(`${i.nw_code}|${(i.colour || '').toLowerCase()}`, i.quantity_scanned));
 
@@ -351,7 +351,7 @@ router.post('/sessions/:id/complete', authMiddleware, async (req: AuthRequest, r
     }
 
     // Move all scanned items to requires_location_queue
-    const items = await query(`SELECT * FROM checkin_items WHERE session_id = $1`, [req.params.id]);
+    const items = await query(`SELECT * FROM checkin_items WHERE session_id = $1 AND removed_at IS NULL`, [req.params.id]);
     for (const item of items.rows) {
       await query(
         `INSERT INTO requires_location_queue (session_id, order_id, nw_code, colour, medusa_sku, quantity, status, created_at, updated_at)
@@ -362,7 +362,7 @@ router.post('/sessions/:id/complete', authMiddleware, async (req: AuthRequest, r
     }
 
     const summary = await query(
-      `SELECT COUNT(*) as items, SUM(quantity_scanned) as units FROM checkin_items WHERE session_id = $1`,
+      `SELECT COUNT(*) as items, SUM(quantity_scanned) as units FROM checkin_items WHERE session_id = $1 AND removed_at IS NULL`,
       [req.params.id]
     );
 
