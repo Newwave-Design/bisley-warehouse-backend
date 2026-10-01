@@ -2,6 +2,8 @@
  * Authentication API
  *
  * POST /api/auth/login              — verify email/password against warehouse_users, issue a signed JWT
+ *                                      (body.device=true → 90-day token for dedicated scanner handhelds)
+ * POST /api/auth/refresh            — exchange a valid (or recently expired) token for a fresh one, keeping scanners logged in
  * POST /api/auth/bootstrap-admin    — one-time only: creates the initial admin account if none exists yet
  * POST /api/auth/promote-to-admin   — one-time only: moves the calling account into the Admin group if none exists yet
  * GET  /api/auth/me                 — current user + group + effective permissions
@@ -17,9 +19,13 @@ import { getEffectivePermissions } from '../../lib/permissions.js';
 
 const router = express.Router();
 
+const USER_TOKEN_TTL = '30d';
+const DEVICE_TOKEN_TTL = '90d';
+const REFRESH_GRACE_SECONDS = 14 * 24 * 60 * 60; // an expired token can still be refreshed for this long
+
 router.post('/login', async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, device } = req.body;
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password required' });
     }
@@ -44,15 +50,56 @@ router.post('/login', async (req: Request, res: Response) => {
     await query(`UPDATE warehouse_users SET last_login_at = NOW() WHERE id = $1`, [user.id]);
 
     const token = jwt.sign(
-      { sub: user.id, name: user.name, email: user.email, role: user.role },
+      { sub: user.id, name: user.name, email: user.email, role: user.role, ...(device ? { dev: true } : {}) },
       process.env.JWT_SECRET || 'your_secret',
-      { expiresIn: '30d' }
+      { expiresIn: device ? DEVICE_TOKEN_TTL : USER_TOKEN_TTL }
     );
 
     res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Sliding session: a scanner calls this on startup / on a 401 so a logged-in handheld never
+// needs a password re-entered. Re-checks the account is still active, so deactivation still
+// locks the device out at the next refresh. Token lifetime class (user vs device) is preserved.
+router.post('/refresh', async (req: Request, res: Response) => {
+  try {
+    const old = req.headers.authorization?.replace('Bearer ', '');
+    if (!old) return res.status(401).json({ error: 'No token provided' });
+
+    let decoded: any;
+    try {
+      decoded = jwt.verify(old, process.env.JWT_SECRET || 'your_secret', { ignoreExpiration: true });
+    } catch {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    if (decoded.exp && Date.now() / 1000 - decoded.exp > REFRESH_GRACE_SECONDS) {
+      return res.status(401).json({ error: 'Session expired — please log in again' });
+    }
+
+    const userId = decoded.sub || decoded.id;
+    const result = await query(
+      `SELECT id, name, email, role, is_active FROM warehouse_users WHERE id = $1`,
+      [userId]
+    );
+    const user = result.rows[0];
+    if (!user || !user.is_active) {
+      return res.status(401).json({ error: 'This account has been deactivated' });
+    }
+
+    const isDevice = decoded.dev === true;
+    const token = jwt.sign(
+      { sub: user.id, name: user.name, email: user.email, role: user.role, ...(isDevice ? { dev: true } : {}) },
+      process.env.JWT_SECRET || 'your_secret',
+      { expiresIn: isDevice ? DEVICE_TOKEN_TTL : USER_TOKEN_TTL }
+    );
+    res.json({ token });
+  } catch (err) {
+    console.error('Refresh error:', err);
+    res.status(500).json({ error: 'Refresh failed' });
   }
 });
 
