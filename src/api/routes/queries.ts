@@ -149,7 +149,10 @@ router.get('/:id', async (req: Request, res: Response) => {
 
     // Fetch linked orders
     const ordersResult = await getPool().query(
-      `SELECT * FROM query_linked_orders WHERE query_id = $1 ORDER BY tagged_at DESC`,
+      `SELECT qlo.*, pl.pick_list_number
+       FROM query_linked_orders qlo
+       LEFT JOIN pick_lists pl ON pl.id = qlo.pick_list_id
+       WHERE qlo.query_id = $1 ORDER BY qlo.tagged_at DESC`,
       [id]
     )
 

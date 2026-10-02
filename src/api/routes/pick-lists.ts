@@ -9,6 +9,7 @@ import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { v4 as uuidv4 } from 'uuid';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { createUpsShipmentLabel } from '../../lib/ups.js';
+import { getOrderValues } from '../../lib/order-values.js';
 
 const router = express.Router();
 
@@ -97,6 +98,7 @@ async function getPickListStockStatus(pickListId: string) {
  *   sku=H2910NL-av1              only pick lists containing this SKU (also returns per-line qty for it)
  *   sort=asc|desc                default asc (oldest-first picking queue); Customer Orders view uses desc
  *   limit=50&offset=0
+ *   include_values=true          adds order_value { gross, net, vat, refunded, currency } per list (live from Medusa)
  */
 router.get('/', authMiddleware, async (req: Request, res: Response) => {
   try {
@@ -173,10 +175,14 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
     );
 
     // Enrich each pick list with stock status
+    const values = String(req.query.include_values) === 'true'
+      ? await getOrderValues(result.rows.map((pl: any) => pl.medusa_order_id))
+      : null;
     const enrichedPickLists = await Promise.all(
       result.rows.map(async (pl: any) => ({
         ...pl,
         stock_status: await getPickListStockStatus(pl.id),
+        ...(values ? { order_value: values[pl.medusa_order_id] ?? null } : {}),
       }))
     );
 
