@@ -13,6 +13,7 @@ import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { moveStockBetweenBays, MoveError } from '../../lib/stock-move.js';
+import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
 
 const router = express.Router();
 
@@ -319,6 +320,50 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
       WHERE pli.pick_list_id = $1
       ORDER BY pli.line_number
     `, [req.params.id]);
+
+    // Give each kit component the same detail as a main row: friendly name, colour, thumbnail and bays.
+    // Components that are only inventory items (no catalogue variant of their own) fall back to a sibling
+    // product in the same SKU family for the name, and to the SKU's colour code for the colour.
+    const componentSkus = [...new Set(items.rows.flatMap((r: any) =>
+      Array.isArray(r.kit_components) ? r.kit_components.map((c: any) => c.sku) : []))];
+    if (componentSkus.length) {
+      const families = [...new Set(componentSkus.map((s: string) => s.split('-')[0]))];
+      const [info, family, bays] = await Promise.all([
+        query(`SELECT variant_sku, product_title, colour_name, colour_code, variant_thumbnail
+               FROM wms_products WHERE variant_sku = ANY($1::text[])`, [componentSkus]),
+        query(`SELECT DISTINCT ON (split_part(variant_sku, '-', 1)) split_part(variant_sku, '-', 1) AS family, product_title
+               FROM wms_products
+               WHERE split_part(variant_sku, '-', 1) = ANY($1::text[]) AND is_archived = false
+               ORDER BY split_part(variant_sku, '-', 1), variant_sku`, [families]),
+        query(`SELECT wi.product_sku, wl.location_code, wi.quantity
+               FROM warehouse_inventory wi JOIN warehouse_locations wl ON wl.id = wi.location_id
+               WHERE wi.product_sku = ANY($1::text[]) AND wi.quantity > 0
+               ORDER BY wi.quantity DESC`, [componentSkus]),
+      ]);
+      const infoBySku = new Map(info.rows.map((r: any) => [r.variant_sku, r]));
+      const titleByFamily = new Map(family.rows.map((r: any) => [r.family, r.product_title]));
+      const baysBySku = new Map<string, { location_code: string; qty: number }[]>();
+      for (const b of bays.rows) {
+        const list = baysBySku.get(b.product_sku) ?? [];
+        list.push({ location_code: b.location_code, qty: b.quantity });
+        baysBySku.set(b.product_sku, list);
+      }
+      for (const item of items.rows) {
+        if (!Array.isArray(item.kit_components)) continue;
+        item.kit_components = item.kit_components.map((c: any) => {
+          const p: any = infoBySku.get(c.sku);
+          const code = extractColourCode(c.sku);
+          return {
+            ...c,
+            product_title: p?.product_title ?? titleByFamily.get(c.sku.split('-')[0]) ?? null,
+            colour_name: p?.colour_name ?? (code ? COLOUR_NAMES[code] ?? null : null),
+            colour_code: p?.colour_code ?? code,
+            thumbnail: p?.variant_thumbnail ?? null,
+            stock_locations: baysBySku.get(c.sku) ?? [],
+          };
+        });
+      }
+    }
 
     res.json({ ...pl.rows[0], items: items.rows });
   } catch (err) {

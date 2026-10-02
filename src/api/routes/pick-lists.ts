@@ -10,6 +10,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { createUpsShipmentLabel } from '../../lib/ups.js';
 import { getOrderValues } from '../../lib/order-values.js';
+import { refreshKitsForSkus } from '../../lib/kit-refresh.js';
 
 const router = express.Router();
 
@@ -196,6 +197,27 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
     console.error('Pick list fetch error:', error);
     const errorMsg = error instanceof Error ? error.message : String(error);
     return res.status(500).json({ error: 'Failed to fetch pick lists', details: errorMsg });
+  }
+});
+
+/**
+ * POST /api/pick-lists/:pickListId/resync (admin)
+ * Re-reads the kit definitions (components and quantities) for this pick list's SKUs from Medusa, so changes made
+ * to kits in Medusa show on the pick list straight away instead of waiting for the daily catalogue sync.
+ * Response: { checked, changed: [{ sku, before, after }], not_found: [sku] }
+ */
+router.post('/:pickListId/resync', authMiddleware, requirePermission('system_admin'), async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    const pl = await query(`SELECT id FROM pick_lists WHERE id = $1`, [pickListId]);
+    if (!pl.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+
+    const skus = await query(`SELECT DISTINCT product_sku FROM pick_list_items WHERE pick_list_id = $1`, [pickListId]);
+    const result = await refreshKitsForSkus(skus.rows.map((r: any) => r.product_sku));
+    return res.json(result);
+  } catch (error: any) {
+    console.error('Pick list resync error:', error);
+    return res.status(502).json({ error: 'Could not resync from Medusa', details: error?.message ?? String(error) });
   }
 });
 

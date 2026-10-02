@@ -15,6 +15,7 @@ import { query } from '../../db/index.js';
 import { estimateShippingForServices, resolveKitDimensions, type PackagingProfile, type ShippingService } from '../../lib/shipping-estimator.js';
 import { DEFAULT_PACKAGING_PROFILES, DEFAULT_SHIPPING_SERVICES, isMissingRelationError } from '../../lib/fulfillment-defaults.js';
 import { logError, logWarning } from '../../lib/logger.js';
+import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured, type UpsRateQuote } from '../../lib/ups.js';
 import { decideShippingForPackedItem, parseAitWeightTiers, parseDhlTiers, type AitAssignment, type AitWeightTier, type DhlAssignment, type DhlTier } from '../../lib/shipping-decision.js';
 
@@ -80,23 +81,9 @@ async function refreshCachedInventoryFromWarehouse(): Promise<void> {
 }
 
 // ── Bisley colour code → display name lookup ──────────────────────────────────
-const COLOUR_NAMES: Record<string, string> = {
-  av1: 'Black', aa3: 'Anthracite Grey', ba5: 'Traffic White',
-  bc6: 'Bisley Blue', bn6: 'Bisley Orange', bx6: 'Olive Green',
-  cb2: 'Palest Pink', cd1: 'Golden Sunflower Yellow', av4: 'Goose Grey',
-  ag8: 'Regent', bz2: 'Ocean Blue', cj6: 'Natural Canvas',
-  da8: 'Emerald', be2: 'Fuchsia', bh2: 'Bisley Green', bp5: 'Azure',
-  ab1: 'Coral', bq4: 'Seville', ab2: 'Lilac', cj4: 'Berry',
-  cj5: 'Marine Green', ab9: 'Chalk', ay8: 'Cardinal Red', bp7: 'Prussian',
-  bq5: 'Dijon', ay7: 'Ocean Blue',
-};
+// Colour code -> name lookup and SKU colour extraction live in lib/colour-names.ts
 
-/** Extract Bisley colour code (e.g. av1, bc6) from the end of a SKU. */
-function extractColourCode(sku: string): string | null {
-  const lastSeg = sku.split('-').pop() ?? '';
-  const m = /([a-z]{2}\d)$/.exec(lastSeg);
-  return m ? m[1] : null;
-}
+// (extractColourCode: see lib/colour-names.ts)
 
 // wms_products' dimension/weight columns are INTEGER, but Medusa allows decimals (e.g. 40.1kg) —
 // inserting a raw decimal string fails the whole 200-row batch it's in with a Postgres type error,
