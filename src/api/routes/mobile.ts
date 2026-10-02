@@ -12,21 +12,18 @@
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { moveStockBetweenBays, MoveError } from '../../lib/stock-move.js';
 
 const router = express.Router();
 
 // performed_by columns are UUID - the demo token's user id ('1') is not a valid UUID, so guard it.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-function toUuidOrNull(id: unknown): string | null {
+export function toUuidOrNull(id: unknown): string | null {
   return typeof id === 'string' && UUID_RE.test(id) ? id : null;
 }
 
-/** GET /api/mobile/lookup?q=BARCODE — resolve any scan to product info + stock */
-router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) => {
-  try {
-    const q = ((req.query.q as string) ?? '').trim().toUpperCase();
-    if (!q) return res.status(400).json({ error: 'q required' });
-
+/** Resolve any scan (EAN/supercode, NW code, SKU) to product info + stock; shared with move sessions */
+export async function lookupProduct(q: string): Promise<any> {
     // 1. Exact barcode match (EAN, supercode like H2910NL-av1)
     const bm = await query(
       `SELECT bm.product_sku AS sku, bm.colour_code, bm.colour_name, bm.product_name,
@@ -36,7 +33,7 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
     );
     if (bm.rows[0]) {
       const stock = await getStock(bm.rows[0].sku, bm.rows[0].colour_code);
-      return res.json({ found: true, source: 'barcode', ...bm.rows[0], stock });
+      return { found: true, source: 'barcode', ...bm.rows[0], stock };
     }
 
     // 2. NW code — checked directly against wms_products.nw_code first (the canonical mapping
@@ -50,7 +47,7 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
     );
     if (wpNw.rows[0]) {
       const stock = await getStock(wpNw.rows[0].sku, wpNw.rows[0].colour_code);
-      return res.json({ found: true, source: 'nw_code', ...wpNw.rows[0], stock });
+      return { found: true, source: 'nw_code', ...wpNw.rows[0], stock };
     }
 
     const sm = await query(
@@ -63,7 +60,7 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
     );
     if (sm.rows[0]) {
       const stock = await getStock(sm.rows[0].sku, sm.rows[0].colour_code);
-      return res.json({ found: true, source: 'nw_code', ...sm.rows[0], stock });
+      return { found: true, source: 'nw_code', ...sm.rows[0], stock };
     }
 
     // 3. Partial SKU search in wms_products
@@ -75,16 +72,24 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
     );
     if (wp.rows.length > 0) {
       const stock = await getStock(wp.rows[0].sku, wp.rows[0].colour_code);
-      return res.json({ found: true, source: 'sku_search', ...wp.rows[0], stock, alternatives: wp.rows });
+      return { found: true, source: 'sku_search', ...wp.rows[0], stock, alternatives: wp.rows };
     }
 
-    res.json({ found: false, query: q });
+    return { found: false, query: q };
+}
+
+/** GET /api/mobile/lookup?q=BARCODE — resolve any scan to product info + stock */
+router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const q = ((req.query.q as string) ?? '').trim().toUpperCase();
+    if (!q) return res.status(400).json({ error: 'q required' });
+    res.json(await lookupProduct(q));
   } catch (err) {
     res.status(500).json({ error: 'Lookup failed' });
   }
 });
 
-async function getStock(sku: string, colourCode: string | null) {
+export async function getStock(sku: string, colourCode: string | null) {
   const r = await query(
     `SELECT l.location_code, wi.quantity, wi.quantity_reserved, wi.quantity_available
      FROM warehouse_inventory wi
@@ -150,51 +155,14 @@ router.post('/move', authMiddleware, async (req: AuthRequest, res: Response) => 
       return res.status(400).json({ error: 'sku, from_location, to_location, quantity required' });
     }
 
-    const [fromLoc, toLoc] = await Promise.all([
-      query(`SELECT id FROM warehouse_locations WHERE location_code = $1`, [from_location.toUpperCase()]),
-      query(`SELECT id FROM warehouse_locations WHERE location_code = $1`, [to_location.toUpperCase()]),
-    ]);
-    if (!fromLoc.rows[0]) return res.status(404).json({ error: `Bay ${from_location} not found` });
-    if (!toLoc.rows[0]) return res.status(404).json({ error: `Bay ${to_location} not found` });
+    const r = await moveStockBetweenBays({
+      fromCode: from_location, toCode: to_location, sku,
+      colourCode: colour_code ?? null, quantity, userId: toUuidOrNull((req as any).user?.id),
+    });
 
-    const fromId = fromLoc.rows[0].id;
-    const toId = toLoc.rows[0].id;
-
-    // Verify sufficient stock at source
-    const srcStock = await query(
-      `SELECT quantity FROM warehouse_inventory WHERE location_id=$1 AND product_sku=$2 AND (colour_code=$3 OR $3 IS NULL)`,
-      [fromId, sku, colour_code ?? null]
-    );
-    if (!srcStock.rows[0] || srcStock.rows[0].quantity < quantity) {
-      return res.status(400).json({ error: `Insufficient stock at ${from_location}` });
-    }
-
-    // Deduct from source
-    await query(`
-      UPDATE warehouse_inventory SET quantity = quantity - $1, updated_at = NOW()
-      WHERE location_id=$2 AND product_sku=$3 AND (colour_code=$4 OR $4 IS NULL)
-    `, [quantity, fromId, sku, colour_code ?? null]);
-
-    // Add to destination
-    await query(`
-      INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
-      DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
-    `, [toId, sku, colour_code ?? null, quantity]);
-
-    // Record both movements
-    const [mvtOut, mvtIn] = await Promise.all([
-      query(`INSERT INTO warehouse_movements (movement_type,location_id,product_sku,colour_code,quantity,notes,performed_by,movement_date)
-             VALUES ('ADJUST',$1,$2,$3,$4,$5,$6,NOW()) RETURNING id`,
-        [fromId, sku, colour_code ?? null, -quantity, `Moved to ${to_location}`, (req as any).user?.id ?? '1']),
-      query(`INSERT INTO warehouse_movements (movement_type,location_id,product_sku,colour_code,quantity,notes,performed_by,movement_date)
-             VALUES ('RECEIVE',$1,$2,$3,$4,$5,$6,NOW()) RETURNING id`,
-        [toId, sku, colour_code ?? null, quantity, `Moved from ${from_location}`, (req as any).user?.id ?? '1']),
-    ]);
-
-    res.json({ success: true, movement_out: mvtOut.rows[0].id, movement_in: mvtIn.rows[0].id });
+    res.json({ success: true, movement_out: r.movement_out, movement_in: r.movement_in });
   } catch (err: any) {
+    if (err instanceof MoveError) return res.status(err.status).json({ error: err.message });
     res.status(500).json({ error: err.message ?? 'Move failed' });
   }
 });
@@ -284,21 +252,29 @@ router.post('/undo', authMiddleware, async (req: AuthRequest, res: Response) => 
   }
 });
 
-/** GET /api/mobile/pick-lists — pending pick lists for mobile picker */
-router.get('/pick-lists', authMiddleware, async (_req: AuthRequest, res: Response) => {
+/**
+ * GET /api/mobile/pick-lists — pick lists for the handheld
+ *   ?status=PENDING,IN_PROGRESS (default) | any comma list | ALL     ?sort=asc (default, oldest first) | desc
+ */
+router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
+    const statusParam = ((req.query.status as string) || 'PENDING,IN_PROGRESS').toUpperCase();
+    const statuses = statusParam === 'ALL' ? null : statusParam.split(',').map(s => s.trim());
+    const orderDir = String(req.query.sort).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+
     const result = await query(`
       SELECT
-        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at,
+        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.customer_name,
         COUNT(pli.id)::int                                                     AS total_items,
         COUNT(*) FILTER (WHERE pli.status = 'PICKED')::int                    AS items_picked,
         COUNT(*) FILTER (WHERE pli.status = 'PENDING')::int                   AS items_pending
       FROM pick_lists pl
       LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
-      WHERE pl.status IN ('PENDING', 'IN_PROGRESS')
+      WHERE pl.is_archived = false AND ($1::text[] IS NULL OR pl.status = ANY($1::text[]))
       GROUP BY pl.id
-      ORDER BY pl.created_at ASC
-    `);
+      ORDER BY pl.created_at ${orderDir}
+      LIMIT 100
+    `, [statuses]);
     res.json({ pick_lists: result.rows });
   } catch (err) {
     res.status(500).json({ error: 'Failed to load pick lists' });

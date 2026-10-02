@@ -748,6 +748,44 @@ FROM checkin_items ci JOIN checkin_sessions s ON s.id = ci.session_id
 WHERE s.status = 'OPEN' AND NOT EXISTS (SELECT 1 FROM checkin_scans cs WHERE cs.item_id = ci.id);
 
 -- ================================================================================
+-- MOVE SESSIONS (handheld bay-to-bay moves: scan items, review, pick destination bay, tick to move)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS move_sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  status TEXT CHECK (status IN ('OPEN', 'COMPLETE', 'CANCELLED')) DEFAULT 'OPEN',
+  started_by VARCHAR,
+  completed_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS move_items (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id UUID NOT NULL REFERENCES move_sessions(id) ON DELETE CASCADE,
+  product_sku VARCHAR NOT NULL,
+  colour_code VARCHAR,
+  colour_name VARCHAR,
+  product_name VARCHAR,
+  quantity INT NOT NULL DEFAULT 1,
+  from_location VARCHAR,
+  to_location VARCHAR,
+  moved_at TIMESTAMP,
+  move_log JSONB,
+  removed_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS move_scans (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id UUID NOT NULL REFERENCES move_sessions(id) ON DELETE CASCADE,
+  item_id UUID NOT NULL REFERENCES move_items(id) ON DELETE CASCADE,
+  quantity INT NOT NULL DEFAULT 1,
+  scanned_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_move_sessions_status ON move_sessions(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_move_items_session ON move_items(session_id);
+CREATE INDEX IF NOT EXISTS idx_move_scans_session ON move_scans(session_id, scanned_at DESC);
+
+-- ================================================================================
 -- CHECKIN DISCREPANCIES (Phase 3: Auto-flagged mismatches vs order)
 -- ================================================================================
 CREATE TABLE IF NOT EXISTS checkin_discrepancies (
