@@ -11,6 +11,7 @@ import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { createUpsShipmentLabel } from '../../lib/ups.js';
 import { getOrderValues } from '../../lib/order-values.js';
 import { refreshKitsForSkus } from '../../lib/kit-refresh.js';
+import { getDeliveryDues } from '../../lib/delivery-due.js';
 
 const router = express.Router();
 
@@ -179,9 +180,11 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
     const values = String(req.query.include_values) === 'true'
       ? await getOrderValues(result.rows.map((pl: any) => pl.medusa_order_id))
       : null;
+    const dues = await getDeliveryDues(result.rows.map((pl: any) => pl.id));
     const enrichedPickLists = await Promise.all(
       result.rows.map(async (pl: any) => ({
         ...pl,
+        due: dues[pl.id] ?? null,
         stock_status: await getPickListStockStatus(pl.id),
         ...(values ? { order_value: values[pl.medusa_order_id] ?? null } : {}),
       }))
@@ -488,8 +491,11 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
 
     const stockStatus = await getPickListStockStatus(pickListId);
 
+    const due = (await getDeliveryDues([pickListId]))[pickListId] ?? null;
+
     return res.json({
       pickList,
+      due,
       stock_status: stockStatus,
       items: itemsResult.rows,
       packages: packagesResult.rows,

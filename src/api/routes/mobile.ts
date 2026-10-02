@@ -14,6 +14,7 @@ import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { moveStockBetweenBays, MoveError } from '../../lib/stock-move.js';
 import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
+import { getDeliveryDues } from '../../lib/delivery-due.js';
 
 const router = express.Router();
 
@@ -276,7 +277,8 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
       ORDER BY pl.created_at ${orderDir}
       LIMIT 100
     `, [statuses]);
-    res.json({ pick_lists: result.rows });
+    const dues = await getDeliveryDues(result.rows.map((r: any) => r.id));
+    res.json({ pick_lists: result.rows.map((r: any) => ({ ...r, due: dues[r.id] ?? null })) });
   } catch (err) {
     res.status(500).json({ error: 'Failed to load pick lists' });
   }
@@ -365,7 +367,8 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
       }
     }
 
-    res.json({ ...pl.rows[0], items: items.rows });
+    const due = (await getDeliveryDues([req.params.id]))[req.params.id] ?? null;
+    res.json({ ...pl.rows[0], due, items: items.rows });
   } catch (err) {
     res.status(500).json({ error: 'Failed to load pick list detail' });
   }
