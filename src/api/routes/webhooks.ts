@@ -14,6 +14,10 @@ import express, { Request, Response } from 'express';
 import crypto from 'crypto';
 import { query, getPool } from '../../db/index.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
+import { medusaGet } from '../../lib/medusa-client.js';
+import { authMiddleware, requirePermission } from '../../middleware/auth.js';
+import { logError, logWarning } from '../../lib/logger.js';
+import { createNotification, createNotificationOnce } from '../../lib/notifications.js';
 
 const router = express.Router();
 
@@ -61,11 +65,134 @@ router.post('/medusa', express.raw({ type: '*/*' }), async (req: Request, res: R
     res.json({ received: true, event: eventType });
   } catch (err: any) {
     console.error('Webhook error:', err);
+    // Visible in the Error Log; Medusa retries on the 500, and the order catch-up recovers anything still missing
+    await logError('WEBHOOK', `Medusa webhook processing failed: ${err?.message ?? err}`, undefined, 'ERROR', err?.stack);
     res.status(500).json({ error: 'Webhook processing failed' });
   }
 });
 
-async function handleOrderPlaced(order: any) {
+/**
+ * Order catch-up: Medusa orders (last N days) that have no WMS pick list — because the order.placed
+ * webhook was never delivered or failed. Unless dryRun, creates them exactly as the webhook would
+ * (pick list + items + stock reservation). Safe to re-run: orders that already have a pick list
+ * (including split children), or whose pick list was deliberately deleted, are skipped.
+ */
+interface OrderSummary { display_id: number; order_id: string; created_at: string; email: string | null; items: (string | null)[] }
+export interface ReconcileResult {
+  at: string;
+  dryRun: boolean;
+  days: number;
+  checked: number;
+  missing: OrderSummary[];
+  created: OrderSummary[];
+  failed: (OrderSummary & { error: string })[];
+}
+
+const SKIP_STATUSES = new Set(['canceled', 'cancelled', 'archived', 'draft']);
+const SHIPPED_FULFILMENT = new Set(['fulfilled', 'shipped', 'delivered', 'canceled']);
+const ORDER_FIELDS = 'id,display_id,email,status,fulfillment_status,created_at,items.id,items.quantity,items.variant_id,items.product_id,items.variant_sku,shipping_address.*,shipping_methods.*';
+const orderSummary = (o: any): OrderSummary => ({
+  display_id: o.display_id, order_id: o.id, created_at: o.created_at, email: o.email ?? null,
+  items: (o.items ?? []).map((i: any) => i.variant_sku ?? null),
+});
+
+async function doReconcile(days: number, dryRun: boolean): Promise<ReconcileResult> {
+  const since = Date.now() - days * 24 * 60 * 60 * 1000;
+  const PAGE = 50;
+
+  // Small pages: the Medusa Cloud instance has a low memory ceiling
+  const orders: any[] = [];
+  for (let offset = 0; offset < 500; offset += PAGE) {
+    const data = await medusaGet(`/admin/orders?limit=${PAGE}&offset=${offset}&order=-created_at&fields=${ORDER_FIELDS}`);
+    if (!Array.isArray(data?.orders)) throw new Error(`Medusa orders request failed: ${JSON.stringify(data).slice(0, 200)}`);
+    const page: any[] = data.orders;
+    if (!page.length) break;
+    orders.push(...page);
+    if (new Date(page[page.length - 1].created_at).getTime() < since) break;
+  }
+  const recent = orders.filter(o =>
+    new Date(o.created_at).getTime() >= since && !SKIP_STATUSES.has(o.status) && !SHIPPED_FULFILMENT.has(o.fulfillment_status));
+
+  const ids = recent.map(o => o.id);
+  // Split children are keyed `<order_id>-BO...`, so match on the part before the first '-'
+  const have = await query(`SELECT DISTINCT split_part(medusa_order_id, '-', 1) AS base FROM pick_lists WHERE split_part(medusa_order_id, '-', 1) = ANY($1::text[])`, [ids]);
+  const suppressed = await query(`SELECT medusa_order_id FROM suppressed_orders WHERE medusa_order_id = ANY($1::text[])`, [ids]);
+  const skip = new Set<string>([...have.rows.map((r: any) => r.base), ...suppressed.rows.map((r: any) => r.medusa_order_id)]);
+  const missing = recent.filter(o => !skip.has(o.id));
+
+  const result: ReconcileResult = {
+    at: new Date().toISOString(), dryRun, days, checked: recent.length,
+    missing: missing.map(orderSummary), created: [], failed: [],
+  };
+  if (dryRun) return result;
+
+  for (const o of missing) {
+    try {
+      await handleOrderPlaced(o);
+      result.created.push(orderSummary(o));
+    } catch (err: any) {
+      result.failed.push({ ...orderSummary(o), error: err?.message ?? String(err) });
+    }
+  }
+
+  if (result.created.length) {
+    const list = result.created.map(o => `#${o.display_id}`).join(', ');
+    await logWarning('WEBHOOK', `Recovered ${result.created.length} order(s) that never reached the WMS`, { orders: result.created });
+    await createNotification('ORDER_RECOVERED',
+      `${result.created.length} order${result.created.length === 1 ? ' was' : 's were'} missing from the WMS and recovered`,
+      `${list} — the order webhook did not deliver. Pick lists have been created.`,
+      { link: '/customer-orders', severity: 'warning', metadata: { orders: result.created.map(o => o.display_id) } });
+  }
+  if (result.failed.length) {
+    await logError('WEBHOOK', `Could not recover ${result.failed.length} missing order(s)`, { failed: result.failed });
+    await createNotificationOnce('ORDER_SYNC_FAILED',
+      `${result.failed.length} Medusa order${result.failed.length === 1 ? '' : 's'} could not be added to the WMS`,
+      result.failed.map(o => `#${o.display_id}: ${o.error}`).join('; ').slice(0, 500),
+      { link: '/error-log', severity: 'error' });
+  }
+  return result;
+}
+
+// Runs are serialised so the scheduler, the dashboard and manual calls never create the same order twice
+let reconcileQueue: Promise<unknown> = Promise.resolve();
+export function reconcileOrders(opts: { days?: number; dryRun?: boolean } = {}): Promise<ReconcileResult> {
+  const days = Math.min(Math.max(opts.days ?? 7, 1), 30);
+  const run = reconcileQueue.catch(() => undefined).then(() => doReconcile(days, opts.dryRun ?? true));
+  reconcileQueue = run;
+  return run;
+}
+
+// Dashboard polls the dry-run check; cache it so it never hammers the Medusa admin API
+const STATUS_TTL_MS = 2 * 60 * 1000;
+const statusCache = new Map<number, { at: number; result: ReconcileResult }>();
+
+/** GET /api/webhooks/sync-status?days=7 — Medusa orders vs WMS pick lists (read-only) */
+router.get('/sync-status', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const days = Math.min(Math.max(parseInt(String(req.query.days)) || 7, 1), 30);
+    const hit = statusCache.get(days);
+    if (hit && Date.now() - hit.at < STATUS_TTL_MS) return res.json(hit.result);
+    const result = await reconcileOrders({ days, dryRun: true });
+    statusCache.set(days, { at: Date.now(), result });
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(502).json({ error: 'Could not check Medusa orders', details: err?.message ?? String(err) });
+  }
+});
+
+/** POST /api/webhooks/reconcile-orders?days=7&dryRun=true — admin: preview or run the catch-up */
+router.post('/reconcile-orders', authMiddleware, requirePermission('system_admin'), async (req: Request, res: Response) => {
+  try {
+    const result = await reconcileOrders({ days: parseInt(String(req.query.days)) || 7, dryRun: String(req.query.dryRun) !== 'false' });
+    statusCache.clear();
+    return res.json(result);
+  } catch (err: any) {
+    console.error('Reconcile error:', err);
+    return res.status(500).json({ error: 'Reconcile failed', details: err?.message ?? String(err) });
+  }
+});
+
+export async function handleOrderPlaced(order: any) {
   const medusaOrderId = order.id;
   const displayId = order.display_id ?? order.id;
   const primaryShippingMethod = order.shipping_methods?.[0] ?? null;
@@ -84,7 +211,8 @@ async function handleOrderPlaced(order: any) {
     phone: shippingAddress.phone ?? null,
   } : {};
 
-  const pickListNumber = `PL-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${String(displayId).padStart(4, '0')}`;
+  const placedAt = order.created_at ? new Date(order.created_at) : new Date();
+  const pickListNumber = `PL-${placedAt.toISOString().slice(0, 10).replace(/-/g, '')}-${String(displayId).padStart(4, '0')}`;
 
   // Everything below runs in one transaction: a failed item insert must not
   // leave behind an empty pick_lists row that then silently blocks retries
@@ -94,10 +222,14 @@ async function handleOrderPlaced(order: any) {
   try {
     await client.query('BEGIN');
 
-    const existing = await client.query(`SELECT id FROM pick_lists WHERE medusa_order_id = $1`, [medusaOrderId]);
+    const existing = await client.query(
+      `SELECT 1 FROM pick_lists WHERE medusa_order_id = $1::text OR medusa_order_id LIKE $1::text || '-%'
+       UNION ALL SELECT 1 FROM suppressed_orders WHERE medusa_order_id = $1::text`,
+      [medusaOrderId]
+    );
     if (existing.rows.length > 0) {
       await client.query('ROLLBACK');
-      return; // idempotent
+      return; // idempotent: already have it (or a split child of it), or it was deliberately deleted
     }
 
     const plResult = await client.query(`
@@ -107,7 +239,7 @@ async function handleOrderPlaced(order: any) {
         shipping_method_name, shipping_method_code, shipping_address,
         created_at, updated_at
       )
-      VALUES ($1, $2, 'PENDING', $3, $4, $5, $6, $7::jsonb, NOW(), NOW())
+      VALUES ($1, $2, 'PENDING', $3, $4, $5, $6, $7::jsonb, COALESCE($8::timestamptz AT TIME ZONE 'UTC', NOW()), NOW())
       RETURNING id
     `, [
       medusaOrderId,
@@ -117,6 +249,7 @@ async function handleOrderPlaced(order: any) {
       primaryShippingMethod?.name ?? primaryShippingMethod?.shipping_option?.name ?? null,
       primaryShippingMethod?.id ?? primaryShippingMethod?.shipping_option_id ?? null,
       JSON.stringify(shippingSnapshot),
+      order.created_at ?? null,
     ]);
 
     pickListId = plResult.rows[0].id;

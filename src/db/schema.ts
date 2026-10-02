@@ -785,6 +785,14 @@ CREATE INDEX IF NOT EXISTS idx_move_sessions_status ON move_sessions(status, cre
 CREATE INDEX IF NOT EXISTS idx_move_items_session ON move_items(session_id);
 CREATE INDEX IF NOT EXISTS idx_move_scans_session ON move_scans(session_id, scanned_at DESC);
 
+-- Orders whose pick list was deliberately deleted, so the Medusa order catch-up never recreates them
+CREATE TABLE IF NOT EXISTS suppressed_orders (
+  medusa_order_id VARCHAR(100) PRIMARY KEY,
+  pick_list_number VARCHAR(50),
+  deleted_by VARCHAR,
+  deleted_at TIMESTAMP DEFAULT NOW()
+);
+
 -- ================================================================================
 -- CHECKIN DISCREPANCIES (Phase 3: Auto-flagged mismatches vs order)
 -- ================================================================================

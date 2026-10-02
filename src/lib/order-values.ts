@@ -1,9 +1,9 @@
 /**
  * Order values for the Customer Orders list, read live from Medusa (refunds change after the order is placed).
- *   gross    = order total: incl. VAT and shipping, after discounts
- *   vat      = order tax total
- *   refunded = summary.refunded_total
- *   net      = ex-VAT value of what was kept: (gross - vat) scaled by the un-refunded share of gross
+ *   gross    = order total: incl. VAT and shipping, after discounts. Medusa has already taken refunds/credit lines off it.
+ *   vat      = order tax total, scaled down to match the total once credit lines (refunds) are removed
+ *   refunded = summary.refunded_total (informational only — not subtracted again)
+ *   net      = gross - vat
  * Cached briefly per order; any failure yields null so the list never breaks.
  */
 import { medusaGet } from './medusa-client.js';
@@ -24,20 +24,22 @@ const cache = new Map<string, { at: number; ttl: number; value: OrderValue | nul
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
 async function fetchOrderValue(orderId: string): Promise<OrderValue | null> {
-  const data = await medusaGet(`/admin/orders/${encodeURIComponent(orderId)}?fields=id,currency_code,total,tax_total,*summary`);
+  const data = await medusaGet(`/admin/orders/${encodeURIComponent(orderId)}?fields=id,currency_code,total,tax_total,credit_line_total,*summary`);
   const o = data?.order;
   const gross = Number(o?.total);
   if (!o || Number.isNaN(gross)) return null;
 
-  const vat = Number(o.tax_total) || 0;
+  // tax_total still includes the VAT on credit lines, which `total` has already had deducted
+  const taxTotal = Number(o.tax_total) || 0;
+  const creditLines = Number(o.credit_line_total) || 0;
+  const vat = creditLines > 0 && gross + creditLines > 0 ? taxTotal * (gross / (gross + creditLines)) : taxTotal;
   const refunded = Number(o.summary?.refunded_total) || 0;
-  const keptShare = gross > 0 ? Math.max(0, gross - refunded) / gross : 0;
 
   return {
     gross: round2(gross),
     vat: round2(vat),
     refunded: round2(refunded),
-    net: round2((gross - vat) * keptShare),
+    net: round2(gross - vat),
     currency: String(o.currency_code || 'gbp').toUpperCase(),
   };
 }

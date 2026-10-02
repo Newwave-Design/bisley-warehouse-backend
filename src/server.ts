@@ -38,6 +38,7 @@ import moveSessionRoutes from './api/routes/move-sessions.js';
 import barcodeTestRoutes from './api/routes/barcode-test.js';
 import shippingOptionsRoutes from './routes/shipping-options.js';
 import { createNotificationOnce } from './lib/notifications.js';
+import { reconcileOrders } from './api/routes/webhooks.js';
 import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
 import { query as dbQueryUtil } from './db/index.js';
 
@@ -56,14 +57,7 @@ process.on('uncaughtException', (err) => {
   console.error('⚠️  UNCAUGHT EXCEPTION (server kept running):', err);
 });
 
-// Webhooks need the raw request body for HMAC signature verification — must be
-// mounted before the global express.json() below, or that middleware consumes
-// the body first and every signature check silently fails.
-app.use('/api/webhooks', webhooksRoutes);
-
-// Middleware
-app.use(express.json());
-app.use(cors({
+const corsOptions = {
   origin: [
     'http://localhost:3000',
     'http://localhost:3001',
@@ -75,7 +69,18 @@ app.use(cors({
     'https://bisley-warehouse-dashboard-production.up.railway.app',
   ],
   credentials: true,
-}));
+};
+
+// Webhooks need the raw request body for HMAC signature verification — must be
+// mounted before the global express.json() below, or that middleware consumes
+// the body first and every signature check silently fails.
+// CORS is applied here too: the dashboard calls /sync-status and /reconcile-orders from the browser.
+app.use('/api/webhooks', cors(corsOptions));
+app.use('/api/webhooks', webhooksRoutes);
+
+// Middleware
+app.use(express.json());
+app.use(cors(corsOptions));
 
 // Health check
 app.get('/health', (req, res) => {
@@ -221,6 +226,22 @@ async function start() {
       setInterval(() => { void runDailyChecks(); }, TWENTY_FOUR_HOURS);
       void runDailyChecks(); // also run once on boot rather than waiting a full day
       console.log('✓ Daily checks scheduled (weekly report + liability review, every 24h)');
+    }
+
+    // Order catch-up: the order.placed webhook is fire-and-forget, so every 10 minutes (and shortly after boot,
+    // since redeploys are when deliveries get dropped) create pick lists for any recent Medusa order that has none.
+    if (process.env.NODE_ENV === 'production') {
+      const runCatchUp = async () => {
+        try {
+          const r = await reconcileOrders({ days: 2, dryRun: false });
+          if (r.created.length || r.failed.length) {
+            console.log(`[scheduler] Order catch-up: ${r.created.length} recovered, ${r.failed.length} failed (of ${r.checked} checked)`);
+          }
+        } catch (err) { console.warn('[scheduler] Order catch-up error:', err); }
+      };
+      setInterval(() => { void runCatchUp(); }, 10 * 60 * 1000);
+      setTimeout(() => { void runCatchUp(); }, 30 * 1000);
+      console.log('✓ Order catch-up scheduled (every 10 min, last 2 days)');
     }
 
     // Scheduled catalogue sync — pulls new/changed Medusa products into the WMS automatically,

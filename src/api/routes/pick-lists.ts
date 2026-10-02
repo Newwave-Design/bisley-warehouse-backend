@@ -1415,10 +1415,17 @@ router.delete('/:pickListId', authMiddleware, requirePermission('manage_operatio
     }
     
     const existing = await query(
-      `SELECT id FROM pick_lists WHERE id = $1`,
+      `SELECT id, medusa_order_id, pick_list_number FROM pick_lists WHERE id = $1`,
       [pickListId]
     );
     if (!existing.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+
+    // Remember the order so the Medusa catch-up doesn't bring it back (children are keyed `<order_id>-BO...`)
+    await query(
+      `INSERT INTO suppressed_orders (medusa_order_id, pick_list_number, deleted_by)
+       VALUES (split_part($1::text, '-', 1), $2, $3) ON CONFLICT (medusa_order_id) DO NOTHING`,
+      [existing.rows[0].medusa_order_id, existing.rows[0].pick_list_number, (req as any).user?.email ?? null]
+    );
     
     // Cascade delete all associated items (pick_list_items has ON DELETE CASCADE)
     // then delete the pick list
