@@ -13,6 +13,7 @@
  * PATCH  /api/stock-in/sessions/:id/items/:itemId — Edit quantity (review screen)
  * DELETE /api/stock-in/sessions/:id/items/:itemId — Remove item
  * POST   /api/stock-in/sessions/:id/confirm  — Commit stock to warehouse + sync to Medusa
+ * POST   /api/stock-in/sessions/:id/reopen   — Put an abandoned session back to OPEN
  */
 
 import express, { Response } from 'express';
@@ -177,6 +178,23 @@ router.post('/sessions/:id/abandon', authMiddleware, async (req: AuthRequest, re
   } catch (err) {
     logger.error(`Failed to abandon session: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
     res.status(500).json({ error: 'Failed to abandon session' });
+  }
+});
+
+/** POST /api/stock-in/sessions/:id/reopen — put an abandoned session back to OPEN so scanning can carry on */
+router.post('/sessions/:id/reopen', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(
+      `UPDATE checkin_sessions SET status = 'OPEN', updated_at = NOW() WHERE id = $1 AND status = 'CANCELLED' RETURNING id`,
+      [req.params.id]
+    );
+    if (!result.rows[0]) return res.status(400).json({ error: 'Session not found or not abandoned' });
+
+    logger.info(`[stock-in] Reopened session ${req.params.id}`);
+    res.json({ success: true });
+  } catch (err) {
+    logger.error(`Failed to reopen session: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
+    res.status(500).json({ error: 'Failed to reopen session' });
   }
 });
 
