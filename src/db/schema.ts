@@ -741,6 +741,8 @@ CREATE TABLE IF NOT EXISTS checkin_scans (
   scanned_at TIMESTAMP DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_checkin_scans_session ON checkin_scans(session_id, scanned_at DESC);
+-- Soft delete of a single scan: its units come off the item's count and it shows struck through until restored
+ALTER TABLE checkin_scans ADD COLUMN IF NOT EXISTS removed_at TIMESTAMP;
 -- Seed one history row for items in still-open sessions that pre-date scan logging
 INSERT INTO checkin_scans (session_id, item_id, quantity, scanned_at)
 SELECT ci.session_id, ci.id, ci.quantity_scanned, COALESCE(ci.updated_at, ci.scanned_at, NOW())

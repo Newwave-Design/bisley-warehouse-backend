@@ -14,6 +14,8 @@
  * DELETE /api/stock-in/sessions/:id/items/:itemId — Remove item
  * POST   /api/stock-in/sessions/:id/confirm  — Commit stock to warehouse + sync to Medusa
  * POST   /api/stock-in/sessions/:id/reopen   — Put an abandoned session back to OPEN
+ * DELETE /api/stock-in/sessions/:id/scans/:scanId — Trash one scan (struck through, units come off the count)
+ * POST   /api/stock-in/sessions/:id/scans/:scanId/restore — Restore a trashed scan
  */
 
 import express, { Response } from 'express';
@@ -142,7 +144,7 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
     );
 
     const scans = await query(
-      `SELECT id, item_id, quantity, scanned_at FROM checkin_scans
+      `SELECT id, item_id, quantity, scanned_at, removed_at FROM checkin_scans
        WHERE session_id = $1 ORDER BY scanned_at DESC LIMIT 500`,
       [req.params.id]
     );
@@ -313,6 +315,54 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
     const errorMsg = err instanceof Error ? err.message : JSON.stringify(err);
     logger.error(`Scan failed: ${errorMsg}`);
     res.status(500).json({ error: `Scan failed: ${errorMsg}` });
+  }
+});
+
+/**
+ * DELETE /api/stock-in/sessions/:id/scans/:scanId — trash one scan: it stays in the history, struck through,
+ * and its units come off the item's count. POST .../restore puts it back.
+ */
+router.delete('/sessions/:id/scans/:scanId', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const session = await query(`SELECT status FROM checkin_sessions WHERE id = $1`, [req.params.id]);
+    if (session.rows[0]?.status !== 'OPEN') return res.status(400).json({ error: 'Session is not open' });
+
+    const scan = await query(
+      `UPDATE checkin_scans SET removed_at = NOW() WHERE id = $1 AND session_id = $2 AND removed_at IS NULL RETURNING item_id, quantity`,
+      [req.params.scanId, req.params.id]
+    );
+    if (!scan.rows[0]) return res.status(404).json({ error: 'Scan not found or already removed' });
+
+    const item = await query(
+      `UPDATE checkin_items SET quantity_scanned = GREATEST(quantity_scanned - $1, 0), updated_at = NOW() WHERE id = $2 RETURNING *`,
+      [scan.rows[0].quantity, scan.rows[0].item_id]
+    );
+    res.json({ success: true, item: item.rows[0] });
+  } catch (err) {
+    logger.error(`Failed to remove scan: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
+    res.status(500).json({ error: 'Failed to remove scan' });
+  }
+});
+
+router.post('/sessions/:id/scans/:scanId/restore', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const session = await query(`SELECT status FROM checkin_sessions WHERE id = $1`, [req.params.id]);
+    if (session.rows[0]?.status !== 'OPEN') return res.status(400).json({ error: 'Session is not open' });
+
+    const scan = await query(
+      `UPDATE checkin_scans SET removed_at = NULL WHERE id = $1 AND session_id = $2 AND removed_at IS NOT NULL RETURNING item_id, quantity`,
+      [req.params.scanId, req.params.id]
+    );
+    if (!scan.rows[0]) return res.status(404).json({ error: 'Removed scan not found' });
+
+    const item = await query(
+      `UPDATE checkin_items SET quantity_scanned = quantity_scanned + $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+      [scan.rows[0].quantity, scan.rows[0].item_id]
+    );
+    res.json({ success: true, item: item.rows[0] });
+  } catch (err) {
+    logger.error(`Failed to restore scan: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
+    res.status(500).json({ error: 'Failed to restore scan' });
   }
 });
 
