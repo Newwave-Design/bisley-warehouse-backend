@@ -22,7 +22,10 @@ router.get('/reference', authMiddleware, async (_req: AuthRequest, res: Response
         `SELECT variant_sku AS sku, product_title AS title, colour_code, colour_name, variant_thumbnail AS thumbnail, nw_code
            FROM wms_products WHERE is_archived = false`
       ),
-      query(`SELECT location_code, bay_code, bin_code FROM warehouse_locations WHERE is_active = true`),
+      query(
+        `SELECT id, location_code, aisle_code, bay_code, bin_code, description, max_weight_kg::float8 AS max_weight_kg
+           FROM warehouse_locations WHERE is_active = true`
+      ),
       query(
         `SELECT wi.product_sku AS sku, wi.colour_code, wl.location_code, wi.quantity, wi.quantity_reserved
            FROM warehouse_inventory wi JOIN warehouse_locations wl ON wl.id = wi.location_id

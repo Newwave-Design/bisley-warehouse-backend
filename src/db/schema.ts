@@ -1378,4 +1378,18 @@ CREATE INDEX IF NOT EXISTS idx_return_items_authorization_id ON return_items(ret
 CREATE INDEX IF NOT EXISTS idx_return_items_status ON return_items(status);
 CREATE INDEX IF NOT EXISTS idx_return_items_sku ON return_items(product_sku);
 
+-- ================================================================================
+-- MOBILE APP RELEASES (APKs for the Android handheld's in-app update; the app downloads the newest one)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS mobile_app_releases (
+  version_code INT PRIMARY KEY,
+  version_name VARCHAR NOT NULL,
+  notes TEXT,
+  size_bytes INT NOT NULL,
+  sha256 VARCHAR(64) NOT NULL,
+  apk BYTEA NOT NULL,
+  published_by VARCHAR,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
 `;
