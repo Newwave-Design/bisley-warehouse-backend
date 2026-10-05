@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS barcode_mappings (
 );
 -- Add thumbnail_url to existing installations that predate this column
 ALTER TABLE barcode_mappings ADD COLUMN IF NOT EXISTS thumbnail_url VARCHAR(500);
+-- Who assigned a barcode by hand from the handheld (null for codes that came from the Medusa sync)
+ALTER TABLE barcode_mappings ADD COLUMN IF NOT EXISTS assigned_by VARCHAR;
 
 -- ================================================================================
 -- WMS PRODUCTS (Local Medusa cache — synced via POST /api/products/sync)
@@ -126,6 +128,9 @@ CREATE INDEX IF NOT EXISTS idx_wms_products_sync_run ON wms_products(last_sync_r
 -- a physical box label be matched directly to a wms_products row without a sku_mappings join.
 -- Kept in sync with sku_mappings.nw_code (the canonical source) whenever an order PDF is parsed.
 ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS nw_code VARCHAR(50);
+-- Supplier's own part number + colour code (from the barcode spreadsheet); not touched by the Medusa sync — see data-ops/populate-supplier-codes.mjs
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS supplier_part_code VARCHAR(100);
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS supplier_colour_code VARCHAR(30);
 CREATE INDEX IF NOT EXISTS idx_wms_products_nw_code ON wms_products(nw_code);
 
 -- ================================================================================
@@ -966,6 +971,11 @@ CREATE TABLE IF NOT EXISTS field_mappings (
   CONSTRAINT unique_direction_source UNIQUE(mapping_direction, source_field)
 );
 
+-- WMS_TO_SUPPLIER = columns of the re-order spreadsheet emailed to the supplier. WMS-only data: nothing here is written back to Medusa.
+ALTER TABLE field_mappings DROP CONSTRAINT IF EXISTS field_mappings_mapping_direction_check;
+ALTER TABLE field_mappings ADD CONSTRAINT field_mappings_mapping_direction_check
+  CHECK (mapping_direction IN ('MEDUSA_TO_WMS', 'WMS_TO_GENERO', 'WMS_TO_SUPPLIER'));
+
 -- Seed default Medusa → WMS field mappings (idempotent)
 INSERT INTO field_mappings (mapping_direction, source_field, source_label, target_field, target_label, notes) VALUES
   ('MEDUSA_TO_WMS', 'variant.sku',                   'Variant SKU',            'sku_mappings.medusa_sku',            'Medusa SKU',          'Primary identifier for matching variants to WMS records'),
@@ -985,7 +995,11 @@ INSERT INTO field_mappings (mapping_direction, source_field, source_label, targe
   ('WMS_TO_GENERO', '(env) GENERO_ACCOUNT_NO',          'NW Account Number',    'account',    'account',      'Bisley New Wave account number — configured as GENERO_ACCOUNT_NO env var. Required.'),
   ('WMS_TO_GENERO', 'genero_order_lines.bisley_order',  'Bisley Order No',      'order_id',   'order_id',     'Genero returns bisley_order on first submit; pass as order_id on subsequent polls'),
   ('WMS_TO_GENERO', '(returned) status',                'Order Status',         null,         'status',       'Returned by Genero: Open / In Production / Dispatched etc. Update on each poll.'),
-  ('WMS_TO_GENERO', '(returned) Est_delivery',          'Est. Delivery Date',   null,         'Est_delivery', 'Returned by Genero: estimated delivery date. Poll periodically as it updates.')
+  ('WMS_TO_GENERO', '(returned) Est_delivery',          'Est. Delivery Date',   null,         'Est_delivery', 'Returned by Genero: estimated delivery date. Poll periodically as it updates.'),
+  ('WMS_TO_SUPPLIER', 'wms_products.supplier_part_code',   'Supplier SKU',   'SKU',      'SKU',      'Supplier part number: "Product Code" in Bisley Product Barcodes.xlsx, matched via EAN (data-ops/populate-supplier-codes.mjs). Stored in the WMS only; never written to Medusa. Rows without one cannot be sent.'),
+  ('WMS_TO_SUPPLIER', 'wms_products.product_title',        'Product Title',  'Title',    'Title',    'Product name from the Medusa sync (read-only copy)'),
+  ('WMS_TO_SUPPLIER', 'wms_products.supplier_colour_code', 'Supplier Colour', 'Colour',  'Colour',   'Supplier colour code: "Colour" in Bisley Product Barcodes.xlsx. Stored in the WMS only.'),
+  ('WMS_TO_SUPPLIER', 'pick_list_items.quantity_required', 'Quantity',       'Quantity', 'Quantity', 'Customer-order quantity; kits expand to components (qty x kit required qty)')
 ON CONFLICT (mapping_direction, source_field) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS idx_field_mappings_direction ON field_mappings(mapping_direction);
@@ -1391,5 +1405,37 @@ CREATE TABLE IF NOT EXISTS mobile_app_releases (
   published_by VARCHAR,
   created_at TIMESTAMP DEFAULT NOW()
 );
+
+-- ================================================================================
+-- SUPPLIERS + SUPPLIER RE-ORDER SENDS (spreadsheet emailed to a supplier for ticked customer-order lines)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS suppliers (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(255),
+  email VARCHAR(255) NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_suppliers_email ON suppliers (LOWER(email));
+
+CREATE TABLE IF NOT EXISTS supplier_reorder_sends (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  supplier_id UUID NOT NULL REFERENCES suppliers(id),
+  sent_to VARCHAR(255) NOT NULL,
+  sent_by VARCHAR(255),
+  line_count INT NOT NULL,
+  sent_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- One row per sent spreadsheet line; (pick_list_item_id, sku) identifies a line (kits expand to components).
+CREATE TABLE IF NOT EXISTS supplier_reorder_send_lines (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  send_id UUID NOT NULL REFERENCES supplier_reorder_sends(id) ON DELETE CASCADE,
+  pick_list_item_id UUID NOT NULL REFERENCES pick_list_items(id) ON DELETE CASCADE,
+  sku VARCHAR(100) NOT NULL,
+  quantity INT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_srsl_line ON supplier_reorder_send_lines (pick_list_item_id, sku);
+CREATE INDEX IF NOT EXISTS idx_srsl_send ON supplier_reorder_send_lines (send_id);
 
 `;
