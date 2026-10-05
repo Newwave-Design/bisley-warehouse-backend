@@ -368,6 +368,37 @@ router.post('/sessions/:id/scans/:scanId/restore', authMiddleware, async (req: A
   }
 });
 
+/** PATCH /api/stock-in/sessions/:id/scans/:scanId { quantity } — change one scan's quantity; the item's count moves by the difference */
+router.patch('/sessions/:id/scans/:scanId', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const qty = parseInt(req.body?.quantity);
+    if (!(qty >= 1 && qty <= 9999)) return res.status(400).json({ error: 'Quantity must be between 1 and 9999' });
+
+    const session = await query(`SELECT status FROM checkin_sessions WHERE id = $1`, [req.params.id]);
+    if (session.rows[0]?.status !== 'OPEN') return res.status(400).json({ error: 'Session is not open' });
+
+    const current = await query(
+      `SELECT item_id, quantity, removed_at FROM checkin_scans WHERE id = $1 AND session_id = $2`,
+      [req.params.scanId, req.params.id]
+    );
+    const scan = current.rows[0];
+    if (!scan) return res.status(404).json({ error: 'Scan not found' });
+
+    await query(`UPDATE checkin_scans SET quantity = $1 WHERE id = $2`, [qty, req.params.scanId]);
+    // a trashed scan is not in the count, so only its own row changes
+    const item = scan.removed_at
+      ? await query(`SELECT * FROM checkin_items WHERE id = $1`, [scan.item_id])
+      : await query(
+          `UPDATE checkin_items SET quantity_scanned = GREATEST(quantity_scanned + $1, 0), updated_at = NOW() WHERE id = $2 RETURNING *`,
+          [qty - scan.quantity, scan.item_id]
+        );
+    res.json({ success: true, item: item.rows[0] });
+  } catch (err) {
+    logger.error(`Failed to change scan quantity: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
+    res.status(500).json({ error: 'Failed to change scan quantity' });
+  }
+});
+
 /** PATCH /api/stock-in/sessions/:id/items/:itemId — Edit quantity on review screen */
 router.patch('/sessions/:id/items/:itemId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
