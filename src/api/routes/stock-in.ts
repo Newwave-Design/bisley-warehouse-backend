@@ -20,6 +20,7 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
+import { failedScansFor } from '../../lib/failed-scans.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { getProductDetails } from '../../lib/inventory-sync-service.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
@@ -159,6 +160,7 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
       items: items.rows,
       scans: scans.rows,
       summary: summary.rows[0],
+      failed_scans: await failedScansFor('STOCK_IN', req.params.id),
     });
   } catch (err) {
     logger.error(`Failed to fetch session: ${err instanceof Error ? err.message : JSON.stringify(err)}`);

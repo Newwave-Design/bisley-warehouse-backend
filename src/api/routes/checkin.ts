@@ -15,6 +15,7 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
+import { failedScansFor } from '../../lib/failed-scans.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 
 const router = express.Router();
@@ -159,7 +160,7 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
       order_line_items = lines.rows;
     }
 
-    res.json({ ...session.rows[0], items: items.rows, discrepancies: discrepancies.rows, order_line_items });
+    res.json({ ...session.rows[0], items: items.rows, discrepancies: discrepancies.rows, order_line_items, failed_scans: await failedScansFor('STOCK_IN', req.params.id) });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch session' });
   }

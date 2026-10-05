@@ -84,10 +84,59 @@ router.post('/barcodes', authMiddleware, async (req: AuthRequest, res: Response)
       [barcode, p.variant_sku, p.colour_code, p.colour_name, p.product_title, p.variant_thumbnail, p.medusa_product_id, p.medusa_variant_id, req.user?.email ?? null]
     );
     console.log(`[mobile-sync] Barcode ${barcode} assigned to ${p.variant_sku} by ${req.user?.email}`);
+    // every scan of this code that failed earlier is now explained
+    await query(
+      `UPDATE failed_scans SET resolved_at = NOW(), resolution = 'ASSIGNED', resolved_sku = $2 WHERE code = $1 AND resolved_at IS NULL`,
+      [barcode, p.variant_sku]
+    );
     res.json({ success: true, barcode, sku: p.variant_sku });
   } catch (err) {
     console.error('Barcode assignment error:', err);
     res.status(500).json({ error: 'Failed to assign barcode' });
+  }
+});
+
+/**
+ * POST /api/mobile-sync/failed-scans { client_id, source: STOCK_IN|MOVE|PICK, session_id, code, quantity, scanned_at }
+ * Keeps a scan the handheld could not match against the session it happened in. Idempotent on client_id; if the code
+ * has been assigned to a product in the meantime the row is stored already resolved.
+ */
+router.post('/failed-scans', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { client_id, source, session_id, code, quantity, scanned_at } = req.body ?? {};
+    if (!client_id || !code || !['STOCK_IN', 'MOVE', 'PICK'].includes(source)) {
+      return res.status(400).json({ error: 'client_id, code and a valid source required' });
+    }
+    const at = scanned_at && !isNaN(Date.parse(scanned_at)) ? new Date(scanned_at) : new Date();
+    const mapped = await query(`SELECT product_sku FROM barcode_mappings WHERE barcode = $1 AND is_active = true LIMIT 1`, [String(code)]);
+    const sku: string | null = mapped.rows[0]?.product_sku ?? null;
+    await query(
+      `INSERT INTO failed_scans (client_id, source, session_id, code, quantity, scanned_by, scanned_at, resolved_at, resolution, resolved_sku)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (client_id) DO NOTHING`,
+      [String(client_id), source, session_id ? String(session_id) : null, String(code).slice(0, 100), Math.max(1, parseInt(quantity) || 1),
+        req.user?.email ?? null, at, sku ? new Date() : null, sku ? 'ASSIGNED' : null, sku]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Failed scan save error:', err);
+    res.status(500).json({ error: 'Failed to save scan' });
+  }
+});
+
+/** POST /api/mobile-sync/failed-scans/resolve { client_id } — the person discarded a failed scan on the handheld. */
+router.post('/failed-scans/resolve', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const clientId = String(req.body?.client_id ?? '');
+    if (!clientId) return res.status(400).json({ error: 'client_id required' });
+    await query(
+      `UPDATE failed_scans SET resolved_at = NOW(), resolution = 'DISCARDED' WHERE client_id = $1 AND resolved_at IS NULL`,
+      [clientId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Failed scan resolve error:', err);
+    res.status(500).json({ error: 'Failed to update scan' });
   }
 });
 

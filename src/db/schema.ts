@@ -1407,6 +1407,25 @@ CREATE TABLE IF NOT EXISTS mobile_app_releases (
 );
 
 -- ================================================================================
+-- FAILED SCANS (codes a handheld scanned that matched no product; kept against the session they happened in)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS failed_scans (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id VARCHAR(200) UNIQUE,
+  source VARCHAR(20) NOT NULL,
+  session_id VARCHAR(100),
+  code VARCHAR(100) NOT NULL,
+  quantity INT NOT NULL DEFAULT 1,
+  scanned_by VARCHAR,
+  scanned_at TIMESTAMP DEFAULT NOW(),
+  resolved_at TIMESTAMP,
+  resolution VARCHAR(20),
+  resolved_sku VARCHAR(100)
+);
+CREATE INDEX IF NOT EXISTS idx_failed_scans_session ON failed_scans(source, session_id);
+CREATE INDEX IF NOT EXISTS idx_failed_scans_open_code ON failed_scans(code) WHERE resolved_at IS NULL;
+
+-- ================================================================================
 -- SUPPLIERS + SUPPLIER RE-ORDER SENDS (spreadsheet emailed to a supplier for ticked customer-order lines)
 -- ================================================================================
 CREATE TABLE IF NOT EXISTS suppliers (

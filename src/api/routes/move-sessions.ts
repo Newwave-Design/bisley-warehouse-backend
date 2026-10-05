@@ -16,6 +16,7 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
+import { failedScansFor } from '../../lib/failed-scans.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { lookupProduct, getStock, toUuidOrNull } from './mobile.js';
 import { moveStockBetweenBays } from '../../lib/stock-move.js';
@@ -87,7 +88,7 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
       `SELECT id, item_id, quantity, scanned_at FROM move_scans WHERE session_id = $1 ORDER BY scanned_at DESC LIMIT 500`,
       [req.params.id]
     );
-    res.json({ session: session.rows[0], items: items.rows, scans: scans.rows });
+    res.json({ session: session.rows[0], items: items.rows, scans: scans.rows, failed_scans: await failedScansFor('MOVE', req.params.id) });
   } catch (err) {
     logger.error(`Failed to fetch session: ${errMsg(err)}`);
     res.status(500).json({ error: 'Failed to fetch session' });
