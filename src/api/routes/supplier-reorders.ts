@@ -9,7 +9,7 @@
  * GET  /api/supplier-reorders            — all rows with last-sent info
  * GET  /api/supplier-reorders/suppliers  — saved suppliers
  * POST /api/supplier-reorders/send       — { supplier: { email, name? }, lines: [{ pick_list_item_id, sku }] }
- *      Builds the .xlsx (SKU, Title, Colour, Quantity), emails it via Medusa's mailer
+ *      Builds the .xlsx (SKU, Title, Colour, Full SKU, Quantity — one row per supplier SKU + colour, quantities summed), emails it via Medusa's mailer
  *      (POST /admin/supplier-orders/send), saves the supplier, and records the send.
  *
  * Replaces the threshold-driven Pending Reorders flow (kept in the code, hidden from the nav).
@@ -200,10 +200,23 @@ router.post('/send', authMiddleware, requirePermission('manage_orders'), async (
       return res.status(422).json({ error: `No supplier SKU for: ${missing.join(', ')}. Untick these rows.` });
     }
 
-    const aoa: (string | number)[][] = [['SKU', 'Title', 'Colour', 'Quantity']];
-    for (const l of selected) aoa.push([safeCell(l.supplier_sku!), safeCell(l.title), safeCell(l.supplier_colour), l.quantity]);
+    // One row per supplier SKU + colour, quantities summed across the ticked order lines
+    const grouped = new Map<string, { sku: string; colour: string; title: string; quantity: number }>();
+    for (const l of selected) {
+      const key = `${l.supplier_sku}|${l.supplier_colour}`;
+      const g = grouped.get(key);
+      if (g) g.quantity += l.quantity;
+      else grouped.set(key, { sku: l.supplier_sku!, colour: l.supplier_colour, title: l.title, quantity: l.quantity });
+    }
+    const sheetRows = [...grouped.values()].sort((a, b) => a.sku.localeCompare(b.sku) || a.colour.localeCompare(b.colour));
+
+    const aoa: (string | number)[][] = [['SKU', 'Title', 'Colour', 'Full SKU', 'Quantity']];
+    for (const r of sheetRows) {
+      const full = r.colour ? `${r.sku}-${r.colour}` : r.sku;
+      aoa.push([safeCell(r.sku), safeCell(r.title), safeCell(r.colour), safeCell(full), r.quantity]);
+    }
     const ws = XLSX.utils.aoa_to_sheet(aoa);
-    ws['!cols'] = [{ wch: 22 }, { wch: 50 }, { wch: 20 }, { wch: 10 }];
+    ws['!cols'] = [{ wch: 22 }, { wch: 50 }, { wch: 14 }, { wch: 30 }, { wch: 10 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Re-order');
     const buffer: Buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -216,7 +229,7 @@ router.post('/send', authMiddleware, requirePermission('manage_orders'), async (
       to: email,
       supplier_name: name || null,
       filename,
-      line_count: selected.length,
+      line_count: sheetRows.length,
       content_base64: buffer.toString('base64'),
     });
 
@@ -252,7 +265,9 @@ router.post('/send', authMiddleware, requirePermission('manage_orders'), async (
     }
   } catch (err: any) {
     console.error('[supplier-reorders] send failed:', err);
-    res.status(502).json({ error: 'Could not send the email — nothing was recorded' });
+    // Medusa's own message (e.g. missing sender env var) is what tells the user what to fix
+    const reason = String(err?.message ?? '').replace(/^Medusa API error: \d+ /, '').slice(0, 300);
+    res.status(502).json({ error: `Could not send the email — nothing was recorded${reason ? `: ${reason}` : ''}` });
   }
 });
 

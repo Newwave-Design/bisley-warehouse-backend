@@ -1001,7 +1001,8 @@ INSERT INTO field_mappings (mapping_direction, source_field, source_label, targe
   ('WMS_TO_SUPPLIER', 'wms_products.supplier_part_code',   'Supplier SKU',   'SKU',      'SKU',      'Supplier part number: "Product Code" in Bisley Product Barcodes.xlsx, matched via EAN (data-ops/populate-supplier-codes.mjs). Stored in the WMS only; never written to Medusa. Rows without one cannot be sent.'),
   ('WMS_TO_SUPPLIER', 'wms_products.product_title',        'Product Title',  'Title',    'Title',    'Product name from the Medusa sync (read-only copy)'),
   ('WMS_TO_SUPPLIER', 'wms_products.supplier_colour_code', 'Supplier Colour', 'Colour',  'Colour',   'Supplier colour code: "Colour" in Bisley Product Barcodes.xlsx. Stored in the WMS only.'),
-  ('WMS_TO_SUPPLIER', 'pick_list_items.quantity_required', 'Quantity',       'Quantity', 'Quantity', 'Customer-order quantity; kits expand to components (qty x kit required qty)')
+  ('WMS_TO_SUPPLIER', 'pick_list_items.quantity_required', 'Quantity',       'Quantity', 'Quantity', 'Customer-order quantity; kits expand to components (qty x kit required qty). Summed per supplier SKU + colour in the spreadsheet'),
+  ('WMS_TO_SUPPLIER', 'wms_products.supplier_part_code + supplier_colour_code', 'Full SKU', 'Full SKU', 'Full SKU', 'Supplier part number and colour joined as PART-COLOUR, as on the supplier order PDFs')
 ON CONFLICT (mapping_direction, source_field) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS idx_field_mappings_direction ON field_mappings(mapping_direction);
