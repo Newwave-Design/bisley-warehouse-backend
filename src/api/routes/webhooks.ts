@@ -325,46 +325,53 @@ async function handleOrderCancelled(order: any) {
   const medusaOrderId = order.id;
   console.log(`[webhooks] Processing order.cancelled for ${medusaOrderId}`);
 
-  // Find the pick list
-  const plResult = await query(`SELECT id, status FROM pick_lists WHERE medusa_order_id = $1`, [medusaOrderId]);
+  // Find the pick list and any split children (keyed `<order_id>-BO...`)
+  const plResult = await query(
+    `SELECT id, status FROM pick_lists WHERE medusa_order_id = $1 OR left(medusa_order_id, length($1) + 3) = $1 || '-BO'`,
+    [medusaOrderId]
+  );
   if (plResult.rows.length === 0) {
     console.log(`[webhooks] No pick list found for order ${medusaOrderId}, skipping cancellation`);
     return;
   }
 
-  const pickListId = plResult.rows[0].id;
-  const pickListStatus = plResult.rows[0].status;
+  const affectedSkus = new Set<string>();
+  for (const pl of plResult.rows) {
+    const pickListId = pl.id;
+    const pickListStatus = pl.status;
 
-  // Don't cancel if already in final state
-  if (['DISPATCHED', 'CANCELLED'].includes(pickListStatus)) {
-    console.log(`[webhooks] Pick list ${pickListId} already in final state (${pickListStatus}), skipping`);
-    return;
-  }
+    // Don't cancel if already in final state
+    if (['DISPATCHED', 'CANCELLED'].includes(pickListStatus)) {
+      console.log(`[webhooks] Pick list ${pickListId} already in final state (${pickListStatus}), skipping`);
+      continue;
+    }
 
-  // Get all items and their quantities
-  const itemsResult = await query(
-    `SELECT product_sku, quantity_required FROM pick_list_items WHERE pick_list_id = $1`,
-    [pickListId]
-  );
-
-  // Release reserved stock for each item
-  for (const item of itemsResult.rows) {
-    await query(
-      `UPDATE warehouse_inventory
-       SET quantity_reserved = GREATEST(0, quantity_reserved - $1), updated_at = NOW()
-       WHERE product_sku = $2`,
-      [item.quantity_required, item.product_sku]
+    // Get all items and their quantities
+    const itemsResult = await query(
+      `SELECT product_sku, quantity_required FROM pick_list_items WHERE pick_list_id = $1`,
+      [pickListId]
     );
-  }
 
-  // Cancel the pick list
-  await query(
-    `UPDATE pick_lists SET status = 'CANCELLED', updated_at = NOW() WHERE id = $1`,
-    [pickListId]
-  );
+    // Release reserved stock for each item
+    for (const item of itemsResult.rows) {
+      await query(
+        `UPDATE warehouse_inventory
+         SET quantity_reserved = GREATEST(0, quantity_reserved - $1), updated_at = NOW()
+         WHERE product_sku = $2`,
+        [item.quantity_required, item.product_sku]
+      );
+      affectedSkus.add(item.product_sku);
+    }
+
+    // Cancel the pick list
+    await query(
+      `UPDATE pick_lists SET status = 'CANCELLED', updated_at = NOW() WHERE id = $1`,
+      [pickListId]
+    );
+    console.log(`✓ Order ${medusaOrderId} cancelled — pick list ${pickListId} marked CANCELLED, stock released`);
+  }
 
   // Sync updated available quantities back to Medusa
-  const affectedSkus = new Set<string>(itemsResult.rows.map((r: any) => r.product_sku));
   for (const sku of affectedSkus) {
     const row = await query(
       `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
@@ -373,8 +380,6 @@ async function handleOrderCancelled(order: any) {
     const available = Math.max(0, parseInt(row.rows[0]?.qty ?? '0') - parseInt(row.rows[0]?.reserved ?? '0'));
     await syncSkuToMedusa(sku, available);
   }
-
-  console.log(`✓ Order ${medusaOrderId} cancelled — pick list ${pickListId} marked CANCELLED, stock released`);
 }
 
 /**

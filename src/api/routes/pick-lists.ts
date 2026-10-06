@@ -566,13 +566,14 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
            customer_name, customer_email, shipping_method_name, shipping_method_code, shipping_address,
            is_sandbox, notes, created_at, updated_at
          )
-         VALUES ($1, $2, 'AWAITING_STOCK', $3, $4, $5, $6, $7, $8::jsonb, $9, $10, NOW(), NOW())
+         VALUES ($1, $2, 'AWAITING_STOCK', $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, NOW())
          RETURNING id`,
         [
           childOrderId, childPickListNumber, pickListId,
           pl.customer_name, pl.customer_email, pl.shipping_method_name, pl.shipping_method_code,
           JSON.stringify(pl.shipping_address || {}), pl.is_sandbox,
           `Split from ${pl.pick_list_number} — awaiting stock`,
+          pl.created_at,
         ]
       );
       const childId = child.rows[0].id;
@@ -580,17 +581,23 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
       let childLineNumber = 1;
       for (const { item, shortQty } of shortItems) {
         const keepQty = item.quantity_required - item.quantity_picked - shortQty;
-        if (keepQty > 0) {
-          // Still enough to pick some now — reduce the required quantity, keep quantity_picked as-is
-          await query(`UPDATE pick_list_items SET quantity_required = $1, updated_at = NOW() WHERE id = $2`, [item.quantity_picked + keepQty, item.id]);
-        } else {
-          await query(`DELETE FROM pick_list_items WHERE id = $1`, [item.id]);
+        if (keepQty <= 0 && !(item.quantity_picked > 0)) {
+          // Whole line moves across: keep the same row so its id, order-line id, date and supplier-send history survive
+          await query(
+            `UPDATE pick_list_items SET pick_list_id = $1, line_number = $2, quantity_required = $3, updated_at = NOW() WHERE id = $4`,
+            [childId, childLineNumber++, shortQty, item.id]
+          );
+          continue;
         }
 
+        // Part of the line stays: reduce the parent (never below what is already picked) and copy the short part across
+        await query(`UPDATE pick_list_items SET quantity_required = $1, updated_at = NOW() WHERE id = $2`, [item.quantity_picked + Math.max(keepQty, 0), item.id]);
         await query(
-          `INSERT INTO pick_list_items (pick_list_id, line_number, product_sku, colour_code, quantity_required, status, is_sandbox, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, NOW(), NOW())`,
-          [childId, childLineNumber++, item.product_sku, item.colour_code, shortQty, pl.is_sandbox]
+          `INSERT INTO pick_list_items (pick_list_id, line_number, product_sku, colour_code, quantity_required, status, is_sandbox,
+             medusa_order_line_item_id, medusa_variant_id, medusa_product_id, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8, $9, $10, NOW())`,
+          [childId, childLineNumber++, item.product_sku, item.colour_code, shortQty, pl.is_sandbox,
+           item.medusa_order_line_item_id, item.medusa_variant_id, item.medusa_product_id, item.created_at]
         );
       }
     }
@@ -705,132 +712,9 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
  *
  * This is a DYNAMIC split — no hardcoded AWAITING_STOCK status, just calculated state.
  */
-router.post('/:pickListId/split-for-picking', authMiddleware, requirePermission('manage_operations'), async (req: Request, res: Response) => {
-  try {
-    const { pickListId } = req.params;
-
-    const header = await query(`SELECT * FROM pick_lists WHERE id = $1`, [pickListId]);
-    if (!header.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
-    const pl = header.rows[0];
-
-    if (!['PENDING', 'IN_PROGRESS'].includes(pl.status)) {
-      return res.status(400).json({ error: `Cannot split a pick list with status ${pl.status}` });
-    }
-
-    const itemsResult = await query(
-      `SELECT * FROM pick_list_items WHERE pick_list_id = $1 ORDER BY line_number`,
-      [pickListId]
-    );
-    const items = itemsResult.rows;
-
-    const availableItems: any[] = [];
-    const unavailableItems: any[] = [];
-
-    // Check stock for each item
-    for (const item of items) {
-      const remaining = item.quantity_required - item.quantity_picked;
-      const stockRow = await query(
-        `SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE product_sku = $1`,
-        [item.product_sku]
-      );
-      const available = stockRow.rows[0].qty;
-
-      if (available >= remaining) {
-        availableItems.push(item);
-      } else {
-        unavailableItems.push(item);
-      }
-    }
-
-    if (unavailableItems.length === 0) {
-      return res.status(400).json({
-        error: 'All items have sufficient stock — nothing to split',
-        message: 'Use normal picking workflow',
-      });
-    }
-
-    if (availableItems.length === 0) {
-      return res.status(400).json({
-        error: 'No items have sufficient stock — cannot split',
-        short_items: unavailableItems.map(i => ({
-          sku: i.product_sku,
-          required: i.quantity_required - i.quantity_picked,
-        })),
-      });
-    }
-
-    // Create "ready to pick" pick list with available items
-    const suffix = Date.now().toString(36).slice(-4).toUpperCase();
-    const readyPickListNumber = `${pl.pick_list_number}-R`; // -R for "Ready"
-    const readyChild = await query(
-      `INSERT INTO pick_lists (
-         medusa_order_id, pick_list_number, status, parent_pick_list_id,
-         customer_name, customer_email, shipping_method_name, shipping_method_code, shipping_address,
-         is_sandbox, notes, created_at, updated_at
-       )
-       VALUES ($1, $2, 'PENDING', $3, $4, $5, $6, $7, $8::jsonb, $9, $10, NOW(), NOW())
-       RETURNING id`,
-      [
-        pl.medusa_order_id,
-        readyPickListNumber,
-        pickListId,
-        pl.customer_name,
-        pl.customer_email,
-        pl.shipping_method_name,
-        pl.shipping_method_code,
-        JSON.stringify(pl.shipping_address || {}),
-        pl.is_sandbox,
-        `Split from ${pl.pick_list_number} — ready to pick`,
-      ]
-    );
-    const readyChildId = readyChild.rows[0].id;
-
-    // Add available items to ready list
-    let readyLineNumber = 1;
-    for (const item of availableItems) {
-      await query(
-        `INSERT INTO pick_list_items (pick_list_id, line_number, product_sku, colour_code, quantity_required, quantity_picked, status, is_sandbox, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', $7, NOW(), NOW())`,
-        [readyChildId, readyLineNumber++, item.product_sku, item.colour_code, item.quantity_required, item.quantity_picked, pl.is_sandbox]
-      );
-    }
-
-    // Remove available items from source list
-    for (const item of availableItems) {
-      await query(`DELETE FROM pick_list_items WHERE id = $1`, [item.id]);
-    }
-
-    // If source list is now empty, mark it complete; otherwise it stays as the "awaiting" list
-    const remainingCount = await query(
-      `SELECT COUNT(*) as c FROM pick_list_items WHERE pick_list_id = $1`,
-      [pickListId]
-    );
-
-    if (remainingCount.rows[0].c === 0) {
-      // All items could be picked, original list is now empty - remove it or mark as completed
-      await query(`DELETE FROM pick_lists WHERE id = $1`, [pickListId]);
-    }
-
-    return res.json({
-      success: true,
-      ready_pick_list_number: readyPickListNumber,
-      ready_pick_list_id: readyChildId,
-      available_items_count: availableItems.length,
-      unavailable_items_count: unavailableItems.length,
-      unavailable_items: unavailableItems.map(i => {
-        const remaining = i.quantity_required - i.quantity_picked;
-        return {
-          sku: i.product_sku,
-          required: remaining,
-          colour_code: i.colour_code,
-        };
-      }),
-      message: `Split complete: ${availableItems.length} items ready to pick, ${unavailableItems.length} awaiting stock`,
-    });
-  } catch (error) {
-    console.error('Split for picking error:', error);
-    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to split for picking' });
-  }
+router.post('/:pickListId/split-for-picking', authMiddleware, requirePermission('manage_operations'), async (_req: Request, res: Response) => {
+  // Retired: the child list reuses the parent's UNIQUE medusa_order_id so this has never been able to succeed; use split-backorder.
+  return res.status(410).json({ error: 'Split for picking is retired - use "Split backorder" instead' });
 });
 
 /**
