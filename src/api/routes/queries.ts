@@ -13,6 +13,9 @@ import type { PoolClient } from 'pg'
 
 const router = express.Router()
 
+const QUERY_STATUSES = ['open', 'in_progress', 'resolved', 'closed']
+const QUERY_PRIORITIES = ['low', 'normal', 'high', 'urgent']
+
 // Apply auth middleware to all routes
 router.use(authMiddleware)
 
@@ -192,12 +195,41 @@ router.put('/:id', async (req: Request, res: Response) => {
     }
 
     const { id } = req.params
-    const { status, priority, assigned_to, description, subject } = req.body
+    const { status, priority, assigned_to, description, subject, customer_name, customer_email, customer_phone } = req.body
+
+    if (status && !QUERY_STATUSES.includes(status)) {
+      res.status(400).json({ error: `Invalid status. Must be one of: ${QUERY_STATUSES.join(', ')}` })
+      return
+    }
+    if (priority && !QUERY_PRIORITIES.includes(priority)) {
+      res.status(400).json({ error: `Invalid priority. Must be one of: ${QUERY_PRIORITIES.join(', ')}` })
+      return
+    }
+    if (customer_name !== undefined && !String(customer_name).trim()) {
+      res.status(400).json({ error: 'customer_name cannot be empty' })
+      return
+    }
+    if (subject !== undefined && !String(subject).trim()) {
+      res.status(400).json({ error: 'subject cannot be empty' })
+      return
+    }
 
     let updateQuery = 'UPDATE customer_queries SET '
     const params: any[] = []
     const updates: string[] = []
 
+    if (customer_name !== undefined) {
+      updates.push(`customer_name = $${params.length + 1}`)
+      params.push(String(customer_name).trim())
+    }
+    if (customer_email !== undefined) {
+      updates.push(`customer_email = $${params.length + 1}`)
+      params.push(customer_email || null)
+    }
+    if (customer_phone !== undefined) {
+      updates.push(`customer_phone = $${params.length + 1}`)
+      params.push(customer_phone || null)
+    }
     if (status) {
       updates.push(`status = $${params.length + 1}`)
       params.push(status)
@@ -214,9 +246,9 @@ router.put('/:id', async (req: Request, res: Response) => {
       updates.push(`description = $${params.length + 1}`)
       params.push(description)
     }
-    if (subject) {
+    if (subject !== undefined) {
       updates.push(`subject = $${params.length + 1}`)
-      params.push(subject)
+      params.push(String(subject).trim())
     }
 
     updates.push(`updated_at = NOW()`)
@@ -293,18 +325,23 @@ router.get('/:id/matching-orders', async (req: Request, res: Response) => {
 /**
  * POST /api/queries/:id/records
  * Add a communication record (note, action log, etc.)
- * Body: { record_type, record_title, content, record_value }
+ * Body: { record_type, record_title, content, record_value, new_status }
+ * A 'status_change' record with new_status also updates the query's status.
  */
 router.post('/:id/records', async (req: Request, res: Response) => {
   let client: PoolClient | undefined
   try {
     client = await getPool().connect()
     const { id } = req.params
-    const { record_type, record_title, content, record_value } = req.body
+    const { record_type, record_title, content, record_value, new_status } = req.body
     const user_id = (req as any).user?.id
 
     if (!record_type || !content) {
       res.status(400).json({ error: 'record_type and content are required' })
+      return
+    }
+    if (record_type === 'status_change' && !QUERY_STATUSES.includes(new_status)) {
+      res.status(400).json({ error: `new_status is required for status_change records. Must be one of: ${QUERY_STATUSES.join(', ')}` })
       return
     }
 
@@ -315,11 +352,17 @@ router.post('/:id/records', async (req: Request, res: Response) => {
       [uuid(), id, record_type, record_title || null, content, record_value || null, user_id]
     )
 
-    // Update query's updated_at timestamp
-    await client!.query(
-      `UPDATE customer_queries SET updated_at = NOW() WHERE id = $1`,
-      [id]
-    )
+    if (record_type === 'status_change') {
+      await client!.query(
+        `UPDATE customer_queries SET status = $1, updated_at = NOW() WHERE id = $2`,
+        [new_status, id]
+      )
+    } else {
+      await client!.query(
+        `UPDATE customer_queries SET updated_at = NOW() WHERE id = $1`,
+        [id]
+      )
+    }
 
     res.status(201).json(result.rows[0])
   } catch (error) {
