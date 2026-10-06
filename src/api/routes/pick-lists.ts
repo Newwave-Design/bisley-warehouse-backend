@@ -4,8 +4,10 @@
  */
 
 import express, { Request, Response } from 'express';
-import { query } from '../../db/index.js';
-import { authMiddleware, requirePermission } from '../../middleware/auth.js';
+import { query, getPool } from '../../db/index.js';
+import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
+import { applyDispatchStock } from '../../lib/dispatch-stock.js';
+import { toUuidOrNull } from './mobile.js';
 import { v4 as uuidv4 } from 'uuid';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { createUpsShipmentLabel } from '../../lib/ups.js';
@@ -1226,65 +1228,44 @@ router.patch('/:pickListId/label-printed', authMiddleware, async (req: Request, 
  * Decrements warehouse_inventory.quantity, clears reservations, pushes to Medusa.
  * This is the only point where physical stock numbers change on outbound.
  */
-router.patch('/:pickListId/dispatch', authMiddleware, async (req: Request, res: Response) => {
+router.patch('/:pickListId/dispatch', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const { pickListId } = req.params;
+  const userId = toUuidOrNull(req.user?.id);
+  const client = await getPool().connect();
+  let syncSkus: string[] = [];
+  let shortfalls: { sku: string; short: number }[] = [];
+  let itemCount = 0;
   try {
-    const { pickListId } = req.params;
+    await client.query('BEGIN');
 
-    const pickList = await query(`SELECT * FROM pick_lists WHERE id = $1`, [pickListId]);
-    if (!pickList.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
-    if (!['PICKED', 'IN_PROGRESS', 'PACKING', 'PACKED', 'LABEL_PRINTED'].includes(pickList.rows[0].status)) {
+    const pickList = (await client.query(`SELECT * FROM pick_lists WHERE id = $1 FOR UPDATE`, [pickListId])).rows[0];
+    if (!pickList) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Pick list not found' }); }
+    if (!['PICKED', 'IN_PROGRESS', 'PACKING', 'PACKED', 'LABEL_PRINTED'].includes(pickList.status)) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Pick list must be picked or packed before dispatch' });
     }
 
-    // Get all picked items, plus the cost/liability/price to stamp onto them at the point of sale
-    const items = await query(
-      `SELECT pli.*, wi.location_id as inv_location_id,
-              wi.liability_status AS inv_liability_status,
-              wp.unit_cost_gbp AS sku_unit_cost_gbp, wp.price_gbp AS product_price_gbp
-       FROM pick_list_items pli
-       LEFT JOIN warehouse_inventory wi
-         ON wi.product_sku = pli.product_sku
-         AND wi.location_id = pli.picked_from_location_id
-       LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
-       WHERE pli.pick_list_id = $1 AND pli.quantity_picked > 0`,
-      [pickListId]
-    );
-
-    const syncSkus = new Set<string>();
-
-    for (const item of items.rows) {
-      const sku = item.product_sku;
-      const qty = parseInt(item.quantity_picked);
-      const locationId = item.picked_from_location_id;
-      if (!sku || !qty || !locationId) continue;
-
-      // Decrement physical stock and clear the reservation
-      await query(
-        `UPDATE warehouse_inventory
-         SET quantity = GREATEST(quantity - $1, 0),
-             quantity_reserved = GREATEST(quantity_reserved - $1, 0),
-             updated_at = NOW()
-         WHERE product_sku = $2 AND location_id = $3`,
-        [qty, sku, locationId]
-      );
-      syncSkus.add(sku);
-
-      // Stamp cost/price/liability onto this sale line — fixed at dispatch time so it
-      // stays correct in historical reports even if the liability default later flips.
-      await query(
-        `UPDATE pick_list_items
-         SET unit_cost_gbp = $1, unit_price_gbp = $2, liability_status = $3, updated_at = NOW()
-         WHERE id = $4`,
-        [item.sku_unit_cost_gbp ?? null, item.product_price_gbp ?? null, item.inv_liability_status ?? 'Bisley', item.id]
-      );
+    // Sandbox lists must never move real stock
+    if (!pickList.is_sandbox) {
+      if (!userId) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'A real user login is required to dispatch' }); }
+      ({ syncSkus, shortfalls } = await applyDispatchStock(client, pickList, userId));
     }
+    itemCount = (await client.query(`SELECT COUNT(*)::int AS n FROM pick_list_items WHERE pick_list_id = $1 AND quantity_picked > 0`, [pickListId])).rows[0].n;
 
-    // Mark pick list as dispatched
-    await query(
+    await client.query(
       `UPDATE pick_lists SET status = 'DISPATCHED', dispatched_at = NOW(), updated_at = NOW() WHERE id = $1`,
       [pickListId]
     );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    console.error('Pick list dispatch error:', error);
+    return res.status(500).json({ error: 'Failed to dispatch pick list' });
+  } finally {
+    client.release();
+  }
 
+  try {
     // Push new WMS totals to Medusa for all affected SKUs
     const syncErrors: string[] = [];
     for (const sku of syncSkus) {
@@ -1299,13 +1280,14 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: Request, res: 
 
     res.json({
       success: true,
-      dispatched: items.rows.length,
-      skus_synced: syncSkus.size - syncErrors.length,
+      dispatched: itemCount,
+      skus_synced: syncSkus.length - syncErrors.length,
       sync_errors: syncErrors.length > 0 ? syncErrors : undefined,
+      short_skus: shortfalls.length > 0 ? shortfalls : undefined,
     });
   } catch (error) {
-    console.error('Pick list dispatch error:', error);
-    res.status(500).json({ error: 'Failed to dispatch pick list' });
+    console.error('Pick list dispatch Medusa sync error:', error);
+    res.json({ success: true, dispatched: itemCount, sync_errors: ['Medusa stock sync failed - run a stock sync'], short_skus: shortfalls.length > 0 ? shortfalls : undefined });
   }
 });
 

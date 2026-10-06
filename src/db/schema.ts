@@ -930,6 +930,8 @@ CREATE INDEX IF NOT EXISTS idx_inventory_sku ON warehouse_inventory(product_sku)
 CREATE INDEX IF NOT EXISTS idx_movements_location ON warehouse_movements(location_id);
 CREATE INDEX IF NOT EXISTS idx_movements_sku ON warehouse_movements(product_sku);
 CREATE INDEX IF NOT EXISTS idx_movements_date ON warehouse_movements(movement_date);
+ALTER TABLE warehouse_movements ADD COLUMN IF NOT EXISTS pick_list_item_id UUID;
+CREATE INDEX IF NOT EXISTS idx_movements_pick_item ON warehouse_movements(pick_list_item_id) WHERE pick_list_item_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_pick_lists_status ON pick_lists(status);
 CREATE INDEX IF NOT EXISTS idx_pick_lists_medusa_id ON pick_lists(medusa_order_id);
 CREATE INDEX IF NOT EXISTS idx_pick_lists_dispatched_at ON pick_lists(dispatched_at);
