@@ -53,7 +53,11 @@ router.post('/medusa', express.raw({ type: '*/*' }), async (req: Request, res: R
         await handleOrderPlaced(data);
         break;
       case 'order.cancelled':
+      case 'order.canceled':
         await handleOrderCancelled(data);
+        break;
+      case 'order-edit.confirmed':
+        await handleOrderEdited(data);
         break;
       case 'order.returned':
         await handleOrderReturned(data);
@@ -380,6 +384,98 @@ async function handleOrderCancelled(order: any) {
     const available = Math.max(0, parseInt(row.rows[0]?.qty ?? '0') - parseInt(row.rows[0]?.reserved ?? '0'));
     await syncSkuToMedusa(sku, available);
   }
+}
+
+/**
+ * handleOrderEdited — bring an existing pick list in line with an order edited in Medusa
+ *
+ * Matches lines on medusa_order_line_item_id: changed quantities are updated, removed lines are archived (so
+ * supplier-send history survives), new lines are added. Reservations move by the same amount. Anything that
+ * can't be applied safely (already picked beyond the new quantity, split or dispatched orders) is left alone
+ * and raised as a notification for a person to check. Re-delivery changes nothing.
+ */
+export async function handleOrderEdited(order: any) {
+  const medusaOrderId = order.id;
+  const lists = (await query(
+    `SELECT id, status, medusa_order_id, is_sandbox FROM pick_lists
+     WHERE medusa_order_id = $1 OR left(medusa_order_id, length($1) + 3) = $1 || '-BO'`,
+    [medusaOrderId]
+  )).rows;
+  const label = `#${order.display_id ?? medusaOrderId}`;
+  const review = (reason: string) => createNotification('ORDER_EDIT_REVIEW',
+    `Order ${label} was edited in Medusa and needs checking`, reason,
+    { link: '/customer-orders', severity: 'warning', metadata: { order_id: medusaOrderId } });
+
+  if (lists.length === 0) { console.log(`[webhooks] order edit for ${medusaOrderId}: no pick list, skipping`); return; }
+  const parent = lists.find((l: any) => l.medusa_order_id === medusaOrderId);
+  if (lists.length > 1 || !parent) { await review('The order is split across several pick lists, so the change was not applied automatically.'); return; }
+  if (['DISPATCHED', 'CANCELLED'].includes(parent.status)) { await review(`The pick list is already ${parent.status}, so the change was not applied.`); return; }
+
+  const medusaItems = (order.items ?? [])
+    .map((i: any) => ({
+      id: i.id as string,
+      sku: (i.variant?.sku ?? i.variant_sku ?? i.sku) as string | undefined,
+      qty: Number(i.quantity) || 0,
+      variantId: i.variant?.id ?? i.variant_id ?? null,
+      productId: i.product?.id ?? i.product_id ?? null,
+    }))
+    .filter((i: any) => i.id && i.sku);
+
+  const notes: string[] = [];
+  let changed = 0;
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const wms = (await client.query(`SELECT * FROM pick_list_items WHERE pick_list_id = $1 ORDER BY line_number FOR UPDATE`, [parent.id])).rows;
+    const reserve = (sku: string, delta: number) => client.query(
+      `UPDATE warehouse_inventory SET quantity_reserved = GREATEST(0, quantity_reserved + $1), updated_at = NOW() WHERE product_sku = $2`,
+      [delta, sku]
+    );
+
+    for (const w of wms) {
+      if (!w.medusa_order_line_item_id || w.is_archived) continue;
+      const m = medusaItems.find((i: any) => i.id === w.medusa_order_line_item_id);
+      if (!m) {
+        if ((w.quantity_picked ?? 0) > 0) { notes.push(`${w.product_sku} was removed but ${w.quantity_picked} are already picked`); continue; }
+        await client.query(`UPDATE pick_list_items SET is_archived = true, archived_at = NOW(), updated_at = NOW() WHERE id = $1`, [w.id]);
+        await reserve(w.product_sku, -w.quantity_required);
+        changed++;
+      } else if (m.qty !== w.quantity_required) {
+        if (m.qty < (w.quantity_picked ?? 0)) { notes.push(`${w.product_sku} was reduced to ${m.qty} but ${w.quantity_picked} are already picked`); continue; }
+        await client.query(`UPDATE pick_list_items SET quantity_required = $1, updated_at = NOW() WHERE id = $2`, [m.qty, w.id]);
+        await reserve(w.product_sku, m.qty - w.quantity_required);
+        changed++;
+      }
+    }
+
+    const known = new Set(wms.map((w: any) => w.medusa_order_line_item_id).filter(Boolean));
+    let lineNumber = wms.reduce((max: number, w: any) => Math.max(max, w.line_number), 0);
+    for (const m of medusaItems) {
+      if (known.has(m.id) || m.qty <= 0) continue;
+      const tail = m.sku!.split('-').pop();
+      await client.query(
+        `INSERT INTO pick_list_items
+           (pick_list_id, line_number, product_sku, colour_code, quantity_required, status, is_sandbox,
+            medusa_order_line_item_id, medusa_variant_id, medusa_product_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8, $9, NOW(), NOW())`,
+        [parent.id, ++lineNumber, m.sku, tail?.match(/[a-z]{2}\d/) ? tail : null, m.qty, parent.is_sandbox, m.id, m.variantId, m.productId]
+      );
+      await reserve(m.sku!, m.qty);
+      changed++;
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  if (changed && ['PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED'].includes(parent.status)) {
+    notes.push(`The pick list was already ${parent.status} when the lines changed`);
+  }
+  if (notes.length) await review(notes.join('; '));
+  console.log(`✓ Order ${label} edit applied to pick list ${parent.id} (${changed} line change${changed === 1 ? '' : 's'})`);
 }
 
 /**

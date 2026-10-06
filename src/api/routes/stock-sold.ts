@@ -1,115 +1,125 @@
 /**
- * Stock Sold report — what sold from our own inventory, by ISO week, to pay the supplier for that stock.
+ * Stock Sold report — units of our own stock that have shipped, by settlement week, to pay the supplier for that stock.
  *
- * Same lines as Supplier Re-orders (customer-order lines, kits expanded to components, supplier SKU + colour, summed per
- * SKU), but only units that came out of stock we have checked in. Per SKU, orders (oldest first) use up completed check-in
- * batches (oldest first). A unit counts in the later of the week it was sold and the week its stock was checked in, so a
- * sale made before the stock arrived rolls forward to the check-in week, with a note of when it was sold.
- * A sale never counts for more than was checked in, and still counts if the stock has since run to 0.
+ * A unit becomes payable when it is dispatched: every DISPATCH row in warehouse_movements (kits already expanded to
+ * components) that took stock from a bay counts once, as one row per supplier SKU + colour with the summed quantity.
+ * Weeks run Saturday to Friday and are labelled by their Friday (send day), using UK dates.
+ * Units shipped with no checked-in stock behind them (location null) are not payable and are listed separately.
  *
- * GET /api/stock-sold?from=YYYY-MM-DD&to=YYYY-MM-DD         — weeks with rows, plus SKUs sold that have no supplier SKU
- * GET /api/stock-sold/export?from=...&to=...                 — the same as an .xlsx (Week, SKU, Title, Colour, Full SKU, Quantity, Note)
- * Dates are inclusive and apply to the week a unit counts in; default is the last 8 weeks.
+ * GET /api/stock-sold?from=YYYY-MM-DD&to=YYYY-MM-DD   — weeks with rows, SKUs with no supplier SKU, and unstocked shipments
+ * GET /api/stock-sold/export?from=...&to=...           — the same as an .xlsx (Week, SKU, Title, Colour, Full SKU, Quantity, Note)
+ * Dates are inclusive and apply to the dispatch date; default is the last 8 weeks.
  */
 
 import express, { Response } from 'express';
 import XLSX from 'xlsx';
 import { query } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
-import { buildLines, safeCell } from './supplier-reorders.js';
+import { safeCell } from './supplier-reorders.js';
 
 const router = express.Router();
 
 const DAY = 86400000;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-function isoWeek(d: Date): { key: string; start: Date } {
-  const t = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
-  const dow = (new Date(t).getUTCDay() + 6) % 7; // Monday = 0
-  const start = new Date(t - dow * DAY);
-  const thursday = new Date(start.getTime() + 3 * DAY);
-  const year = thursday.getUTCFullYear();
-  const week = Math.floor((thursday.getTime() - Date.UTC(year, 0, 1)) / DAY / 7) + 1;
-  return { key: `${year}-W${String(week).padStart(2, '0')}`, start };
+// movement_date is a naive timestamp written by the server clock (UTC on Railway); read it back as a UK calendar date.
+function ukDate(d: Date): string {
+  return d.toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
 }
 
-function fmt(d: Date): string {
-  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+function utcDay(iso: string): number {
+  return Date.parse(`${iso}T00:00:00Z`);
 }
 
-function parseRange(q: any): { from: Date; to: Date } | null {
-  const today = new Date();
-  const todayUtc = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
-  const to = q.to ? (DATE_RE.test(String(q.to)) ? new Date(`${q.to}T00:00:00Z`) : null) : todayUtc;
-  const from = q.from ? (DATE_RE.test(String(q.from)) ? new Date(`${q.from}T00:00:00Z`) : null) : new Date(todayUtc.getTime() - 55 * DAY);
-  if (!from || !to || Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) return null;
-  if ((to.getTime() - from.getTime()) / DAY > 800) return null;
+/** The Friday that ends the Saturday–Friday week containing the given date. */
+function fridayOf(iso: string): number {
+  const t = utcDay(iso);
+  const dow = new Date(t).getUTCDay(); // Sunday = 0 ... Saturday = 6
+  return t + ((5 - dow + 7) % 7) * DAY;
+}
+
+function fmt(t: number): string {
+  return new Date(t).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+}
+
+function parseRange(q: any): { from: string; to: string } | null {
+  const today = ukDate(new Date());
+  const to = q.to ? String(q.to) : today;
+  const from = q.from ? String(q.from) : new Date(utcDay(today) - 55 * DAY).toISOString().slice(0, 10);
+  if (!DATE_RE.test(from) || !DATE_RE.test(to) || Number.isNaN(utcDay(from)) || Number.isNaN(utcDay(to))) return null;
+  if (from > to || (utcDay(to) - utcDay(from)) / DAY > 800) return null;
   return { from, to };
 }
 
-export async function buildReport(from: Date, to: Date) {
-  const [lines, checkedIn] = await Promise.all([
-    buildLines(),
-    query(`SELECT ci.medusa_sku AS sku, COALESCE(s.completed_at, s.updated_at) AS at, SUM(ci.quantity_scanned)::int AS qty
-           FROM checkin_items ci JOIN checkin_sessions s ON s.id = ci.session_id
-           WHERE s.status = 'COMPLETE' AND NOT s.is_sandbox AND ci.removed_at IS NULL AND ci.medusa_sku IS NOT NULL
-           GROUP BY ci.medusa_sku, s.id, COALESCE(s.completed_at, s.updated_at)
-           ORDER BY COALESCE(s.completed_at, s.updated_at)`),
-  ]);
-  const batches = new Map<string, { at: number; remaining: number }[]>();
-  for (const r of checkedIn.rows) {
-    const list = batches.get(r.sku) ?? batches.set(r.sku, []).get(r.sku)!;
-    list.push({ at: new Date(r.at).getTime(), remaining: Number(r.qty) });
-  }
-  const endExclusive = to.getTime() + DAY;
+export async function buildReport(from: string, to: string) {
+  // Pad the SQL window by a day each side, then filter on the UK date so the boundary is exact
+  const moves = await query(
+    `SELECT product_sku, movement_date, location_id, -quantity AS qty
+     FROM warehouse_movements
+     WHERE movement_type = 'DISPATCH' AND movement_date >= $1::date - 1 AND movement_date < $2::date + 2`,
+    [from, to]
+  );
 
-  type Row = { supplier_sku: string; colour: string; full_sku: string; title: string; quantity: number; rolled: Map<number, number> };
-  const weeks = new Map<string, { key: string; start: Date; rows: Map<string, Row> }>();
-  const missing = new Map<string, number>();
-
-  // Oldest orders first, across all history, so each takes the oldest stock still unsold
-  lines.sort((a, b) => a.ordered_at.localeCompare(b.ordered_at) || a.pick_list_number.localeCompare(b.pick_list_number));
-  for (const l of lines) {
-    const skuBatches = batches.get(l.sku);
-    if (!skuBatches) continue;
-    const sold = new Date(l.ordered_at).getTime();
-    let left = l.quantity;
-    for (const b of skuBatches) {
-      if (left <= 0) break;
-      if (b.remaining <= 0) continue;
-      const qty = Math.min(left, b.remaining);
-      b.remaining -= qty;
-      left -= qty;
-      const counted = Math.max(sold, b.at);
-      if (counted < from.getTime() || counted >= endExclusive) continue;
-      if (!l.supplier_sku) { missing.set(l.sku, (missing.get(l.sku) ?? 0) + qty); continue; }
-      const w = isoWeek(new Date(counted));
-      const wk = weeks.get(w.key) ?? weeks.set(w.key, { key: w.key, start: w.start, rows: new Map() }).get(w.key)!;
-      const k = `${l.supplier_sku}|${l.supplier_colour}`;
-      const row = wk.rows.get(k) ?? wk.rows.set(k, {
-        supplier_sku: l.supplier_sku, colour: l.supplier_colour,
-        full_sku: l.supplier_colour ? `${l.supplier_sku}-${l.supplier_colour}` : l.supplier_sku,
-        title: l.title, quantity: 0, rolled: new Map(),
-      }).get(k)!;
-      row.quantity += qty;
-      if (sold < b.at) {
-        const day = Date.UTC(new Date(sold).getUTCFullYear(), new Date(sold).getUTCMonth(), new Date(sold).getUTCDate());
-        row.rolled.set(day, (row.rolled.get(day) ?? 0) + qty);
-      }
+  const skus = [...new Set(moves.rows.map((r: any) => r.product_sku as string))];
+  const info = new Map<string, { title: string; colour: string; supplier_sku: string | null; supplier_colour: string }>();
+  if (skus.length) {
+    const wp = await query(
+      `SELECT DISTINCT ON (variant_sku) variant_sku, product_title, colour_name, colour_code, supplier_part_code, supplier_colour_code
+       FROM wms_products WHERE variant_sku = ANY($1) ORDER BY variant_sku, is_archived`,
+      [skus]
+    );
+    for (const r of wp.rows) {
+      info.set(r.variant_sku, {
+        title: r.product_title ?? '',
+        colour: r.colour_name || r.colour_code || '',
+        supplier_sku: r.supplier_part_code ?? null,
+        supplier_colour: r.supplier_colour_code ?? '',
+      });
     }
   }
 
-  const out = [...weeks.values()].sort((a, b) => a.key.localeCompare(b.key)).map((w) => {
-    const rows = [...w.rows.values()]
+  type Row = { supplier_sku: string; colour: string; full_sku: string; title: string; quantity: number; days: Map<string, number> };
+  const weeks = new Map<number, Map<string, Row>>();
+  const missing = new Map<string, number>();
+  const unstocked = new Map<string, number>();
+
+  for (const m of moves.rows) {
+    const day = ukDate(new Date(m.movement_date));
+    if (day < from || day > to) continue;
+    const qty = Number(m.qty);
+    if (!m.location_id) { unstocked.set(m.product_sku, (unstocked.get(m.product_sku) ?? 0) + qty); continue; }
+    const i = info.get(m.product_sku);
+    if (!i?.supplier_sku) { missing.set(m.product_sku, (missing.get(m.product_sku) ?? 0) + qty); continue; }
+
+    const friday = fridayOf(day);
+    const rows = weeks.get(friday) ?? weeks.set(friday, new Map()).get(friday)!;
+    const k = `${i.supplier_sku}|${i.supplier_colour}`;
+    const row = rows.get(k) ?? rows.set(k, {
+      supplier_sku: i.supplier_sku, colour: i.colour, title: i.title, quantity: 0, days: new Map(),
+      full_sku: i.supplier_colour ? `${i.supplier_sku}-${i.supplier_colour}` : i.supplier_sku,
+    }).get(k)!;
+    row.quantity += qty;
+    row.days.set(day, (row.days.get(day) ?? 0) + qty);
+  }
+
+  const out = [...weeks.entries()].sort((a, b) => a[0] - b[0]).map(([friday, map]) => {
+    const rows = [...map.values()]
       .sort((a, b) => a.supplier_sku.localeCompare(b.supplier_sku) || a.colour.localeCompare(b.colour))
-      .map(({ rolled, ...r }) => ({
+      .map(({ days, ...r }) => ({
         ...r,
-        note: rolled.size ? `Sold before stocked: ${[...rolled.entries()].sort((a, b) => a[0] - b[0]).map(([d, q]) => `${q} × ${fmt(new Date(d))}`).join('; ')}` : '',
+        note: `Dispatched: ${[...days.entries()].sort().map(([d, q]) => `${q} × ${fmt(utcDay(d))}`).join('; ')}`,
       }));
-    const end = new Date(w.start.getTime() + 6 * DAY);
-    return { key: w.key, label: `${fmt(w.start)} – ${fmt(end)} ${end.getUTCFullYear()}`, rows, total: rows.reduce((s, r) => s + r.quantity, 0) };
+    const iso = new Date(friday).toISOString().slice(0, 10);
+    return {
+      key: `w/e ${iso}`,
+      label: `${fmt(friday - 6 * DAY)} – ${fmt(friday)} ${new Date(friday).getUTCFullYear()}`,
+      rows,
+      total: rows.reduce((s, r) => s + r.quantity, 0),
+    };
   });
-  return { weeks: out, missing: [...missing.entries()].map(([sku, quantity]) => ({ sku, quantity })), stocked_skus: checkedIn.rows.length };
+
+  const list = (m: Map<string, number>) => [...m.entries()].map(([sku, quantity]) => ({ sku, quantity }));
+  return { weeks: out, missing: list(missing), unstocked: list(unstocked) };
 }
 
 router.get('/', authMiddleware, requirePermission('manage_orders'), async (req: AuthRequest, res: Response) => {
@@ -133,13 +143,12 @@ router.get('/export', authMiddleware, requirePermission('manage_orders'), async 
       aoa.push([w.key, safeCell(r.supplier_sku), safeCell(r.title), safeCell(r.colour), safeCell(r.full_sku), r.quantity, r.note]);
     }
     const ws = XLSX.utils.aoa_to_sheet(aoa);
-    ws['!cols'] = [{ wch: 10 }, { wch: 22 }, { wch: 50 }, { wch: 14 }, { wch: 30 }, { wch: 10 }, { wch: 45 }];
+    ws['!cols'] = [{ wch: 16 }, { wch: 22 }, { wch: 50 }, { wch: 14 }, { wch: 30 }, { wch: 10 }, { wch: 45 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Stock sold');
     const buffer: Buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-    const iso = (d: Date) => d.toISOString().slice(0, 10);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="bisley-stock-sold-${iso(range.from)}-to-${iso(range.to)}.xlsx"`);
+    res.setHeader('Content-Disposition', `attachment; filename="bisley-stock-sold-${range.from}-to-${range.to}.xlsx"`);
     res.send(buffer);
   } catch (err) {
     console.error('[stock-sold] export failed:', err);
