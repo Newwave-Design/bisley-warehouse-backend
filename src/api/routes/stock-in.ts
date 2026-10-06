@@ -19,10 +19,10 @@
  */
 
 import express, { Response } from 'express';
-import { query } from '../../db/index.js';
+import { query, getPool } from '../../db/index.js';
+import { toUuidOrNull } from './mobile.js';
 import { failedScansFor } from '../../lib/failed-scans.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
-import { getProductDetails } from '../../lib/inventory-sync-service.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { getLogger } from '../../lib/logger.js';
@@ -412,11 +412,12 @@ router.patch('/sessions/:id/items/:itemId', authMiddleware, async (req: AuthRequ
       `UPDATE checkin_items
        SET quantity_scanned = $1, updated_at = NOW()
        WHERE id = $2 AND session_id = $3
+         AND EXISTS (SELECT 1 FROM checkin_sessions WHERE id = $3 AND status = 'OPEN')
        RETURNING *`,
       [quantity, req.params.itemId, req.params.id]
     );
 
-    if (!result.rows[0]) return res.status(404).json({ error: 'Item not found' });
+    if (!result.rows[0]) return res.status(404).json({ error: 'Item not found or session is not open' });
 
     logger.info(`[stock-in] Updated item ${req.params.itemId} qty to ${quantity}`);
     res.json(result.rows[0]);
@@ -429,10 +430,14 @@ router.patch('/sessions/:id/items/:itemId', authMiddleware, async (req: AuthRequ
 /** DELETE /api/stock-in/sessions/:id/items/:itemId — Soft-remove an item (kept for scan history, restorable) */
 router.delete('/sessions/:id/items/:itemId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    await query(
-      `UPDATE checkin_items SET removed_at = NOW(), updated_at = NOW() WHERE id = $1 AND session_id = $2`,
+    const removed = await query(
+      `UPDATE checkin_items SET removed_at = NOW(), updated_at = NOW()
+       WHERE id = $1 AND session_id = $2
+         AND EXISTS (SELECT 1 FROM checkin_sessions WHERE id = $2 AND status = 'OPEN')
+       RETURNING id`,
       [req.params.itemId, req.params.id]
     );
+    if (!removed.rows[0]) return res.status(404).json({ error: 'Item not found or session is not open' });
 
     logger.info(`[stock-in] Removed item ${req.params.itemId} from session ${req.params.id}`);
     res.json({ success: true });
@@ -526,70 +531,63 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
     }
 
     const defaultLiability = 'Bisley';
+    const userId = toUuidOrNull(req.user?.id);
+    if (!userId) return res.status(400).json({ error: 'A real user login is required to confirm stock-in' });
     let stocked = 0;
     const syncedSkus = new Set<string>();
-    const failedItems: string[] = [];
 
-    // Stock each item to warehouse_inventory
-    for (let i = 0; i < items.rows.length; i++) {
-      const item = items.rows[i];
+    // Resolve colour codes up front so the transaction only holds writes
+    const prepared: { sku: string; colourCode: string; qty: number }[] = [];
+    for (const item of items.rows) {
       const sku = item.medusa_sku || item.nw_code;
-      
-      try {
-        const productDetails = await getProductDetails(sku);
-        const productDisplay = productDetails
-          ? `${productDetails.name} (${productDetails.dimensions || 'n/a'})`
-          : sku;
+      prepared.push({ sku, colourCode: await resolveColourCode(sku, item.colour), qty: item.quantity_scanned });
+    }
 
-        // checkin_items.colour may hold a long colour_name rather than a short code —
-        // resolve the real code (variant-specific) and fall back to truncating it.
-        const colourCode = await resolveColourCode(sku, item.colour);
+    // All-or-nothing: a failure leaves no stock added and the session OPEN, so a retry cannot double-count
+    const client = await getPool().connect();
+    try {
+      await client.query('BEGIN');
+      const locked = await client.query(`SELECT status FROM checkin_sessions WHERE id = $1 FOR UPDATE`, [sessionId]);
+      if (locked.rows[0]?.status !== 'OPEN') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Session is not open' });
+      }
 
-        logger.debug(`[stock-in] Stocking item ${i + 1}/${items.rows.length}: ${sku} qty=${item.quantity_scanned} colour=${colourCode || 'none'}`);
-
-        // Upsert into warehouse_inventory
-        const insertResult = await query(
+      for (const p of prepared) {
+        const upsert = await client.query(
           `INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
            VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
            ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
            DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
            RETURNING id, quantity`,
-          [
-            receivingLocationId,
-            sku,
-            colourCode,
-            item.quantity_scanned,
-            defaultLiability,
-          ]
+          [receivingLocationId, p.sku, p.colourCode, p.qty, defaultLiability]
         );
-
-        if (!insertResult.rows[0]) {
-          throw new Error('Insert returned no rows');
-        }
-
-        syncedSkus.add(sku);
+        if (!upsert.rows[0]) throw new Error(`Insert returned no rows for ${p.sku}`);
+        await client.query(
+          `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, colour_code, quantity, notes, performed_by, checkin_session_id)
+           VALUES ('RECEIVE', $1, $2, $3, $4, 'Stock-in confirmed', $5, $6)`,
+          [receivingLocationId, p.sku, p.colourCode, p.qty, userId, sessionId]
+        );
+        syncedSkus.add(p.sku);
         stocked++;
-        logger.info(`  ✓ Stocked ${item.quantity_scanned}x ${productDisplay} (new quantity: ${insertResult.rows[0].quantity})`);
-      } catch (itemErr) {
-        const itemMsg = itemErr instanceof Error ? itemErr.message : JSON.stringify(itemErr);
-        logger.error(`[stock-in] Failed to stock item ${i + 1}: ${sku} - ${itemMsg}`);
-        failedItems.push(`Item ${i + 1} (${sku}): ${itemMsg}`);
       }
-    }
 
-    if (failedItems.length > 0) {
-      logger.error(`[stock-in] Failed to stock ${failedItems.length} items: ${failedItems.join('; ')}`);
-      return res.status(500).json({ 
-        error: `Failed to stock items: ${failedItems[0]}`,
-        details: failedItems,
-        items_stocked: stocked,
-        note: 'Some items failed to stock. Your session is saved and you can retry.'
+      await client.query(
+        `UPDATE checkin_sessions SET status = 'COMPLETE', completed_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        [sessionId]
+      );
+      await client.query('COMMIT');
+    } catch (stockErr) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      const stockMsg = stockErr instanceof Error ? stockErr.message : JSON.stringify(stockErr);
+      logger.error(`[stock-in] Confirm rolled back for session ${sessionId}: ${stockMsg}`);
+      return res.status(500).json({
+        error: `Failed to stock items: ${stockMsg}`,
+        items_stocked: 0,
+        note: 'Nothing was stocked. Your session is still open and you can retry.',
       });
-    }
-
-    if (stocked === 0) {
-      logger.error(`[stock-in] No items were successfully stocked in session ${sessionId}`);
-      return res.status(500).json({ error: 'No items were successfully stocked' });
+    } finally {
+      client.release();
     }
 
     logger.info(`[stock-in] Successfully stocked ${stocked} items, attempting to unblock pick lists...`);
@@ -608,26 +606,6 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
     }
 
     logger.info(`[stock-in] Stocked ${stocked} items to warehouse_inventory. Medusa inventory unchanged (sync disabled for now).`);
-
-    // Mark session complete
-    try {
-      const updateResult = await query(
-        `UPDATE checkin_sessions SET status = 'COMPLETE', completed_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING id`,
-        [sessionId]
-      );
-      if (!updateResult.rows[0]) {
-        throw new Error('Session update returned no rows');
-      }
-      logger.info(`[stock-in] Session ${sessionId} marked COMPLETE`);
-    } catch (completeErr) {
-      const completeMsg = completeErr instanceof Error ? completeErr.message : JSON.stringify(completeErr);
-      logger.error(`[stock-in] Failed to mark session complete: ${completeMsg}`);
-      return res.status(500).json({ 
-        error: `Failed to mark session complete: ${completeMsg}`,
-        items_stocked: stocked,
-        note: 'Items were stocked but session completion failed. Your items are safe.'
-      });
-    }
 
     res.json({
       success: true,

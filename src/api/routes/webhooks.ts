@@ -395,6 +395,7 @@ async function handleOrderReturned(order: any) {
   // Medusa return data format:
   // order.returns is an array of return objects, each with metadata.redeem_to_warehouse
   const returns = order.returns ?? [];
+  const restockedSkus = new Set<string>();
 
   for (const ret of returns) {
     // Generate RMA number: RMA-YYYYMMDD-XXXX
@@ -458,11 +459,12 @@ async function handleOrderReturned(order: any) {
         await query(
           `UPDATE warehouse_inventory
            SET quantity = quantity + $1, updated_at = NOW()
-           WHERE product_sku = $2`,
+           WHERE id = (SELECT id FROM warehouse_inventory WHERE product_sku = $2 ORDER BY quantity DESC LIMIT 1)`,
           [qty, sku]
         );
 
         affectedSkus.add(sku);
+        restockedSkus.add(sku);
         console.log(`✓ Redeemed ${qty}x ${sku} from return ${ret.id} (RMA: ${rma_number})`);
       }
     }
@@ -483,7 +485,7 @@ async function handleOrderReturned(order: any) {
   }
 
 
-  console.log(`✓ Return processed for order ${medusaOrderId} — ${affectedSkus.size} SKUs restocked`);
+  console.log(`✓ Return processed for order ${medusaOrderId} — ${restockedSkus.size} SKUs restocked`);
 }
 
 router.get('/test-order', async (req: Request, res: Response) => {
