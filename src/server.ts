@@ -26,7 +26,8 @@ import mobileRoutes from './api/routes/mobile.js';
 import mobileSyncRoutes from './api/routes/mobile-sync.js';
 import mobileAppRoutes from './api/routes/mobile-app.js';
 import webhooksRoutes from './api/routes/webhooks.js';
-import reorderRulesRoutes, { pendingRouter as pendingReordersRouter, runReorderCheck } from './api/routes/reorder-rules.js';
+import reorderRulesRoutes, { pendingRouter as pendingReordersRouter } from './api/routes/reorder-rules.js';
+import supplierReordersRoutes from './api/routes/supplier-reorders.js';
 import errorLogRoutes from './api/routes/error-log.js';
 import notificationsRoutes from './api/routes/notifications.js';
 import deliveriesRoutes from './api/routes/deliveries.js';
@@ -111,6 +112,7 @@ app.use('/api/mobile-sync', mobileSyncRoutes);
 app.use('/api/mobile-app', mobileAppRoutes);
 app.use('/api/reorder-rules', reorderRulesRoutes);
 app.use('/api/pending-reorders', pendingReordersRouter);
+app.use('/api/supplier-reorders', supplierReordersRoutes);
 app.use('/api/error-log', errorLogRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/deliveries', deliveriesRoutes);
@@ -193,9 +195,9 @@ async function start() {
             );
             await fetch(`http://localhost:${PORT}/api/genero/poll`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
             console.log(`[scheduler] Genero poll ran at ${new Date().toISOString()}`);
-            // Also run reorder check after each Genero poll
-            const triggered = await runReorderCheck();
-            if (triggered.length > 0) console.log(`[scheduler] Reorder check triggered ${triggered.length} pending reorders: ${triggered.slice(0,5).join(', ')}`);
+            // Threshold reorder check parked — re-ordering is driven by customer orders (see supplier-reorders.ts)
+            // const triggered = await runReorderCheck();
+            // if (triggered.length > 0) console.log(`[scheduler] Reorder check triggered ${triggered.length} pending reorders: ${triggered.slice(0,5).join(', ')}`);
 
             // Daily operational checks: unassigned inventory + deliveries today
             await runDailyChecks();

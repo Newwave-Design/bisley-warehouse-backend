@@ -131,6 +131,8 @@ ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS nw_code VARCHAR(50);
 -- Supplier's own part number + colour code (from the barcode spreadsheet); not touched by the Medusa sync — see data-ops/populate-supplier-codes.mjs
 ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS supplier_part_code VARCHAR(100);
 ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS supplier_colour_code VARCHAR(30);
+-- 'barcode_sheet' = read from the supplier barcode list; 'inferred' = code taken from sibling colours, colour from our SKU
+ALTER TABLE wms_products ADD COLUMN IF NOT EXISTS supplier_code_source VARCHAR(20);
 CREATE INDEX IF NOT EXISTS idx_wms_products_nw_code ON wms_products(nw_code);
 
 -- ================================================================================

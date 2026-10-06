@@ -32,7 +32,8 @@ router.get('/field-mappings', authMiddleware, requirePermission('manage_settings
     );
     const MEDUSA_TO_WMS = result.rows.filter(r => r.mapping_direction === 'MEDUSA_TO_WMS');
     const WMS_TO_GENERO = result.rows.filter(r => r.mapping_direction === 'WMS_TO_GENERO');
-    res.json({ MEDUSA_TO_WMS, WMS_TO_GENERO });
+    const WMS_TO_SUPPLIER = result.rows.filter(r => r.mapping_direction === 'WMS_TO_SUPPLIER');
+    res.json({ MEDUSA_TO_WMS, WMS_TO_GENERO, WMS_TO_SUPPLIER });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to load field mappings' });
