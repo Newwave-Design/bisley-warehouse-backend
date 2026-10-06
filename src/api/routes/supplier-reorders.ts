@@ -23,7 +23,7 @@ import { medusaPost } from '../../lib/medusa-client.js';
 
 const router = express.Router();
 
-interface ReorderLine {
+export interface ReorderLine {
   key: string;
   pick_list_item_id: string;
   sku: string;
@@ -41,7 +41,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LINES = 2000;
 
-async function buildLines(): Promise<ReorderLine[]> {
+export async function buildLines(): Promise<ReorderLine[]> {
   const items = await query(`
     SELECT pli.id AS pick_list_item_id, pli.product_sku, pli.colour_code AS item_colour,
            pli.quantity_required, pl.pick_list_number, pl.created_at AS ordered_at,
@@ -166,7 +166,7 @@ router.get('/suppliers', authMiddleware, requirePermission('manage_orders'), asy
 });
 
 // Stops a cell starting with = + - @ being evaluated as a formula when the supplier opens the file
-function safeCell(v: string): string {
+export function safeCell(v: string): string {
   return /^[=+\-@]/.test(v) ? `'${v}` : v;
 }
 
