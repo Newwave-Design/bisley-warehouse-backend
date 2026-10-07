@@ -375,12 +375,13 @@ async function handleOrderCancelled(order: any) {
     console.log(`✓ Order ${medusaOrderId} cancelled — pick list ${pickListId} marked CANCELLED, stock released`);
   }
 
-  // Sync updated available quantities back to Medusa
+  // Sync updated available quantities back to Medusa (only SKUs the WMS holds; otherwise Medusa's own stock would be zeroed)
   for (const sku of affectedSkus) {
     const row = await query(
-      `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
+      `SELECT COUNT(*)::int AS rows, SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
       [sku]
     );
+    if (!row.rows[0]?.rows) continue;
     const available = Math.max(0, parseInt(row.rows[0]?.qty ?? '0') - parseInt(row.rows[0]?.reserved ?? '0'));
     await syncSkuToMedusa(sku, available);
   }
@@ -574,9 +575,10 @@ async function handleOrderReturned(order: any) {
     if (shouldRedeem) {
       for (const sku of affectedSkus) {
         const row = await query(
-          `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
+          `SELECT COUNT(*)::int AS rows, SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
           [sku]
         );
+        if (!row.rows[0]?.rows) continue;
         const available = Math.max(0, parseInt(row.rows[0]?.qty ?? '0') - parseInt(row.rows[0]?.reserved ?? '0'));
         await syncSkuToMedusa(sku, available);
       }
