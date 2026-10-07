@@ -446,7 +446,8 @@ async function runSyncJob() {
         variantRows.push({
           product, v, kitJson: JSON.stringify(v.kit_components)
         });
-        if (v.sku) barcodeRows.push({ product, v });
+        // A NULL barcode would fail the whole 200-row batch, and half the catalogue has none
+        if (v.sku && v.barcode) barcodeRows.push({ product, v });
       }
     }
 
@@ -568,6 +569,7 @@ async function runSyncJob() {
             medusa_product_id = EXCLUDED.medusa_product_id,
             medusa_variant_id = EXCLUDED.medusa_variant_id,
             updated_at        = NOW()
+          WHERE barcode_mappings.product_sku = EXCLUDED.product_sku
         `, params);
         barcodesSynced += batch.length;
       } catch (err: any) {
