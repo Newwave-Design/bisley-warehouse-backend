@@ -16,6 +16,7 @@ import { query, getPool } from '../../db/index.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { medusaGet } from '../../lib/medusa-client.js';
 import { checkPaymentOnPlacement } from '../../lib/payment-status.js';
+import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { logError, logWarning } from '../../lib/logger.js';
 import { createNotification, createNotificationOnce } from '../../lib/notifications.js';
@@ -316,6 +317,7 @@ export async function handleOrderPlaced(order: any) {
 
   console.log(`✓ Pick list ${pickListNumber} created for order ${medusaOrderId} (${order.items?.length ?? 0} lines)`);
   void checkPaymentOnPlacement(medusaOrderId);
+  scheduleAllocationRun(`order ${pickListNumber} placed`);
 }
 
 /**
@@ -387,6 +389,7 @@ async function handleOrderCancelled(order: any) {
     const available = Math.max(0, parseInt(row.rows[0]?.qty ?? '0') - parseInt(row.rows[0]?.reserved ?? '0'));
     await syncSkuToMedusa(sku, available);
   }
+  scheduleAllocationRun(`order ${medusaOrderId} cancelled`);
 }
 
 /**
@@ -479,6 +482,7 @@ export async function handleOrderEdited(order: any) {
     notes.push(`The pick list was already ${parent.status} when the lines changed`);
   }
   if (notes.length) await review(notes.join('; '));
+  scheduleAllocationRun(`order ${label} edited`);
   console.log(`✓ Order ${label} edit applied to pick list ${parent.id} (${changed} line change${changed === 1 ? '' : 's'})`);
 }
 

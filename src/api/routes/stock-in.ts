@@ -24,6 +24,7 @@ import { toUuidOrNull } from './mobile.js';
 import { failedScansFor } from '../../lib/failed-scans.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
+import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { getLogger } from '../../lib/logger.js';
 
@@ -591,6 +592,7 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
     }
 
     logger.info(`[stock-in] Successfully stocked ${stocked} items, attempting to unblock pick lists...`);
+    scheduleAllocationRun(`stock-in session ${sessionId} confirmed (${stocked} lines)`);
 
     // Unblock any backorder pick lists that can now be fulfilled
     let unblocked: string[] = [];

@@ -9,6 +9,7 @@ import cors from 'cors';
 import { initializePool, closePool } from './db/index.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureFulfillmentSchema } from './db/ensure-fulfillment-schema.js';
+import { ensureStockSoldAudit } from './db/ensure-stock-sold-audit.js';
 import scanningRoutes from './api/routes/scanning.js';
 import pickListRoutes from './api/routes/pick-lists.js';
 import inventorySyncRoutes from './api/routes/inventory-sync.js';
@@ -29,6 +30,7 @@ import webhooksRoutes from './api/routes/webhooks.js';
 import reorderRulesRoutes, { pendingRouter as pendingReordersRouter } from './api/routes/reorder-rules.js';
 import supplierReordersRoutes from './api/routes/supplier-reorders.js';
 import stockSoldRoutes from './api/routes/stock-sold.js';
+import stockSoldV2Routes from './api/routes/stock-sold-v2.js';
 import errorLogRoutes from './api/routes/error-log.js';
 import notificationsRoutes from './api/routes/notifications.js';
 import deliveriesRoutes from './api/routes/deliveries.js';
@@ -44,6 +46,7 @@ import shippingOptionsRoutes from './routes/shipping-options.js';
 import { createNotificationOnce } from './lib/notifications.js';
 import { reconcileOrders } from './api/routes/webhooks.js';
 import { refreshUnpaidPickLists } from './lib/payment-status.js';
+import { scheduleAllocationRun } from './lib/allocation.js';
 import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
 import { query as dbQueryUtil } from './db/index.js';
 
@@ -116,6 +119,7 @@ app.use('/api/reorder-rules', reorderRulesRoutes);
 app.use('/api/pending-reorders', pendingReordersRouter);
 app.use('/api/supplier-reorders', supplierReordersRoutes);
 app.use('/api/stock-sold', stockSoldRoutes);
+app.use('/api/stock-sold-v2', stockSoldV2Routes);
 app.use('/api/error-log', errorLogRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/deliveries', deliveriesRoutes);
@@ -170,6 +174,12 @@ async function start() {
       await ensureFulfillmentSchema();
     } catch (bootstrapError) {
       console.warn('⚠️  Fulfillment schema bootstrap warning:', (bootstrapError as Error).message);
+    }
+
+    try {
+      await ensureStockSoldAudit();
+    } catch (auditError) {
+      console.warn('⚠️  Stock Sold audit bootstrap warning:', (auditError as Error).message);
     }
 
     // Start server
@@ -262,6 +272,11 @@ async function start() {
       setInterval(() => { void runPaymentRefresh(); }, 3 * 60 * 1000);
       setTimeout(() => { void runPaymentRefresh(); }, 20 * 1000);
       console.log('✓ Payment status refresh scheduled (every 3 min)');
+
+      // Stock Sold V2: allocation is also triggered by every change that affects it, this run catches anything missed
+      setInterval(() => scheduleAllocationRun('scheduled safety run', 0), 5 * 60 * 1000);
+      setTimeout(() => scheduleAllocationRun('startup run', 0), 45 * 1000);
+      console.log('✓ Stock Sold V2 allocation safety run scheduled (every 5 min)');
     }
 
     // Scheduled catalogue sync — pulls new/changed Medusa products into the WMS automatically,

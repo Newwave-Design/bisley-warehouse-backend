@@ -1469,4 +1469,99 @@ CREATE TABLE IF NOT EXISTS supplier_reorder_send_lines (
 CREATE INDEX IF NOT EXISTS idx_srsl_line ON supplier_reorder_send_lines (pick_list_item_id, sku);
 CREATE INDEX IF NOT EXISTS idx_srsl_send ON supplier_reorder_send_lines (send_id);
 
+-- ================================================================================
+-- STOCK SOLD V2 (pay when sold): frozen demand, allocations of stock to paid order lines, weekly statements, returns
+-- ================================================================================
+ALTER TABLE checkin_sessions ADD COLUMN IF NOT EXISTS is_sandbox BOOLEAN NOT NULL DEFAULT false;
+
+-- What one pick list line needs, by component SKU; frozen the first time it is seen so later kit edits do not rewrite history
+CREATE TABLE IF NOT EXISTS sale_demand (
+  pick_list_item_id UUID NOT NULL,
+  component_sku VARCHAR(100) NOT NULL,
+  per_unit_qty INT NOT NULL DEFAULT 1,
+  is_custom BOOLEAN NOT NULL DEFAULT false,
+  title TEXT,
+  frozen_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (pick_list_item_id, component_sku)
+);
+
+-- One row per allocation event. status: ACTIVE, RELEASED (taken back before its week was locked), RELEASED_PAID (taken back after).
+-- payable_qty comes out of Bisley stock and is on the statement; owned_qty comes out of stock we already own and is not.
+CREATE TABLE IF NOT EXISTS sale_allocations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  pick_list_item_id UUID NOT NULL,
+  pick_list_id UUID,
+  pick_list_number VARCHAR(50),
+  medusa_order_id VARCHAR(100),
+  sku VARCHAR(100) NOT NULL,
+  kind VARCHAR(10) NOT NULL DEFAULT 'STOCK',
+  title TEXT,
+  qty INT NOT NULL,
+  payable_qty INT NOT NULL,
+  owned_qty INT NOT NULL DEFAULT 0,
+  status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+  ordered_at TIMESTAMPTZ,
+  allocated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  week_start DATE NOT NULL,
+  released_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_sale_alloc_week ON sale_allocations (week_start, status);
+CREATE INDEX IF NOT EXISTS idx_sale_alloc_line ON sale_allocations (pick_list_item_id, sku, status);
+CREATE INDEX IF NOT EXISTS idx_sale_alloc_sku ON sale_allocations (sku, status);
+
+-- A week (Monday to Sunday) becomes fixed once locked: its statement lines are copied here and never change
+CREATE TABLE IF NOT EXISTS settlement_weeks (
+  week_start DATE PRIMARY KEY,
+  locked_at TIMESTAMPTZ,
+  locked_by VARCHAR(255),
+  note TEXT
+);
+CREATE TABLE IF NOT EXISTS settlement_week_lines (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  week_start DATE NOT NULL,
+  supplier_sku VARCHAR(100),
+  supplier_colour VARCHAR(50),
+  full_sku VARCHAR(160),
+  title TEXT,
+  colour TEXT,
+  quantity INT NOT NULL,
+  kind VARCHAR(10) NOT NULL DEFAULT 'STOCK',
+  note TEXT,
+  wms_skus TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_settlement_lines_week ON settlement_week_lines (week_start);
+
+-- Opening balances and corrections that count as stock received (negative qty removes stock from what we owe for)
+CREATE TABLE IF NOT EXISTS stock_adjustments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  sku VARCHAR(100) NOT NULL,
+  qty INT NOT NULL,
+  kind VARCHAR(20) NOT NULL DEFAULT 'ADJUSTMENT',
+  reason TEXT,
+  created_by VARCHAR(255),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_stock_adjustments_sku ON stock_adjustments (sku);
+
+-- Returned stock waiting for a decision. status: AWAITING, FAULTY (may be reported to Bisley), DAMAGED (our liability), RESELL (back in stock, not counted as received)
+CREATE TABLE IF NOT EXISTS stock_returns (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  pick_list_id UUID,
+  pick_list_item_id UUID,
+  medusa_order_id VARCHAR(100),
+  sku VARCHAR(100) NOT NULL,
+  quantity INT NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'AWAITING',
+  reason TEXT,
+  notes TEXT,
+  created_by VARCHAR(255),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  decided_by VARCHAR(255),
+  decided_at TIMESTAMPTZ,
+  reported_to_bisley_at TIMESTAMPTZ,
+  movement_id UUID
+);
+CREATE INDEX IF NOT EXISTS idx_stock_returns_status ON stock_returns (status);
+CREATE INDEX IF NOT EXISTS idx_stock_returns_sku ON stock_returns (sku, status);
+
 `;

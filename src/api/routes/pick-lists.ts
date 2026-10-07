@@ -8,6 +8,7 @@ import { query, getPool } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { applyDispatchStock } from '../../lib/dispatch-stock.js';
 import { paidSql, isPaid } from '../../lib/payment-status.js';
+import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { toUuidOrNull } from './mobile.js';
 import { v4 as uuidv4 } from 'uuid';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
@@ -693,6 +694,7 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
       );
     }
 
+    scheduleAllocationRun(`pick list ${pickListId} split into a backorder`);
     return res.json({
       success: true,
       fully_backordered: fullyBackordered,
@@ -1146,6 +1148,7 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: AuthRequest, r
       [pickListId]
     );
     await client.query('COMMIT');
+    scheduleAllocationRun(`pick list ${pickListId} dispatched`);
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
     console.error('Pick list dispatch error:', error);
@@ -1223,6 +1226,7 @@ router.post('/:pickListId/archive', authMiddleware, requirePermission('manage_op
     );
     
     console.log(`✓ Archived pick list ${pickListId} with ${itemsResult.rows.length} items`);
+    scheduleAllocationRun(`pick list ${pickListId} archived`);
     res.json({
       success: true,
       archived_pick_list_id: pickListId,
@@ -1277,6 +1281,7 @@ router.post('/:pickListId/restore', authMiddleware, requirePermission('manage_op
     );
     
     console.log(`✓ Restored pick list ${pickListId} with ${itemsResult.rows.length} items`);
+    scheduleAllocationRun(`pick list ${pickListId} restored`);
     res.json({
       success: true,
       restored_pick_list_id: pickListId,
@@ -1331,6 +1336,7 @@ router.delete('/:pickListId', authMiddleware, requirePermission('manage_operatio
     await query(`DELETE FROM pick_lists WHERE id = $1`, [pickListId]);
     
     console.log(`✓ Permanently deleted pick list ${pickListId}`);
+    scheduleAllocationRun(`pick list ${existing.rows[0].pick_list_number} permanently deleted`);
     res.json({ success: true, message: 'Pick list permanently deleted' });
   } catch (error) {
     console.error('Permanent delete error:', error);

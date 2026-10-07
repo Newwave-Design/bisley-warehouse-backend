@@ -7,6 +7,7 @@
  */
 import { query } from '../db/index.js';
 import { medusaGet } from './medusa-client.js';
+import { scheduleAllocationRun } from './allocation.js';
 
 export const PAID_STATUSES = ['captured', 'partially_refunded'] as const;
 
@@ -47,6 +48,7 @@ export async function refreshPaymentStatus(orderIds: string[]): Promise<{ checke
     const changed = await query(`SELECT 1 FROM pick_lists WHERE ${match} AND payment_status IS DISTINCT FROM $2 LIMIT 1`, [id, status]);
     await query(`UPDATE pick_lists SET payment_status = $2, payment_checked_at = NOW() WHERE ${match}`, [id, status]);
     if (changed.rows.length && (PAID_STATUSES as readonly string[]).includes(status)) nowPaid.push(id);
+    if (changed.rows.length) scheduleAllocationRun(`payment status of order ${id} is now ${status}`);
   }
   return { checked: statuses.size, nowPaid };
 }
