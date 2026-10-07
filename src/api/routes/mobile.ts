@@ -13,6 +13,7 @@ import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { moveStockBetweenBays, MoveError } from '../../lib/stock-move.js';
+import { paidSql } from '../../lib/payment-status.js';
 import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
 
@@ -272,7 +273,7 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
         COUNT(*) FILTER (WHERE pli.status = 'PENDING')::int                   AS items_pending
       FROM pick_lists pl
       LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
-      WHERE pl.is_archived = false AND ($1::text[] IS NULL OR pl.status = ANY($1::text[]))
+      WHERE pl.is_archived = false AND ${paidSql('pl')} AND ($1::text[] IS NULL OR pl.status = ANY($1::text[]))
       GROUP BY pl.id
       ORDER BY pl.created_at ${orderDir}
       LIMIT 100
@@ -298,10 +299,10 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
       SELECT
         pli.id, pli.line_number, pli.product_sku, pli.colour_code,
         pli.quantity_required, pli.quantity_picked, pli.status,
-        pli.picked_from_location_id, pli.notes,
+        pli.picked_from_location_id, pli.notes, pli.is_custom,
         l.location_code,
         -- Enrich from wms_products for display
-        wp.product_title, wp.colour_name, wp.variant_thumbnail, wp.metadata,
+        COALESCE(wp.product_title, pli.item_title) AS product_title, wp.colour_name, wp.variant_thumbnail, wp.metadata,
         COALESCE(wp.variant_width_mm, wp.width_mm) AS width_mm,
         COALESCE(wp.variant_height_mm, wp.height_mm) AS height_mm,
         COALESCE(wp.variant_depth_mm, wp.depth_mm) AS depth_mm,

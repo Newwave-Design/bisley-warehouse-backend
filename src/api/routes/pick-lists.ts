@@ -7,6 +7,7 @@ import express, { Request, Response } from 'express';
 import { query, getPool } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { applyDispatchStock } from '../../lib/dispatch-stock.js';
+import { paidSql, isPaid } from '../../lib/payment-status.js';
 import { toUuidOrNull } from './mobile.js';
 import { v4 as uuidv4 } from 'uuid';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
@@ -103,6 +104,7 @@ async function getPickListStockStatus(pickListId: string) {
  *   sort=asc|desc                default asc (oldest-first picking queue); Customer Orders view uses desc
  *   limit=50&offset=0
  *   include_values=true          adds order_value { gross, net, vat, refunded, currency } per list (live from Medusa)
+ *   payment=all                  include orders that are not paid yet (default: paid orders only)
  */
 router.get('/', authMiddleware, async (req: Request, res: Response) => {
   try {
@@ -121,6 +123,7 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
       params.push(statuses);
       conditions.push(`pl.status = ANY($${params.length}::text[])`);
     }
+    if (String(req.query.payment).toLowerCase() !== 'all') conditions.push(paidSql('pl'));
     
     // Filter by archive status (default: show active/non-archived lists)
     const isArchiveQuery = (is_archived as string).toLowerCase();
@@ -160,6 +163,7 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.dispatched_at,
          pl.is_archived,
          pl.archived_at,
+         pl.payment_status,
          COUNT(pli.id) as item_count,
          SUM(CASE WHEN pli.status = 'PICKED' THEN 1 ELSE 0 END) as items_picked
          ${skuParamIndex > 0 ? `, MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_required END) as sku_quantity_required
@@ -258,8 +262,8 @@ router.get('/:pickListId/fulfilment-plan', authMiddleware, async (req: Request, 
         [pickListId]
       ),
       query(
-        `SELECT pli.id, pli.line_number, pli.product_sku, pli.quantity_required, pli.quantity_picked, pli.status,
-                wp.product_title, wp.colour_name, wp.colour_code, wp.variant_thumbnail, wp.metadata,
+        `SELECT pli.id, pli.line_number, pli.product_sku, pli.quantity_required, pli.quantity_picked, pli.status, pli.is_custom,
+                COALESCE(wp.product_title, pli.item_title) AS product_title, wp.colour_name, wp.colour_code, wp.variant_thumbnail, wp.metadata,
                 COALESCE(wp.variant_width_mm, wp.width_mm) AS width_mm,
                 COALESCE(wp.variant_height_mm, wp.height_mm) AS height_mm,
                 COALESCE(wp.variant_depth_mm, wp.depth_mm) AS depth_mm,
@@ -458,7 +462,7 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
          wl.location_code,
          wl.bay_code,
          wl.bin_code,
-         wp.product_title,
+         COALESCE(wp.product_title, pli.item_title) AS product_title,
          wp.colour_name,
          wp.variant_thumbnail,
          COALESCE((SELECT SUM(quantity) FROM warehouse_inventory WHERE product_sku = pli.product_sku), 0)::int AS available_stock
@@ -1131,6 +1135,7 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: AuthRequest, r
 
     // Sandbox lists must never move real stock
     if (!pickList.is_sandbox) {
+      if (!isPaid(pickList)) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'This order has not been paid yet, so it cannot be dispatched' }); }
       if (!userId) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'A real user login is required to dispatch' }); }
       ({ syncSkus, shortfalls } = await applyDispatchStock(client, pickList, userId));
     }

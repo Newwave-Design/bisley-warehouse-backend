@@ -356,6 +356,9 @@ ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS label_printed_at TIMESTAMP;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMP;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS packing_notes TEXT;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_sandbox BOOLEAN NOT NULL DEFAULT false;
+-- Medusa's payment_status for the order (captured = paid); lists only reach the pick queue once paid
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS payment_status VARCHAR(40);
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS payment_checked_at TIMESTAMP;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS parent_pick_list_id UUID REFERENCES pick_lists(id) ON DELETE SET NULL;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS medusa_fulfillment_id VARCHAR(100);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT false;
@@ -398,6 +401,9 @@ ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS medusa_variant_id VARCHAR(1
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS medusa_product_id VARCHAR(100);
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
+-- Order lines with no SKU (custom items): picked and reported as sold, never re-ordered
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS is_custom BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS item_title TEXT;
 CREATE INDEX IF NOT EXISTS idx_pick_list_items_archived ON pick_list_items(is_archived);
 
 -- ================================================================================

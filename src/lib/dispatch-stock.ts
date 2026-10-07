@@ -22,7 +22,7 @@ export async function applyDispatchStock(
   userId: string,
 ): Promise<DispatchStockResult> {
   const items = (await client.query(
-    `SELECT pli.id, pli.product_sku, pli.quantity_picked, pli.picked_from_location_id,
+    `SELECT pli.id, pli.product_sku, pli.quantity_picked, pli.picked_from_location_id, pli.is_custom,
             wp.is_kit, wp.kit_components, wp.unit_cost_gbp AS sku_unit_cost_gbp, wp.price_gbp AS product_price_gbp,
             (SELECT wi.liability_status FROM warehouse_inventory wi
               WHERE wi.product_sku = pli.product_sku AND wi.location_id = pli.picked_from_location_id LIMIT 1) AS inv_liability_status
@@ -41,6 +41,16 @@ export async function applyDispatchStock(
   for (const item of items) {
     const picked = parseInt(item.quantity_picked, 10);
     if (!item.product_sku || !picked) continue;
+
+    // Custom (no SKU) lines carry no stock: record the sale so Stock Sold can list it
+    if (item.is_custom) {
+      await client.query(
+        `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, quantity, notes, performed_by, order_id, pick_list_item_id)
+         VALUES ('DISPATCH', NULL, $1, $2, 'Custom item', $3, $4, $5)`,
+        [item.product_sku, -picked, userId, pickList.medusa_order_id, item.id]
+      );
+      continue;
+    }
 
     const components: KitComponent[] = item.is_kit && Array.isArray(item.kit_components) ? item.kit_components : [];
     const parts = new Map<string, number>();

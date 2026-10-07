@@ -15,6 +15,7 @@ import crypto from 'crypto';
 import { query, getPool } from '../../db/index.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { medusaGet } from '../../lib/medusa-client.js';
+import { checkPaymentOnPlacement } from '../../lib/payment-status.js';
 import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { logError, logWarning } from '../../lib/logger.js';
 import { createNotification, createNotificationOnce } from '../../lib/notifications.js';
@@ -94,7 +95,7 @@ export interface ReconcileResult {
 
 const SKIP_STATUSES = new Set(['canceled', 'cancelled', 'archived', 'draft']);
 const SHIPPED_FULFILMENT = new Set(['fulfilled', 'shipped', 'delivered', 'canceled']);
-const ORDER_FIELDS = 'id,display_id,email,status,fulfillment_status,created_at,items.id,items.quantity,items.variant_id,items.product_id,items.variant_sku,shipping_address.*,shipping_methods.*';
+const ORDER_FIELDS = 'id,display_id,email,status,fulfillment_status,created_at,items.id,items.title,items.quantity,items.variant_id,items.product_id,items.variant_sku,shipping_address.*,shipping_methods.*';
 const orderSummary = (o: any): OrderSummary => ({
   display_id: o.display_id, order_id: o.id, created_at: o.created_at, email: o.email ?? null,
   items: (o.items ?? []).map((i: any) => i.variant_sku ?? null),
@@ -260,11 +261,11 @@ export async function handleOrderPlaced(order: any) {
     let lineNumber = 1;
 
     for (const item of order.items ?? []) {
-      const sku = item.variant?.sku ?? item.variant_sku ?? item.sku;
-      if (!sku) {
-        console.warn(`[webhooks] order.placed ${medusaOrderId}: item ${item.id} has no sku, skipping line`);
-        continue;
-      }
+      const realSku = item.variant?.sku ?? item.variant_sku ?? item.sku;
+      // A line with no SKU is a custom item: it still goes on the pick list, but is never re-ordered
+      const isCustom = !realSku;
+      const sku = realSku || 'CUSTOM';
+      const itemTitle = isCustom ? String(item.title ?? item.product_title ?? 'Custom item').slice(0, 500) : null;
 
       // quantity is a Medusa BigNumber-derived value — coerce defensively in
       // case an upstream query is missing the paired raw_quantity field.
@@ -273,7 +274,7 @@ export async function handleOrderPlaced(order: any) {
         console.warn(`[webhooks] order.placed ${medusaOrderId}: item ${item.id} (${sku}) missing quantity, defaulting to 1`);
       }
 
-      const colourCode = sku.split('-').pop()?.match(/[a-z]{2}\d/) ? sku.split('-').pop() : null;
+      const colourCode = !isCustom && sku.split('-').pop()?.match(/[a-z]{2}\d/) ? sku.split('-').pop() : null;
 
       // Extract Medusa IDs for fulfillment sync
       const medusaLineItemId = item.id;
@@ -283,10 +284,10 @@ export async function handleOrderPlaced(order: any) {
       await client.query(`
         INSERT INTO pick_list_items
           (pick_list_id, line_number, product_sku, colour_code, quantity_required, status, 
-           medusa_order_line_item_id, medusa_variant_id, medusa_product_id,
+           medusa_order_line_item_id, medusa_variant_id, medusa_product_id, is_custom, item_title,
            created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8, NOW(), NOW())
-      `, [pickListId, lineNumber++, sku, colourCode, quantity, medusaLineItemId, medusaVariantId, medusaProductId]);
+        VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8, $9, $10, NOW(), NOW())
+      `, [pickListId, lineNumber++, sku, colourCode, quantity, medusaLineItemId, medusaVariantId, medusaProductId, isCustom, itemTitle]);
     }
 
     await client.query('COMMIT');
@@ -314,6 +315,7 @@ export async function handleOrderPlaced(order: any) {
   }
 
   console.log(`✓ Pick list ${pickListNumber} created for order ${medusaOrderId} (${order.items?.length ?? 0} lines)`);
+  void checkPaymentOnPlacement(medusaOrderId);
 }
 
 /**
@@ -416,11 +418,12 @@ export async function handleOrderEdited(order: any) {
     .map((i: any) => ({
       id: i.id as string,
       sku: (i.variant?.sku ?? i.variant_sku ?? i.sku) as string | undefined,
+      title: String(i.title ?? i.product_title ?? 'Custom item').slice(0, 500),
       qty: Number(i.quantity) || 0,
       variantId: i.variant?.id ?? i.variant_id ?? null,
       productId: i.product?.id ?? i.product_id ?? null,
     }))
-    .filter((i: any) => i.id && i.sku);
+    .filter((i: any) => i.id);
 
   const notes: string[] = [];
   let changed = 0;
@@ -439,12 +442,12 @@ export async function handleOrderEdited(order: any) {
       if (!m) {
         if ((w.quantity_picked ?? 0) > 0) { notes.push(`${w.product_sku} was removed but ${w.quantity_picked} are already picked`); continue; }
         await client.query(`UPDATE pick_list_items SET is_archived = true, archived_at = NOW(), updated_at = NOW() WHERE id = $1`, [w.id]);
-        await reserve(w.product_sku, -w.quantity_required);
+        if (!w.is_custom) await reserve(w.product_sku, -w.quantity_required);
         changed++;
       } else if (m.qty !== w.quantity_required) {
         if (m.qty < (w.quantity_picked ?? 0)) { notes.push(`${w.product_sku} was reduced to ${m.qty} but ${w.quantity_picked} are already picked`); continue; }
         await client.query(`UPDATE pick_list_items SET quantity_required = $1, updated_at = NOW() WHERE id = $2`, [m.qty, w.id]);
-        await reserve(w.product_sku, m.qty - w.quantity_required);
+        if (!w.is_custom) await reserve(w.product_sku, m.qty - w.quantity_required);
         changed++;
       }
     }
@@ -453,15 +456,15 @@ export async function handleOrderEdited(order: any) {
     let lineNumber = wms.reduce((max: number, w: any) => Math.max(max, w.line_number), 0);
     for (const m of medusaItems) {
       if (known.has(m.id) || m.qty <= 0) continue;
-      const tail = m.sku!.split('-').pop();
+      const tail = m.sku?.split('-').pop();
       await client.query(
         `INSERT INTO pick_list_items
            (pick_list_id, line_number, product_sku, colour_code, quantity_required, status, is_sandbox,
-            medusa_order_line_item_id, medusa_variant_id, medusa_product_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8, $9, NOW(), NOW())`,
-        [parent.id, ++lineNumber, m.sku, tail?.match(/[a-z]{2}\d/) ? tail : null, m.qty, parent.is_sandbox, m.id, m.variantId, m.productId]
+            medusa_order_line_item_id, medusa_variant_id, medusa_product_id, is_custom, item_title, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, 'PENDING', $6, $7, $8, $9, $10, $11, NOW(), NOW())`,
+        [parent.id, ++lineNumber, m.sku ?? 'CUSTOM', tail?.match(/[a-z]{2}\d/) ? tail : null, m.qty, parent.is_sandbox, m.id, m.variantId, m.productId, !m.sku, m.sku ? null : m.title]
       );
-      await reserve(m.sku!, m.qty);
+      if (m.sku) await reserve(m.sku, m.qty);
       changed++;
     }
     await client.query('COMMIT');

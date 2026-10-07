@@ -54,9 +54,10 @@ function parseRange(q: any): { from: string; to: string } | null {
 export async function buildReport(from: string, to: string) {
   // Pad the SQL window by a day each side, then filter on the UK date so the boundary is exact
   const moves = await query(
-    `SELECT product_sku, movement_date, location_id, -quantity AS qty
-     FROM warehouse_movements
-     WHERE movement_type = 'DISPATCH' AND movement_date >= $1::date - 1 AND movement_date < $2::date + 2`,
+    `SELECT m.product_sku, m.movement_date, m.location_id, -m.quantity AS qty, pli.is_custom, pli.item_title
+     FROM warehouse_movements m
+     LEFT JOIN pick_list_items pli ON pli.id = m.pick_list_item_id
+     WHERE m.movement_type = 'DISPATCH' AND m.movement_date >= $1::date - 1 AND m.movement_date < $2::date + 2`,
     [from, to]
   );
 
@@ -78,7 +79,7 @@ export async function buildReport(from: string, to: string) {
     }
   }
 
-  type Row = { supplier_sku: string; colour: string; full_sku: string; title: string; quantity: number; days: Map<string, number> };
+  type Row = { supplier_sku: string; colour: string; full_sku: string; title: string; quantity: number; custom: boolean; days: Map<string, number> };
   const weeks = new Map<number, Map<string, Row>>();
   const missing = new Map<string, number>();
   const unstocked = new Map<string, number>();
@@ -87,16 +88,20 @@ export async function buildReport(from: string, to: string) {
     const day = ukDate(new Date(m.movement_date));
     if (day < from || day > to) continue;
     const qty = Number(m.qty);
-    if (!m.location_id) { unstocked.set(m.product_sku, (unstocked.get(m.product_sku) ?? 0) + qty); continue; }
-    const i = info.get(m.product_sku);
-    if (!i?.supplier_sku) { missing.set(m.product_sku, (missing.get(m.product_sku) ?? 0) + qty); continue; }
+    const custom = !!m.is_custom;
+    if (!custom && !m.location_id) { unstocked.set(m.product_sku, (unstocked.get(m.product_sku) ?? 0) + qty); continue; }
+    // Custom items have no SKU: they are listed by title
+    const i = custom
+      ? { title: m.item_title || 'Custom item', colour: '', supplier_sku: '', supplier_colour: '' }
+      : info.get(m.product_sku);
+    if (!i || (!custom && !i.supplier_sku)) { missing.set(m.product_sku, (missing.get(m.product_sku) ?? 0) + qty); continue; }
 
     const friday = fridayOf(day);
     const rows = weeks.get(friday) ?? weeks.set(friday, new Map()).get(friday)!;
-    const k = `${i.supplier_sku}|${i.supplier_colour}`;
+    const k = custom ? `custom|${i.title}` : `${i.supplier_sku}|${i.supplier_colour}`;
     const row = rows.get(k) ?? rows.set(k, {
-      supplier_sku: i.supplier_sku, colour: i.colour, title: i.title, quantity: 0, days: new Map(),
-      full_sku: i.supplier_colour ? `${i.supplier_sku}-${i.supplier_colour}` : i.supplier_sku,
+      supplier_sku: i.supplier_sku ?? '', colour: i.colour, title: i.title, quantity: 0, custom, days: new Map(),
+      full_sku: i.supplier_colour ? `${i.supplier_sku}-${i.supplier_colour}` : (i.supplier_sku ?? ''),
     }).get(k)!;
     row.quantity += qty;
     row.days.set(day, (row.days.get(day) ?? 0) + qty);
@@ -105,9 +110,9 @@ export async function buildReport(from: string, to: string) {
   const out = [...weeks.entries()].sort((a, b) => a[0] - b[0]).map(([friday, map]) => {
     const rows = [...map.values()]
       .sort((a, b) => a.supplier_sku.localeCompare(b.supplier_sku) || a.colour.localeCompare(b.colour))
-      .map(({ days, ...r }) => ({
+      .map(({ days, custom, ...r }) => ({
         ...r,
-        note: `Dispatched: ${[...days.entries()].sort().map(([d, q]) => `${q} × ${fmt(utcDay(d))}`).join('; ')}`,
+        note: `${custom ? 'Custom item (no SKU). ' : ''}Dispatched: ${[...days.entries()].sort().map(([d, q]) => `${q} × ${fmt(utcDay(d))}`).join('; ')}`,
       }));
     const iso = new Date(friday).toISOString().slice(0, 10);
     return {

@@ -43,6 +43,7 @@ import barcodeTestRoutes from './api/routes/barcode-test.js';
 import shippingOptionsRoutes from './routes/shipping-options.js';
 import { createNotificationOnce } from './lib/notifications.js';
 import { reconcileOrders } from './api/routes/webhooks.js';
+import { refreshUnpaidPickLists } from './lib/payment-status.js';
 import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
 import { query as dbQueryUtil } from './db/index.js';
 
@@ -250,6 +251,17 @@ async function start() {
       setInterval(() => { void runCatchUp(); }, 10 * 60 * 1000);
       setTimeout(() => { void runCatchUp(); }, 30 * 1000);
       console.log('✓ Order catch-up scheduled (every 10 min, last 2 days)');
+
+      // Payment status: orders that are not paid yet are re-checked in Medusa until they are
+      const runPaymentRefresh = async () => {
+        try {
+          const r = await refreshUnpaidPickLists();
+          if (r.nowPaid.length) console.log(`[scheduler] ${r.nowPaid.length} order(s) now paid`);
+        } catch (err) { console.warn('[scheduler] Payment refresh error:', err); }
+      };
+      setInterval(() => { void runPaymentRefresh(); }, 3 * 60 * 1000);
+      setTimeout(() => { void runPaymentRefresh(); }, 20 * 1000);
+      console.log('✓ Payment status refresh scheduled (every 3 min)');
     }
 
     // Scheduled catalogue sync — pulls new/changed Medusa products into the WMS automatically,

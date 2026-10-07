@@ -6,6 +6,7 @@
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { paidSql } from '../../lib/payment-status.js';
 
 const router = express.Router();
 
@@ -45,7 +46,7 @@ router.get('/', authMiddleware, async (_req: AuthRequest, res: Response) => {
                COUNT(*) FILTER (WHERE status = 'PENDING')::int     AS pending,
                COUNT(*) FILTER (WHERE status = 'IN_PROGRESS')::int AS in_progress,
                COUNT(*) FILTER (WHERE status = 'PICKED')::int      AS picked
-             FROM pick_lists`),
+             FROM pick_lists pl WHERE ${paidSql('pl')}`),
       query(`SELECT
                COUNT(*) FILTER (WHERE status = 'VALIDATED')::int AS validated,
                COUNT(*) FILTER (WHERE status = 'UNMAPPED')::int  AS unmapped,
