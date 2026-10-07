@@ -15,7 +15,7 @@ import crypto from 'crypto';
 import { query, getPool } from '../../db/index.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { medusaGet } from '../../lib/medusa-client.js';
-import { checkPaymentOnPlacement } from '../../lib/payment-status.js';
+import { checkPaymentOnPlacement, storePaymentStatus } from '../../lib/payment-status.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { logError, logWarning } from '../../lib/logger.js';
@@ -167,6 +167,92 @@ export function reconcileOrders(opts: { days?: number; dryRun?: boolean } = {}):
   reconcileQueue = run;
   return run;
 }
+
+/**
+ * Open-order sync: cancel, edit and refund events from Medusa are fire-and-forget, so every few minutes the order behind
+ * each open pick list is re-read from Medusa and any missed cancellation, payment change or quantity edit is applied
+ * through the same handlers the webhooks use. Orders that are split, already dispatched or have lines the WMS cannot
+ * match by line id are left to the webhook path.
+ */
+export interface OpenOrderSyncResult { dryRun: boolean; checked: number; cancelled: string[]; paymentChanged: string[]; edited: string[]; failed: string[] }
+const SYNC_FIELDS = 'id,display_id,status,payment_status,items.id,items.title,items.quantity,items.variant_id,items.product_id,items.variant_sku';
+const editsSeen = new Map<string, string>();
+let openSyncRunning = false;
+
+export async function syncOpenOrders(dryRun = false): Promise<OpenOrderSyncResult> {
+  const result: OpenOrderSyncResult = { dryRun, checked: 0, cancelled: [], paymentChanged: [], edited: [], failed: [] };
+  if (openSyncRunning) return result;
+  openSyncRunning = true;
+  try {
+    const open = (await query(
+      `SELECT split_part(medusa_order_id, '-', 1) AS id, array_agg(DISTINCT COALESCE(payment_status, '')) AS pays,
+              count(*)::int AS lists, bool_or(medusa_order_id = split_part(medusa_order_id, '-', 1)) AS has_parent
+       FROM pick_lists
+       WHERE NOT is_sandbox AND NOT is_archived AND status NOT IN ('DISPATCHED', 'CANCELLED') AND medusa_order_id LIKE 'order\\_%'
+       GROUP BY 1`
+    )).rows;
+    const ids = open.map((r: any) => r.id);
+    const lines = (await query(
+      `SELECT split_part(pl.medusa_order_id, '-', 1) AS id, pli.medusa_order_line_item_id AS line_id, pli.quantity_required AS qty
+       FROM pick_list_items pli JOIN pick_lists pl ON pl.id = pli.pick_list_id
+       WHERE split_part(pl.medusa_order_id, '-', 1) = ANY($1::text[]) AND NOT pli.is_archived AND NOT pli.is_sandbox`, [ids]
+    )).rows;
+    const wmsLines = new Map<string, { line_id: string | null; qty: number }[]>();
+    for (const l of lines) (wmsLines.get(l.id) ?? wmsLines.set(l.id, []).get(l.id)!).push(l);
+
+    const BATCH = 25;
+    for (let i = 0; i < ids.length; i += BATCH) {
+      const batch = ids.slice(i, i + BATCH);
+      const qs = batch.map((id: string) => `id=${encodeURIComponent(id)}`).join('&');
+      const data = await medusaGet(`/admin/orders?${qs}&limit=${batch.length}&fields=${SYNC_FIELDS}`);
+      if (!Array.isArray(data?.orders)) throw new Error(`Medusa orders request failed: ${JSON.stringify(data).slice(0, 200)}`);
+      for (const o of data.orders) {
+        const info = open.find((r: any) => r.id === o.id);
+        if (!info) continue;
+        result.checked++;
+        const label = `#${o.display_id ?? o.id}`;
+        try {
+          if (o.status === 'canceled' || o.status === 'cancelled') {
+            result.cancelled.push(label);
+            if (!dryRun) await handleOrderCancelled(o);
+            continue;
+          }
+          if (o.payment_status && info.pays.some((p: string) => p !== o.payment_status)) {
+            result.paymentChanged.push(`${label} -> ${o.payment_status}`);
+            if (!dryRun) await storePaymentStatus(o.id, o.payment_status);
+          }
+          const mine = wmsLines.get(o.id) ?? [];
+          if (info.lists !== 1 || !info.has_parent || !mine.length || mine.some((l) => !l.line_id)) continue;
+          const theirs = new Map<string, number>((o.items ?? []).filter((it: any) => it.id && Number(it.quantity) > 0).map((it: any) => [it.id, Number(it.quantity)]));
+          const ours = new Map<string, number>(mine.map((l) => [l.line_id as string, Number(l.qty)]));
+          const same = theirs.size === ours.size && [...theirs].every(([k, q]) => ours.get(k) === q);
+          if (same) continue;
+          const sig = [...theirs].sort().map(([k, q]) => `${k}=${q}`).join(',');
+          if (editsSeen.get(o.id) === sig) continue;
+          result.edited.push(label);
+          if (!dryRun) { editsSeen.set(o.id, sig); await handleOrderEdited(o); }
+        } catch (err: any) {
+          result.failed.push(`${label}: ${err?.message ?? err}`);
+        }
+      }
+    }
+    if (!dryRun && (result.cancelled.length || result.edited.length || result.paymentChanged.length || result.failed.length)) {
+      await logWarning('WEBHOOK', 'Open-order sync applied changes Medusa did not send an event for', { ...result });
+    }
+    return result;
+  } finally {
+    openSyncRunning = false;
+  }
+}
+
+/** POST /api/webhooks/sync-open-orders?dryRun=true — admin: preview or run the open-order sync */
+router.post('/sync-open-orders', authMiddleware, requirePermission('system_admin'), async (req: Request, res: Response) => {
+  try {
+    return res.json(await syncOpenOrders(String(req.query.dryRun) !== 'false'));
+  } catch (err: any) {
+    return res.status(502).json({ error: 'Open-order sync failed', details: err?.message ?? String(err) });
+  }
+});
 
 // Dashboard polls the dry-run check; cache it so it never hammers the Medusa admin API
 const STATUS_TTL_MS = 2 * 60 * 1000;

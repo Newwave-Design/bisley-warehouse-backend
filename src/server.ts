@@ -44,7 +44,7 @@ import moveSessionRoutes from './api/routes/move-sessions.js';
 import barcodeTestRoutes from './api/routes/barcode-test.js';
 import shippingOptionsRoutes from './routes/shipping-options.js';
 import { createNotificationOnce } from './lib/notifications.js';
-import { reconcileOrders } from './api/routes/webhooks.js';
+import { reconcileOrders, syncOpenOrders } from './api/routes/webhooks.js';
 import { refreshUnpaidPickLists } from './lib/payment-status.js';
 import { scheduleAllocationRun } from './lib/allocation.js';
 import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
@@ -272,6 +272,19 @@ async function start() {
       setInterval(() => { void runPaymentRefresh(); }, 3 * 60 * 1000);
       setTimeout(() => { void runPaymentRefresh(); }, 20 * 1000);
       console.log('✓ Payment status refresh scheduled (every 3 min)');
+
+      // Open orders: cancellations, refunds and quantity edits Medusa did not send an event for are picked up here
+      const runOpenOrderSync = async () => {
+        try {
+          const r = await syncOpenOrders(false);
+          if (r.cancelled.length || r.edited.length || r.paymentChanged.length) {
+            console.log(`[scheduler] Open-order sync: ${r.cancelled.length} cancelled, ${r.edited.length} edited, ${r.paymentChanged.length} payment change(s)`);
+          }
+        } catch (err) { console.warn('[scheduler] Open-order sync error:', err); }
+      };
+      setInterval(() => { void runOpenOrderSync(); }, 5 * 60 * 1000);
+      setTimeout(() => { void runOpenOrderSync(); }, 60 * 1000);
+      console.log('✓ Open-order sync scheduled (every 5 min)');
 
       // Stock Sold V2: allocation is also triggered by every change that affects it, this run catches anything missed
       setInterval(() => scheduleAllocationRun('scheduled safety run', 0), 5 * 60 * 1000);

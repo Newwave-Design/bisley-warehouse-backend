@@ -37,6 +37,15 @@ async function fetchStatuses(ids: string[]): Promise<Map<string, string>> {
   return out;
 }
 
+/** Store a Medusa payment status on the order's pick lists (including split children). Returns true if it changed. */
+export async function storePaymentStatus(orderId: string, status: string): Promise<boolean> {
+  const match = `(medusa_order_id = $1 OR left(medusa_order_id, length($1) + 3) = $1 || '-BO')`;
+  const changed = await query(`SELECT 1 FROM pick_lists WHERE ${match} AND payment_status IS DISTINCT FROM $2 LIMIT 1`, [orderId, status]);
+  await query(`UPDATE pick_lists SET payment_status = $2, payment_checked_at = NOW() WHERE ${match}`, [orderId, status]);
+  if (changed.rows.length) scheduleAllocationRun(`payment status of order ${orderId} is now ${status}`);
+  return changed.rows.length > 0;
+}
+
 /** Look up the given Medusa orders and store their payment status on the matching pick lists (including split children). */
 export async function refreshPaymentStatus(orderIds: string[]): Promise<{ checked: number; nowPaid: string[] }> {
   const ids = [...new Set(orderIds)].filter(Boolean);
@@ -44,11 +53,7 @@ export async function refreshPaymentStatus(orderIds: string[]): Promise<{ checke
   const statuses = await fetchStatuses(ids);
   const nowPaid: string[] = [];
   for (const [id, status] of statuses) {
-    const match = `(medusa_order_id = $1 OR left(medusa_order_id, length($1) + 3) = $1 || '-BO')`;
-    const changed = await query(`SELECT 1 FROM pick_lists WHERE ${match} AND payment_status IS DISTINCT FROM $2 LIMIT 1`, [id, status]);
-    await query(`UPDATE pick_lists SET payment_status = $2, payment_checked_at = NOW() WHERE ${match}`, [id, status]);
-    if (changed.rows.length && (PAID_STATUSES as readonly string[]).includes(status)) nowPaid.push(id);
-    if (changed.rows.length) scheduleAllocationRun(`payment status of order ${id} is now ${status}`);
+    if (await storePaymentStatus(id, status) && (PAID_STATUSES as readonly string[]).includes(status)) nowPaid.push(id);
   }
   return { checked: statuses.size, nowPaid };
 }
