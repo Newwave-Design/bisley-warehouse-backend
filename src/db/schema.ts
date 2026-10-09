@@ -1568,5 +1568,13 @@ CREATE INDEX IF NOT EXISTS idx_stock_returns_sku ON stock_returns (sku, status);
 UPDATE sale_allocations SET week_start = week_start - 3 WHERE EXTRACT(DOW FROM week_start) = 1;
 UPDATE settlement_weeks SET week_start = week_start - 3 WHERE EXTRACT(DOW FROM week_start) = 1;
 UPDATE settlement_week_lines SET week_start = week_start - 3 WHERE EXTRACT(DOW FROM week_start) = 1;
+-- Open weeks follow the allocation date (allocation stamps the then-current week), so orders allocated on a Friday land in that Friday's week
+UPDATE sale_allocations a SET week_start = f.wk
+FROM (
+  SELECT id, (d - ((EXTRACT(DOW FROM d)::int + 2) % 7))::date AS wk
+  FROM (SELECT id, (allocated_at AT TIME ZONE 'Europe/London')::date AS d FROM sale_allocations WHERE status = 'ACTIVE') x
+) f
+WHERE a.id = f.id AND a.week_start <> f.wk
+  AND NOT EXISTS (SELECT 1 FROM settlement_weeks s WHERE s.week_start = a.week_start AND s.locked_at IS NOT NULL);
 
 `;
