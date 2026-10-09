@@ -1509,7 +1509,7 @@ CREATE INDEX IF NOT EXISTS idx_sale_alloc_week ON sale_allocations (week_start, 
 CREATE INDEX IF NOT EXISTS idx_sale_alloc_line ON sale_allocations (pick_list_item_id, sku, status);
 CREATE INDEX IF NOT EXISTS idx_sale_alloc_sku ON sale_allocations (sku, status);
 
--- A week (Monday to Sunday) becomes fixed once locked: its statement lines are copied here and never change
+-- A week (Friday to Thursday) becomes fixed once locked: its statement lines are copied here and never change
 CREATE TABLE IF NOT EXISTS settlement_weeks (
   week_start DATE PRIMARY KEY,
   locked_at TIMESTAMPTZ,
@@ -1563,5 +1563,10 @@ CREATE TABLE IF NOT EXISTS stock_returns (
 );
 CREATE INDEX IF NOT EXISTS idx_stock_returns_status ON stock_returns (status);
 CREATE INDEX IF NOT EXISTS idx_stock_returns_sku ON stock_returns (sku, status);
+
+-- Weeks moved from Monday-Sunday to Friday-Thursday: re-key old Monday weeks to the Friday three days earlier (no-op once done)
+UPDATE sale_allocations SET week_start = week_start - 3 WHERE EXTRACT(DOW FROM week_start) = 1;
+UPDATE settlement_weeks SET week_start = week_start - 3 WHERE EXTRACT(DOW FROM week_start) = 1;
+UPDATE settlement_week_lines SET week_start = week_start - 3 WHERE EXTRACT(DOW FROM week_start) = 1;
 
 `;

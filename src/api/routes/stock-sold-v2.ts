@@ -1,11 +1,11 @@
 /**
  * Stock Sold V2 - "pay when sold". Runs alongside the original Stock Sold report and changes nothing in the live flows.
  *
- * Weekly statements (Monday to Sunday, UK time) of units that were sold from stock we hold, plus returns, a running stock view
+ * Weekly statements (Friday to Thursday, UK time) of units that were sold from stock we hold, plus returns, a running stock view
  * that ties back to what is on hand, opening adjustments and a full audit trail. See lib/allocation.ts for how units are counted.
  *
  * GET  /api/stock-sold-v2/weeks                        - every week with units and OPEN/LOCKED status
- * GET  /api/stock-sold-v2/weeks/:weekStart             - one week's statement (weekStart is the Monday), with the orders behind each line
+ * GET  /api/stock-sold-v2/weeks/:weekStart             - one week's statement (weekStart is the Friday), with the orders behind each line
  * GET  /api/stock-sold-v2/weeks/:weekStart/export      - the statement as .xlsx (?detail=true adds an Orders sheet); the download is logged
  * POST /api/stock-sold-v2/weeks/:weekStart/lock        - fix a finished week (system_admin)
  * GET  /api/stock-sold-v2/running                      - per SKU: received, sold, free stock, on hand and any difference
@@ -27,7 +27,7 @@ import { toUuidOrNull } from './mobile.js';
 import { loadPools, bisleyFree, ownedFree, runAllocation, scheduleAllocationRun } from '../../lib/allocation.js';
 import { buildWeek, listWeeks, lockWeek, LockError } from '../../lib/settlement.js';
 import { withAudit, logAuditEvent, actorOf } from '../../lib/audit.js';
-import { isMonday } from '../../lib/weeks.js';
+import { isFriday } from '../../lib/weeks.js';
 
 const router = express.Router();
 const READ = [authMiddleware, requirePermission('manage_orders')];
@@ -47,12 +47,12 @@ router.get('/weeks', ...READ, async (_req: AuthRequest, res: Response) => {
 });
 
 router.get('/weeks/:weekStart', ...READ, async (req: AuthRequest, res: Response) => {
-  if (!isMonday(req.params.weekStart)) return res.status(400).json({ error: 'weekStart must be a Monday (YYYY-MM-DD)' });
+  if (!isFriday(req.params.weekStart)) return res.status(400).json({ error: 'weekStart must be a Friday (YYYY-MM-DD)' });
   try { res.json(await buildWeek({ query }, req.params.weekStart)); } catch (err) { fail(res, err, 'build the statement'); }
 });
 
 router.get('/weeks/:weekStart/export', ...READ, async (req: AuthRequest, res: Response) => {
-  if (!isMonday(req.params.weekStart)) return res.status(400).json({ error: 'weekStart must be a Monday (YYYY-MM-DD)' });
+  if (!isFriday(req.params.weekStart)) return res.status(400).json({ error: 'weekStart must be a Friday (YYYY-MM-DD)' });
   try {
     const st = await buildWeek({ query }, req.params.weekStart);
     const aoa: (string | number)[][] = [['Week commencing', 'SKU', 'Title', 'Colour', 'Full SKU', 'Quantity', 'Note']];
@@ -79,7 +79,7 @@ router.get('/weeks/:weekStart/export', ...READ, async (req: AuthRequest, res: Re
 });
 
 router.post('/weeks/:weekStart/lock', ...ADMIN, async (req: AuthRequest, res: Response) => {
-  if (!isMonday(req.params.weekStart)) return res.status(400).json({ error: 'weekStart must be a Monday (YYYY-MM-DD)' });
+  if (!isFriday(req.params.weekStart)) return res.status(400).json({ error: 'weekStart must be a Friday (YYYY-MM-DD)' });
   const actor = actorOf(req);
   try {
     const st = await withAudit({ actor, source: 'lock', reason: `Locked week commencing ${req.params.weekStart}` },

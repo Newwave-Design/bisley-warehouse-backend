@@ -1,5 +1,5 @@
 /**
- * Stock Sold V2 weekly statements (Monday to Sunday, UK time).
+ * Stock Sold V2 weekly statements (Friday to Thursday, UK time).
  *
  * A statement lists payable units allocated in that week, grouped by supplier SKU + colour (WMS SKUs are translated through
  * wms_products.supplier_part_code / supplier_colour_code). Custom (no SKU) lines are listed by title. An open week is computed
@@ -7,7 +7,7 @@
  */
 import { query } from '../db/index.js';
 import { setAuditContext } from './audit.js';
-import { currentWeekStart, fmtDay, sundayOf, ukDate, utcDay, weekLabel, isoOf } from './weeks.js';
+import { currentWeekStart, fmtDay, thursdayOf, ukDate, utcDay, weekLabel, isoOf } from './weeks.js';
 
 type Db = { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> };
 
@@ -104,7 +104,7 @@ export async function buildWeek(db: Db, weekStart: string): Promise<Statement> {
   }
 
   return {
-    week_start: weekStart, week_end: sundayOf(weekStart), label: weekLabel(weekStart),
+    week_start: weekStart, week_end: thursdayOf(weekStart), label: weekLabel(weekStart),
     status: locked ? 'LOCKED' : 'OPEN', locked_at: week?.locked_at ? new Date(week.locked_at).toISOString() : null, locked_by: week?.locked_by ?? null,
     rows, total: rows.reduce((s, r) => s + r.quantity, 0),
     no_supplier_sku: rows.filter((r) => r.kind === 'STOCK' && !r.supplier_sku).length,
@@ -124,7 +124,7 @@ export async function listWeeks(): Promise<{ week_start: string; week_end: strin
   const sorted = [...weeks.keys()].sort();
   for (let t = utcDay(sorted[0]); t <= utcDay(cur); t += 7 * 86400000) if (!weeks.has(isoOf(t))) weeks.set(isoOf(t), { units: 0, locked_at: null });
   return [...weeks.entries()].sort((a, b) => b[0].localeCompare(a[0])).map(([w, v]) => ({
-    week_start: w, week_end: sundayOf(w), label: weekLabel(w), status: v.locked_at ? 'LOCKED' as const : 'OPEN' as const,
+    week_start: w, week_end: thursdayOf(w), label: weekLabel(w), status: v.locked_at ? 'LOCKED' as const : 'OPEN' as const,
     locked_at: v.locked_at, units: v.units, current: w === cur,
   }));
 }
@@ -134,7 +134,7 @@ export class LockError extends Error { constructor(message: string, public statu
 /** Fix a finished week: store its statement lines so it can never change. Releases after this turn into stock we own. */
 export async function lockWeek(client: Db & { query: any }, weekStart: string, actor: string, force: boolean): Promise<Statement> {
   await client.query('SELECT pg_advisory_xact_lock(727001)');
-  if (!force && sundayOf(weekStart) >= ukDate(new Date())) throw new LockError('That week has not finished yet');
+  if (!force && thursdayOf(weekStart) >= ukDate(new Date())) throw new LockError('That week has not finished yet');
   const existing = (await client.query(`SELECT locked_at FROM settlement_weeks WHERE week_start = $1::date FOR UPDATE`, [weekStart])).rows[0];
   if (existing?.locked_at) throw new LockError('That week is already locked', 409);
   const statement = await buildWeek(client, weekStart);
