@@ -102,6 +102,7 @@ async function getPickListStockStatus(pickListId: string) {
  *   is_archived=true|false       filter by archive status (default false = show active lists only)
  *   search=smith                 matches customer name/email, pick list number or Medusa order id
  *   sku=H2910NL-av1              only pick lists containing this SKU (also returns per-line qty for it)
+ *   sample=true                  only pick lists with a sample line (SKU contains SAMPLE); adds sample_item_count / sample_items_picked
  *   sort=asc|desc                default asc (oldest-first picking queue); Customer Orders view uses desc
  *   limit=50&offset=0
  *   include_values=true          adds order_value { gross, net, vat, refunded, currency } per list (live from Medusa)
@@ -145,6 +146,10 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
       conditions.push(`EXISTS (SELECT 1 FROM pick_list_items pli2 WHERE pli2.pick_list_id = pl.id AND pli2.product_sku = $${skuParamIndex})`);
     }
 
+    if (String(req.query.sample).toLowerCase() === 'true') {
+      conditions.push(`EXISTS (SELECT 1 FROM pick_list_items pli3 WHERE pli3.pick_list_id = pl.id AND pli3.product_sku ILIKE '%SAMPLE%')`);
+    }
+
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const orderDir = (sort as string)?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
     const countParams = params.slice();
@@ -166,7 +171,9 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.archived_at,
          pl.payment_status,
          COUNT(pli.id) as item_count,
-         SUM(CASE WHEN pli.status = 'PICKED' THEN 1 ELSE 0 END) as items_picked
+         SUM(CASE WHEN pli.status = 'PICKED' THEN 1 ELSE 0 END) as items_picked,
+         SUM(CASE WHEN pli.product_sku ILIKE '%SAMPLE%' THEN 1 ELSE 0 END) as sample_item_count,
+         SUM(CASE WHEN pli.product_sku ILIKE '%SAMPLE%' AND pli.status = 'PICKED' THEN 1 ELSE 0 END) as sample_items_picked
          ${skuParamIndex > 0 ? `, MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_required END) as sku_quantity_required
                  , MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_picked END) as sku_quantity_picked` : ''}
        FROM pick_lists pl
@@ -846,6 +853,54 @@ router.post('/:pickListId/items', authMiddleware, async (req: Request, res: Resp
   } catch (error) {
     console.error('Pick item error:', error);
     return res.status(500).json({ error: 'Failed to add pick item' });
+  }
+});
+
+/**
+ * POST /api/pick-lists/:pickListId/mark-samples-picked
+ * Marks every outstanding sample line (SKU contains SAMPLE) on this list as picked in full, without a barcode scan.
+ * Other lines are untouched. Sample lines have no warehouse location, so nothing is reserved here
+ * (same as the desktop "Mark Picked" button). A PENDING list moves to IN_PROGRESS, as Start Picking would.
+ * Response: { success, marked }
+ */
+router.post('/:pickListId/mark-samples-picked', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+
+    const header = await query(`SELECT id, status FROM pick_lists WHERE id = $1`, [pickListId]);
+    const pl = header.rows[0];
+    if (!pl) return res.status(404).json({ error: 'Pick list not found' });
+    if (['DISPATCHED', 'CANCELLED'].includes(pl.status)) {
+      return res.status(400).json({ error: `Cannot pick samples on a pick list with status ${pl.status}` });
+    }
+
+    const sampleLines = await query(
+      `SELECT COUNT(*)::int AS n FROM pick_list_items WHERE pick_list_id = $1 AND product_sku ILIKE '%SAMPLE%'`,
+      [pickListId]
+    );
+    if (sampleLines.rows[0].n === 0) {
+      return res.status(400).json({ error: 'This pick list has no sample items' });
+    }
+
+    const marked = await query(
+      `UPDATE pick_list_items
+       SET status = 'PICKED', quantity_picked = quantity_required, updated_at = NOW()
+       WHERE pick_list_id = $1 AND product_sku ILIKE '%SAMPLE%' AND status <> 'PICKED'
+       RETURNING id`,
+      [pickListId]
+    );
+
+    if (marked.rows.length > 0) {
+      await query(
+        `UPDATE pick_lists SET status = 'IN_PROGRESS', updated_at = NOW() WHERE id = $1 AND status = 'PENDING'`,
+        [pickListId]
+      );
+    }
+
+    return res.json({ success: true, marked: marked.rows.length });
+  } catch (error) {
+    console.error('Mark samples picked error:', error);
+    return res.status(500).json({ error: 'Failed to mark sample items picked' });
   }
 });
 
