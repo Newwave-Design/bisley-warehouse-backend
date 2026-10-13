@@ -371,6 +371,24 @@ CREATE INDEX IF NOT EXISTS idx_pick_lists_parent ON pick_lists(parent_pick_list_
 CREATE INDEX IF NOT EXISTS idx_pick_lists_archived ON pick_lists(is_archived);
 
 -- ================================================================================
+-- PICK LIST NOTES (staff notes on a customer order; an unresolved flag shows as an alert)
+-- ================================================================================
+CREATE TABLE IF NOT EXISTS pick_list_notes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  pick_list_id UUID NOT NULL REFERENCES pick_lists(id) ON DELETE CASCADE,
+  note_text TEXT NOT NULL,
+  is_flagged BOOLEAN NOT NULL DEFAULT false,
+  created_by VARCHAR(255),
+  created_at TIMESTAMP DEFAULT NOW(),
+  resolved_at TIMESTAMP,
+  resolved_by VARCHAR(255)
+);
+ALTER TABLE pick_list_notes ADD COLUMN IF NOT EXISTS dispatch_acknowledged_at TIMESTAMP;
+ALTER TABLE pick_list_notes ADD COLUMN IF NOT EXISTS dispatch_acknowledged_by VARCHAR(255);
+CREATE INDEX IF NOT EXISTS idx_pick_list_notes_list ON pick_list_notes(pick_list_id);
+CREATE INDEX IF NOT EXISTS idx_pick_list_notes_active_flag ON pick_list_notes(pick_list_id) WHERE is_flagged AND resolved_at IS NULL;
+
+-- ================================================================================
 -- PICK LIST ITEMS (Individual line items in a pick list)
 -- ================================================================================
 CREATE TABLE IF NOT EXISTS pick_list_items (

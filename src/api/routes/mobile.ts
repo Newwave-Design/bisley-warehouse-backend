@@ -268,6 +268,8 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
     const result = await query(`
       SELECT
         pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.customer_name,
+        EXISTS (SELECT 1 FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL) AS has_flag,
+        (SELECT LEFT(pln.note_text, 120) FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL ORDER BY pln.created_at DESC LIMIT 1) AS flag_preview,
         COUNT(pli.id)::int                                                     AS total_items,
         COUNT(*) FILTER (WHERE pli.status = 'PICKED')::int                    AS items_picked,
         COUNT(*) FILTER (WHERE pli.status = 'PENDING')::int                   AS items_pending
@@ -369,7 +371,13 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
     }
 
     const due = (await getDeliveryDues([req.params.id]))[req.params.id] ?? null;
-    res.json({ ...pl.rows[0], due, items: items.rows });
+    // Unresolved flags, full text, so the picker can read them before handling the order
+    const flagNotes = await query(
+      `SELECT id, note_text, created_by, created_at FROM pick_list_notes
+       WHERE pick_list_id = $1 AND is_flagged AND resolved_at IS NULL ORDER BY created_at`,
+      [req.params.id]
+    );
+    res.json({ ...pl.rows[0], due, items: items.rows, flag_notes: flagNotes.rows });
   } catch (err) {
     res.status(500).json({ error: 'Failed to load pick list detail' });
   }

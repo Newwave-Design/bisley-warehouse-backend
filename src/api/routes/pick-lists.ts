@@ -170,6 +170,8 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.is_archived,
          pl.archived_at,
          pl.payment_status,
+         EXISTS (SELECT 1 FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL) AS has_flag,
+         (SELECT LEFT(pln.note_text, 120) FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL ORDER BY pln.created_at DESC LIMIT 1) AS flag_preview,
          COUNT(pli.id) as item_count,
          SUM(CASE WHEN pli.status = 'PICKED' THEN 1 ELSE 0 END) as items_picked,
          SUM(CASE WHEN pli.product_sku ILIKE '%SAMPLE%' THEN 1 ELSE 0 END) as sample_item_count,
@@ -507,6 +509,12 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
 
     const due = (await getDeliveryDues([pickListId]))[pickListId] ?? null;
 
+    const notesResult = await query(
+      `SELECT id, note_text, is_flagged, created_by, created_at, resolved_at, resolved_by
+       FROM pick_list_notes WHERE pick_list_id = $1 ORDER BY created_at DESC`,
+      [pickListId]
+    );
+
     return res.json({
       pickList,
       due,
@@ -515,10 +523,68 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
       packages: packagesResult.rows,
       parentPickList: parentResult.rows[0] ?? null,
       childPickLists: childrenResult.rows,
+      order_notes: notesResult.rows,
     });
   } catch (error) {
     console.error('Pick list detail error:', error);
     return res.status(500).json({ error: 'Failed to fetch pick list details' });
+  }
+});
+
+/**
+ * POST /api/pick-lists/:pickListId/notes
+ * Adds a staff note to a customer order. is_flagged=true raises the alert until resolved.
+ * Body: { note_text: string, is_flagged?: boolean }
+ */
+router.post('/:pickListId/notes', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    const noteText = typeof req.body?.note_text === 'string' ? req.body.note_text.trim() : '';
+    const isFlagged = req.body?.is_flagged === true;
+    if (!noteText) return res.status(400).json({ error: 'note_text is required' });
+    if (noteText.length > 2000) return res.status(400).json({ error: 'note_text must be 2000 characters or fewer' });
+
+    const pl = await query(`SELECT id FROM pick_lists WHERE id = $1`, [pickListId]);
+    if (!pl.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+
+    const result = await query(
+      `INSERT INTO pick_list_notes (pick_list_id, note_text, is_flagged, created_by)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [pickListId, noteText, isFlagged, req.user?.email ?? null]
+    );
+    return res.status(201).json({ note: result.rows[0] });
+  } catch (error) {
+    console.error('Pick list note create error:', error);
+    return res.status(500).json({ error: 'Failed to add note' });
+  }
+});
+
+/**
+ * PATCH /api/pick-lists/:pickListId/notes/:noteId
+ * Raises or clears a flag, and resolves or reopens it. Body: { is_flagged?: boolean, resolved?: boolean }
+ */
+router.patch('/:pickListId/notes/:noteId', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { pickListId, noteId } = req.params;
+    const isFlagged = req.body?.is_flagged;
+    const resolved = req.body?.resolved;
+    if (isFlagged !== undefined && typeof isFlagged !== 'boolean') return res.status(400).json({ error: 'is_flagged must be a boolean' });
+    if (resolved !== undefined && typeof resolved !== 'boolean') return res.status(400).json({ error: 'resolved must be a boolean' });
+
+    const result = await query(
+      `UPDATE pick_list_notes SET
+         is_flagged = COALESCE($3::boolean, is_flagged),
+         resolved_at = CASE WHEN $4::boolean IS NULL THEN resolved_at WHEN $4::boolean THEN NOW() ELSE NULL END,
+         resolved_by = CASE WHEN $4::boolean IS NULL THEN resolved_by WHEN $4::boolean THEN $5 ELSE NULL END
+       WHERE id = $1 AND pick_list_id = $2
+       RETURNING *`,
+      [noteId, pickListId, isFlagged ?? null, resolved ?? null, req.user?.email ?? null]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Note not found' });
+    return res.json({ note: result.rows[0] });
+  } catch (error) {
+    console.error('Pick list note update error:', error);
+    return res.status(500).json({ error: 'Failed to update note' });
   }
 });
 
@@ -1172,6 +1238,8 @@ router.patch('/:pickListId/label-printed', authMiddleware, async (req: Request, 
  * Mark pick list as dispatched (items have physically left the warehouse).
  * Decrements warehouse_inventory.quantity, clears reservations, pushes to Medusa.
  * This is the only point where physical stock numbers change on outbound.
+ * If the order has an unresolved flag, returns 409 FLAG_ACKNOWLEDGEMENT_REQUIRED unless
+ * the body contains flag_acknowledged: true, in which case the flags are stamped as acknowledged.
  */
 router.patch('/:pickListId/dispatch', authMiddleware, async (req: AuthRequest, res: Response) => {
   const { pickListId } = req.params;
@@ -1188,6 +1256,28 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: AuthRequest, r
     if (!['PICKED', 'IN_PROGRESS', 'PACKING', 'PACKED', 'LABEL_PRINTED'].includes(pickList.status)) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Pick list must be picked or packed before dispatch' });
+    }
+
+    // Open flags block dispatch until a member of staff acknowledges them (same transaction as the dispatch)
+    const openFlags = (await client.query(
+      `SELECT id, note_text, created_by, created_at FROM pick_list_notes
+       WHERE pick_list_id = $1 AND is_flagged AND resolved_at IS NULL ORDER BY created_at`,
+      [pickListId]
+    )).rows;
+    if (openFlags.length > 0) {
+      if (req.body?.flag_acknowledged !== true) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: 'FLAG_ACKNOWLEDGEMENT_REQUIRED',
+          message: 'This order has an open flag. Read the note and acknowledge it before dispatching.',
+          flags: openFlags,
+        });
+      }
+      await client.query(
+        `UPDATE pick_list_notes SET dispatch_acknowledged_at = NOW(), dispatch_acknowledged_by = $2
+         WHERE pick_list_id = $1 AND is_flagged AND resolved_at IS NULL`,
+        [pickListId, req.user?.email ?? null]
+      );
     }
 
     // Sandbox lists must never move real stock
