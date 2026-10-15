@@ -8,6 +8,10 @@ import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { createNotificationOnce } from '../../lib/notifications.js';
+import { getOrderValues } from '../../lib/order-values.js';
+
+/** Monthly net sales target in GBP (ex VAT). */
+export const MONTHLY_NET_TARGET_GBP = 90_000;
 
 const router = express.Router();
 
@@ -335,6 +339,157 @@ router.get('/financials', authMiddleware, async (req: AuthRequest, res: Response
  * Current stock value (qty x unit cost), split by liability status, for the
  * financials view's Inventory tab.
  */
+function ymd(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+function parseYmd(s: string): Date | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const d = new Date(`${s}T00:00:00.000Z`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function daysInMonthUtc(year: number, monthIndex: number): number {
+  return new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
+}
+
+function addUtcDays(d: Date, n: number): Date {
+  const x = new Date(d);
+  x.setUTCDate(x.getUTCDate() + n);
+  return x;
+}
+
+function londonTodayYmd(): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+
+function currentMonthRange(): { from: string; to: string } {
+  const today = londonTodayYmd();
+  const [y, m] = today.split('-').map(Number);
+  const last = daysInMonthUtc(y, m - 1);
+  return { from: `${y}-${String(m).padStart(2, '0')}-01`, to: `${y}-${String(m).padStart(2, '0')}-${String(last).padStart(2, '0')}` };
+}
+
+function eachYmd(from: string, to: string): string[] {
+  const dates: string[] = [];
+  let d = parseYmd(from)!;
+  const end = parseYmd(to)!;
+  while (d.getTime() <= end.getTime()) {
+    dates.push(ymd(d));
+    d = addUtcDays(d, 1);
+  }
+  return dates;
+}
+
+function dailyTargetGbp(dateYmd: string): number {
+  const [y, m] = dateYmd.split('-').map(Number);
+  return round2(MONTHLY_NET_TARGET_GBP / daysInMonthUtc(y, m - 1));
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+/**
+ * GET /api/reports/sales?from=YYYY-MM-DD&to=YYYY-MM-DD
+ * Daily net sales (ex VAT) against the £90k/month target. Defaults to the current calendar month (London).
+ */
+router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const fallback = currentMonthRange();
+    const from = (req.query.from as string) || fallback.from;
+    const to = (req.query.to as string) || fallback.to;
+    if (!parseYmd(from) || !parseYmd(to) || from > to) {
+      return res.status(400).json({ error: 'from and to must be YYYY-MM-DD, with from ≤ to' });
+    }
+    const dates = eachYmd(from, to);
+    if (dates.length > 366) return res.status(400).json({ error: 'Range cannot exceed 366 days' });
+
+    const stale = await query(
+      `SELECT DISTINCT split_part(pl.medusa_order_id, '-BO', 1) AS order_id
+       FROM pick_lists pl
+       WHERE pl.parent_pick_list_id IS NULL
+         AND NOT pl.is_sandbox AND NOT pl.is_archived AND pl.status <> 'CANCELLED'
+         AND pl.created_at::date BETWEEN $1 AND $2
+         AND (pl.order_net_gbp IS NULL OR pl.order_value_checked_at IS NULL
+              OR pl.order_value_checked_at < NOW() - INTERVAL '6 hours')
+         AND pl.medusa_order_id LIKE 'order\\_%'`,
+      [from, to]
+    );
+    if (stale.rows.length) {
+      await getOrderValues(stale.rows.map((r: { order_id: string }) => r.order_id));
+    }
+
+    const [netRows, unitRows] = await Promise.all([
+      query(
+        `SELECT pl.created_at::date::text AS day,
+                COUNT(*)::int AS order_count,
+                ROUND(COALESCE(SUM(pl.order_net_gbp), 0), 2)::float8 AS net_gbp
+         FROM pick_lists pl
+         WHERE pl.parent_pick_list_id IS NULL
+           AND NOT pl.is_sandbox AND NOT pl.is_archived AND pl.status <> 'CANCELLED'
+           AND pl.created_at::date BETWEEN $1 AND $2
+         GROUP BY 1`,
+        [from, to]
+      ),
+      query(
+        `SELECT COALESCE(parent.created_at, pl.created_at)::date::text AS day,
+                COALESCE(SUM(pli.quantity_required), 0)::int AS units
+         FROM pick_list_items pli
+         JOIN pick_lists pl ON pl.id = pli.pick_list_id
+         LEFT JOIN pick_lists parent ON parent.id = pl.parent_pick_list_id
+         WHERE NOT pl.is_sandbox AND NOT pl.is_archived AND pl.status <> 'CANCELLED'
+           AND COALESCE(parent.status, pl.status) <> 'CANCELLED'
+           AND NOT COALESCE(parent.is_sandbox, false)
+           AND COALESCE(parent.created_at, pl.created_at)::date BETWEEN $1 AND $2
+         GROUP BY 1`,
+        [from, to]
+      ),
+    ]);
+
+    const netByDay = new Map(netRows.rows.map((r: any) => [String(r.day).slice(0, 10), r]));
+    const unitsByDay = new Map(unitRows.rows.map((r: any) => [String(r.day).slice(0, 10), Number(r.units) || 0]));
+
+    let cumulative = 0;
+    let expected = 0;
+    const days = dates.map((date) => {
+      const row = netByDay.get(date);
+      const net = round2(Number(row?.net_gbp) || 0);
+      const orderCount = Number(row?.order_count) || 0;
+      const units = unitsByDay.get(date) || 0;
+      cumulative = round2(cumulative + net);
+      expected = round2(expected + dailyTargetGbp(date));
+      return {
+        date,
+        net_gbp: net,
+        order_count: orderCount,
+        units,
+        cumulative_net_gbp: cumulative,
+        expected_net_gbp: expected,
+      };
+    });
+
+    const periodTarget = days.length ? days[days.length - 1].expected_net_gbp : 0;
+    const daysWithTarget = days.map((d) => ({ ...d, target_net_gbp: periodTarget }));
+
+    res.json({
+      from,
+      to,
+      monthly_target_gbp: MONTHLY_NET_TARGET_GBP,
+      period_target_gbp: periodTarget,
+      totals: {
+        net_gbp: cumulative,
+        order_count: days.reduce((s, d) => s + d.order_count, 0),
+        units: days.reduce((s, d) => s + d.units, 0),
+      },
+      days: daysWithTarget,
+    });
+  } catch (err) {
+    console.error('Sales report error:', err);
+    res.status(500).json({ error: 'Failed to generate sales report' });
+  }
+});
+
 router.get('/inventory-value', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const liability = (req.query.liability as string) || null;

@@ -7,12 +7,16 @@ let pool: pg.Pool | null = null;
 export function initializePool() {
   if (pool) return pool;
 
-  if (!process.env.DATABASE_URL) {
-    console.warn('⚠️  DATABASE_URL not set - database connections will fail');
+  const dbUrl = process.env.WAREHOUSE_DATABASE_URL ||
+                process.env.DATABASE_URL ||
+                process.env.NEON_DATABASE_URL;
+
+  if (!dbUrl) {
+    console.warn('⚠️  WAREHOUSE_DATABASE_URL / DATABASE_URL not set - database connections will fail');
   }
 
   pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
+    connectionString: dbUrl,
     max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 2000,

@@ -367,6 +367,13 @@ ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS tracking_number VARCHAR(100);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS tracking_url VARCHAR(500);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS carrier VARCHAR(50);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS synced_to_medusa_at TIMESTAMP;
+-- Cached Medusa order value (net = gross less VAT) for sales reporting
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_gross_gbp DECIMAL(10,2);
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_net_gbp DECIMAL(10,2);
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_vat_gbp DECIMAL(10,2);
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_refunded_gbp DECIMAL(10,2);
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_currency VARCHAR(10);
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_value_checked_at TIMESTAMP;
 CREATE INDEX IF NOT EXISTS idx_pick_lists_parent ON pick_lists(parent_pick_list_id);
 CREATE INDEX IF NOT EXISTS idx_pick_lists_archived ON pick_lists(is_archived);
 
