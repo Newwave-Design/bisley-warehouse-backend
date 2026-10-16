@@ -6,7 +6,7 @@
  * Custom lines have no catalogue SKU. A part code in the title (PLKCSYT10/34) is the supplier SKU.
  * Delivery charges are left off. Order 196 was sent from the factory and is left off.
  * Spreadsheets carry the supplier's own part number + colour code (wms_products.supplier_part_code /
- * supplier_colour_code); rows without one can't be sent.
+ * supplier_colour_code). A row with no part number uses the line title as the SKU.
  *
  * GET  /api/supplier-reorders            — all rows with last-sent info
  * GET  /api/supplier-reorders/suppliers  — saved suppliers
@@ -298,20 +298,16 @@ router.post('/send', authMiddleware, requirePermission('manage_orders'), async (
       return res.status(409).json({ error: 'Some rows no longer exist — refresh and try again' });
     }
 
-    const missing = [...new Set(selected.filter(l => !l.supplier_sku).map(l =>
-      l.order_sku !== l.sku ? `${l.order_sku} (sold as ${l.sku})` : l.sku
-    ))];
-    if (missing.length) {
-      return res.status(422).json({ error: `No supplier SKU for: ${missing.join(', ')}. Untick these rows.` });
-    }
-
-    // One row per supplier SKU + colour, quantities summed across the ticked order lines
+    // One row per supplier SKU + colour, quantities summed across the ticked order lines.
+    // No supplier part number: the line title stands in as the SKU so the row can still be emailed.
     const grouped = new Map<string, { sku: string; colour: string; title: string; quantity: number }>();
     for (const l of selected) {
-      const key = `${l.supplier_sku}|${l.supplier_colour}`;
+      const sku = l.supplier_sku || l.title || l.order_sku || l.sku;
+      const colour = l.supplier_sku ? l.supplier_colour : '';
+      const key = `${sku}|${colour}`;
       const g = grouped.get(key);
       if (g) g.quantity += l.quantity;
-      else grouped.set(key, { sku: l.supplier_sku!, colour: l.supplier_colour, title: l.title, quantity: l.quantity });
+      else grouped.set(key, { sku, colour, title: l.title, quantity: l.quantity });
     }
     const sheetRows = [...grouped.values()].sort((a, b) => a.sku.localeCompare(b.sku) || a.colour.localeCompare(b.colour));
 
@@ -321,7 +317,7 @@ router.post('/send', authMiddleware, requirePermission('manage_orders'), async (
       aoa.push([safeCell(r.sku), safeCell(r.title), safeCell(r.colour), safeCell(full), r.quantity]);
     }
     const ws = XLSX.utils.aoa_to_sheet(aoa);
-    ws['!cols'] = [{ wch: 22 }, { wch: 50 }, { wch: 14 }, { wch: 30 }, { wch: 10 }];
+    ws['!cols'] = [{ wch: 40 }, { wch: 50 }, { wch: 14 }, { wch: 40 }, { wch: 10 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Re-order');
     const buffer: Buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
