@@ -14,6 +14,7 @@
  *      Builds the .xlsx (SKU, Title, Colour, Full SKU, Quantity — one row per supplier SKU + colour, quantities summed), emails it via Medusa's mailer
  *      (POST /admin/supplier-orders/send), saves the supplier, and records the send.
  *      Single insert trays are swapped for the matching 5-pack SKU; quantity is whole packs of 5.
+ *      If that 5-pack has no supplier code, the 1-pack code is sent with a note.
  *
  * Replaces the threshold-driven Pending Reorders flow (kept in the code, hidden from the nav).
  */
@@ -43,6 +44,8 @@ export interface ReorderLine {
   sold_quantity: number;
   pick_list_number: string;
   ordered_at: string;
+  /** Set when a single tray is ordered on its 1-pack code because the 5-pack has no supplier code. */
+  note: string;
 }
 
 /**
@@ -151,6 +154,7 @@ export async function buildLines(): Promise<ReorderLine[]> {
         supplier_inferred: false,
         quantity: qty,
         sold_quantity: qty,
+        note: '',
       });
       continue;
     }
@@ -170,6 +174,7 @@ export async function buildLines(): Promise<ReorderLine[]> {
           supplier_inferred: info?.inferred ?? false,
           quantity: sold,
           sold_quantity: sold,
+          note: '',
         });
       }
     } else {
@@ -185,6 +190,7 @@ export async function buildLines(): Promise<ReorderLine[]> {
         supplier_inferred: r.supplier_code_source === 'inferred',
         quantity: qty,
         sold_quantity: qty,
+        note: '',
       });
     }
   }
@@ -195,7 +201,9 @@ export async function buildLines(): Promise<ReorderLine[]> {
 
 type PackInfo = { title: string; supplier_sku: string | null; supplier_colour: string; inferred: boolean };
 
-/** Point single-tray lines at the 5-pack's supplier code. Never fall back to the single's code. */
+const FIVE_PACK_NOTE = '5 pack if available';
+
+/** Point single-tray lines at the 5-pack. If that pack has no supplier code, keep the 1-pack code and note it. */
 async function applyTrayFivePacks(lines: ReorderLine[]): Promise<void> {
   const packSkus = [...new Set(lines.map(l => fivePackTraySku(l.sku)).filter((s): s is string => !!s))];
   const packInfo = new Map<string, PackInfo>();
@@ -220,10 +228,15 @@ async function applyTrayFivePacks(lines: ReorderLine[]): Promise<void> {
     const info = packInfo.get(five);
     l.order_sku = five;
     l.quantity = trayOrderQuantity(l.sku, l.sold_quantity);
-    l.title = info?.title || l.title;
-    l.supplier_sku = info?.supplier_sku ?? null;
-    l.supplier_colour = info?.supplier_colour ?? '';
-    l.supplier_inferred = info?.inferred ?? false;
+    if (info?.supplier_sku) {
+      l.title = info.title || l.title;
+      l.supplier_sku = info.supplier_sku;
+      l.supplier_colour = info.supplier_colour;
+      l.supplier_inferred = info.inferred;
+    } else {
+      l.supplier_sku = l.supplier_sku || l.sku;
+      l.note = FIVE_PACK_NOTE;
+    }
   }
 }
 
@@ -300,24 +313,26 @@ router.post('/send', authMiddleware, requirePermission('manage_orders'), async (
 
     // One row per supplier SKU + colour, quantities summed across the ticked order lines.
     // No supplier part number: the line title stands in as the SKU so the row can still be emailed.
-    const grouped = new Map<string, { sku: string; colour: string; title: string; quantity: number }>();
+    const grouped = new Map<string, { sku: string; colour: string; title: string; quantity: number; note: string }>();
     for (const l of selected) {
       const sku = l.supplier_sku || l.title || l.order_sku || l.sku;
       const colour = l.supplier_sku ? l.supplier_colour : '';
       const key = `${sku}|${colour}`;
       const g = grouped.get(key);
-      if (g) g.quantity += l.quantity;
-      else grouped.set(key, { sku, colour, title: l.title, quantity: l.quantity });
+      if (g) {
+        g.quantity += l.quantity;
+        if (l.note) g.note = l.note;
+      } else grouped.set(key, { sku, colour, title: l.title, quantity: l.quantity, note: l.note });
     }
     const sheetRows = [...grouped.values()].sort((a, b) => a.sku.localeCompare(b.sku) || a.colour.localeCompare(b.colour));
 
-    const aoa: (string | number)[][] = [['SKU', 'Title', 'Colour', 'Full SKU', 'Quantity']];
+    const aoa: (string | number)[][] = [['SKU', 'Title', 'Colour', 'Full SKU', 'Quantity', 'Note']];
     for (const r of sheetRows) {
       const full = r.colour ? `${r.sku}-${r.colour}` : r.sku;
-      aoa.push([safeCell(r.sku), safeCell(r.title), safeCell(r.colour), safeCell(full), r.quantity]);
+      aoa.push([safeCell(r.sku), safeCell(r.title), safeCell(r.colour), safeCell(full), r.quantity, safeCell(r.note)]);
     }
     const ws = XLSX.utils.aoa_to_sheet(aoa);
-    ws['!cols'] = [{ wch: 40 }, { wch: 50 }, { wch: 14 }, { wch: 40 }, { wch: 10 }];
+    ws['!cols'] = [{ wch: 40 }, { wch: 50 }, { wch: 14 }, { wch: 40 }, { wch: 10 }, { wch: 24 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Re-order');
     const buffer: Buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
