@@ -426,7 +426,7 @@ ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS medusa_variant_id VARCHAR(1
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS medusa_product_id VARCHAR(100);
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
--- Order lines with no SKU (custom items): picked and reported as sold, never re-ordered
+-- Order lines with no SKU (custom items): picked and reported as sold. Re-ordered from the part code in the title.
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS is_custom BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS item_title TEXT;
 CREATE INDEX IF NOT EXISTS idx_pick_list_items_archived ON pick_list_items(is_archived);

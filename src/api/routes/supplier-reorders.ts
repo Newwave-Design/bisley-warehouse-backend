@@ -3,6 +3,8 @@
  *
  * Rows are derived live from pick_list_items (kits expand to their components) — nothing is stored per row
  * until a send, so sent status comes from supplier_reorder_send_lines.
+ * Custom lines have no catalogue SKU. A part code in the title (PLKCSYT10/34) is the supplier SKU.
+ * Delivery charges are left off. Order 196 was sent from the factory and is left off.
  * Spreadsheets carry the supplier's own part number + colour code (wms_products.supplier_part_code /
  * supplier_colour_code); rows without one can't be sent.
  *
@@ -11,6 +13,7 @@
  * POST /api/supplier-reorders/send       — { supplier: { email, name? }, lines: [{ pick_list_item_id, sku }] }
  *      Builds the .xlsx (SKU, Title, Colour, Full SKU, Quantity — one row per supplier SKU + colour, quantities summed), emails it via Medusa's mailer
  *      (POST /admin/supplier-orders/send), saves the supplier, and records the send.
+ *      Single insert trays are swapped for the matching 5-pack SKU; quantity is whole packs of 5.
  *
  * Replaces the threshold-driven Pending Reorders flow (kept in the code, hidden from the nav).
  */
@@ -27,14 +30,50 @@ export interface ReorderLine {
   key: string;
   pick_list_item_id: string;
   sku: string;
+  /** SKU the supplier is asked for. Single insert trays become the matching 5-pack. */
+  order_sku: string;
   title: string;
   colour: string;
   supplier_sku: string | null;
   supplier_colour: string;
   supplier_inferred: boolean;
+  /** Units to put on the supplier spreadsheet. For a swapped tray this is packs of 5, not singles sold. */
   quantity: number;
+  /** Units the customer bought, before the 5-pack conversion. */
+  sold_quantity: number;
   pick_list_number: string;
   ordered_at: string;
+}
+
+/**
+ * Insert trays the supplier sells in packs of 5. A single (`…P1-…`) is re-ordered as the
+ * matching 5-pack (`…P5-…`). Not every P1 code is a tray — DUBLINP1 is a hinge pack — so the
+ * bases are listed. Colour suffix is kept (`225P1-000` → `225P5-000`).
+ */
+const SINGLE_TRAY = /^(?:22[1-7]|NCS22[2-7]|PIT45[01]|PIT522|PIT580)P1-/;
+
+export function fivePackTraySku(sku: string): string | null {
+  if (!SINGLE_TRAY.test(sku)) return null;
+  return sku.replace(/P1-/, 'P5-');
+}
+
+/** Singles become whole packs of 5 (1–5 sold → 1 pack, 6–10 → 2). Anything else is unchanged. */
+export function trayOrderQuantity(sku: string, sold: number): number {
+  if (!fivePackTraySku(sku) || sold <= 0) return sold;
+  return Math.ceil(sold / 5);
+}
+
+/** Paid custom order supplied direct from the factory — not re-ordered here. */
+const FACTORY_SUPPLIED_ORDER = 'order_01M45V8869WZV1XQHSZK99X6RX';
+
+/** Part code typed on a custom line, e.g. "Replacement lock PLKCSYT10/34 (Tambour)". */
+export function customPartCode(title: string): string | null {
+  const match = title.toUpperCase().match(/\b(?=[A-Z0-9.]*\d)[A-Z][A-Z0-9.]*(?:\/[A-Z0-9.]+)+\b/);
+  return match?.[0] ?? null;
+}
+
+function isChargeTitle(title: string): boolean {
+  return /\b(delivery fee|shipping fee|postage|carriage)\b/i.test(title);
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -44,7 +83,8 @@ const MAX_LINES = 2000;
 export async function buildLines(): Promise<ReorderLine[]> {
   const items = await query(`
     SELECT pli.id AS pick_list_item_id, pli.product_sku, pli.colour_code AS item_colour,
-           pli.quantity_required, pl.pick_list_number, pl.created_at AS ordered_at,
+           pli.quantity_required, pli.is_custom, pli.item_title,
+           pl.pick_list_number, pl.medusa_order_id, pl.created_at AS ordered_at,
            wp.product_title, wp.colour_name, wp.colour_code AS wp_colour, wp.is_kit, wp.kit_components,
            wp.supplier_part_code, wp.supplier_colour_code, wp.supplier_code_source
     FROM pick_list_items pli
@@ -55,7 +95,7 @@ export async function buildLines(): Promise<ReorderLine[]> {
     ) wp ON true
     WHERE pl.status <> 'CANCELLED' AND NOT pl.is_sandbox AND NOT pl.is_archived
       AND pl.payment_status IN ('captured', 'partially_refunded')
-      AND NOT pli.is_sandbox AND NOT pli.is_archived AND NOT pli.is_custom
+      AND NOT pli.is_sandbox AND NOT pli.is_archived
       AND pli.product_sku NOT LIKE 'FINSAMPLE-%'
     ORDER BY pl.created_at DESC, pli.line_number
   `);
@@ -93,19 +133,43 @@ export async function buildLines(): Promise<ReorderLine[]> {
       ordered_at: new Date(r.ordered_at).toISOString(),
     };
     const qty = Number(r.quantity_required) || 0;
+    if (r.is_custom) {
+      const orderId = String(r.medusa_order_id).replace(/-BO.*$/, '');
+      if (orderId === FACTORY_SUPPLIED_ORDER) continue;
+      const title = String(r.item_title || 'Custom item');
+      if (isChargeTitle(title)) continue;
+      const code = customPartCode(title);
+      lines.push({
+        ...base,
+        key: `${base.pick_list_item_id}|${code || 'CUSTOM'}`,
+        sku: code || 'CUSTOM',
+        order_sku: code || 'CUSTOM',
+        title,
+        colour: '',
+        supplier_sku: code,
+        supplier_colour: '',
+        supplier_inferred: false,
+        quantity: qty,
+        sold_quantity: qty,
+      });
+      continue;
+    }
     if (r.is_kit && Array.isArray(r.kit_components) && r.kit_components.length) {
       for (const c of r.kit_components as Comp[]) {
         const info = compInfo.get(c.sku);
+        const sold = qty * (Number(c.required_quantity) || 1);
         lines.push({
           ...base,
           key: `${base.pick_list_item_id}|${c.sku}`,
           sku: c.sku,
+          order_sku: c.sku,
           title: info?.title || c.sku,
           colour: info?.colour ?? '',
           supplier_sku: info?.supplier_sku ?? null,
           supplier_colour: info?.supplier_colour ?? '',
           supplier_inferred: info?.inferred ?? false,
-          quantity: qty * (Number(c.required_quantity) || 1),
+          quantity: sold,
+          sold_quantity: sold,
         });
       }
     } else {
@@ -113,16 +177,54 @@ export async function buildLines(): Promise<ReorderLine[]> {
         ...base,
         key: `${base.pick_list_item_id}|${r.product_sku}`,
         sku: r.product_sku,
+        order_sku: r.product_sku,
         title: r.product_title || r.product_sku,
         colour: r.colour_name || r.wp_colour || r.item_colour || '',
         supplier_sku: r.supplier_part_code ?? null,
         supplier_colour: r.supplier_colour_code ?? '',
         supplier_inferred: r.supplier_code_source === 'inferred',
         quantity: qty,
+        sold_quantity: qty,
       });
     }
   }
+
+  await applyTrayFivePacks(lines);
   return lines;
+}
+
+type PackInfo = { title: string; supplier_sku: string | null; supplier_colour: string; inferred: boolean };
+
+/** Point single-tray lines at the 5-pack's supplier code. Never fall back to the single's code. */
+async function applyTrayFivePacks(lines: ReorderLine[]): Promise<void> {
+  const packSkus = [...new Set(lines.map(l => fivePackTraySku(l.sku)).filter((s): s is string => !!s))];
+  const packInfo = new Map<string, PackInfo>();
+  if (packSkus.length) {
+    const pr = await query(
+      `SELECT DISTINCT ON (variant_sku) variant_sku, product_title, supplier_part_code, supplier_colour_code, supplier_code_source
+       FROM wms_products WHERE variant_sku = ANY($1) ORDER BY variant_sku, is_archived`,
+      [packSkus]
+    );
+    for (const p of pr.rows) {
+      packInfo.set(p.variant_sku, {
+        title: p.product_title ?? '',
+        supplier_sku: p.supplier_part_code ?? null,
+        supplier_colour: p.supplier_colour_code ?? '',
+        inferred: p.supplier_code_source === 'inferred',
+      });
+    }
+  }
+  for (const l of lines) {
+    const five = fivePackTraySku(l.sku);
+    if (!five) continue;
+    const info = packInfo.get(five);
+    l.order_sku = five;
+    l.quantity = trayOrderQuantity(l.sku, l.sold_quantity);
+    l.title = info?.title || l.title;
+    l.supplier_sku = info?.supplier_sku ?? null;
+    l.supplier_colour = info?.supplier_colour ?? '';
+    l.supplier_inferred = info?.inferred ?? false;
+  }
 }
 
 router.get('/', authMiddleware, requirePermission('manage_orders'), async (_req: AuthRequest, res: Response) => {
@@ -196,7 +298,9 @@ router.post('/send', authMiddleware, requirePermission('manage_orders'), async (
       return res.status(409).json({ error: 'Some rows no longer exist — refresh and try again' });
     }
 
-    const missing = [...new Set(selected.filter(l => !l.supplier_sku).map(l => l.sku))];
+    const missing = [...new Set(selected.filter(l => !l.supplier_sku).map(l =>
+      l.order_sku !== l.sku ? `${l.order_sku} (sold as ${l.sku})` : l.sku
+    ))];
     if (missing.length) {
       return res.status(422).json({ error: `No supplier SKU for: ${missing.join(', ')}. Untick these rows.` });
     }

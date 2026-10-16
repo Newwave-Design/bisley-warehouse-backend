@@ -349,7 +349,7 @@ export async function handleOrderPlaced(order: any) {
 
     for (const item of order.items ?? []) {
       const realSku = item.variant?.sku ?? item.variant_sku ?? item.sku;
-      // A line with no SKU is a custom item: it still goes on the pick list, but is never re-ordered
+      // A line with no SKU is a custom item: it still goes on the pick list. Supplier re-orders reads a part code from the title.
       const isCustom = !realSku;
       const sku = realSku || 'CUSTOM';
       const itemTitle = isCustom ? String(item.title ?? item.product_title ?? 'Custom item').slice(0, 500) : null;
