@@ -14,6 +14,7 @@
  */
 
 import express, { Response } from 'express';
+import { stockInUnits } from './stock-in.js';
 import { query } from '../../db/index.js';
 import { failedScansFor } from '../../lib/failed-scans.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
@@ -169,7 +170,8 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
 // Scan an item
 router.post('/sessions/:id/scan', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { nw_code, colour, quantity_scanned = 1, notes } = req.body;
+    const { nw_code, colour, quantity_scanned = 1, notes, quantity_is_units = false } = req.body;
+    const units = stockInUnits(String(nw_code || ''), null, Number(quantity_scanned), quantity_is_units === true);
 
     if (!nw_code) return res.status(400).json({ error: 'nw_code required' });
 
@@ -192,14 +194,14 @@ router.post('/sessions/:id/scan', authMiddleware, async (req: AuthRequest, res: 
     if (existing.rows[0]) {
       const result = await query(
         `UPDATE checkin_items SET quantity_scanned = quantity_scanned + $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
-        [quantity_scanned, existing.rows[0].id]
+        [units, existing.rows[0].id]
       );
       item = result.rows[0];
     } else {
       const result = await query(
         `INSERT INTO checkin_items (session_id, nw_code, colour, medusa_sku, quantity_scanned, notes, scanned_at, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW()) RETURNING *`,
-        [req.params.id, nw_code, colour || null, medusa_sku, quantity_scanned, notes || null]
+        [req.params.id, nw_code, colour || null, medusa_sku, units, notes || null]
       );
       item = result.rows[0];
     }

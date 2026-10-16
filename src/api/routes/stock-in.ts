@@ -28,6 +28,18 @@ import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { getLogger } from '../../lib/logger.js';
 
+/**
+ * Hairpin legs are sold as one pack, and each pack is two legs.
+ * A scan's typed quantity is packs; stock is counted in legs.
+ * `quantity_is_units` means the caller already converted (the phone app).
+ */
+export function stockInUnits(sku: string, title: string | null | undefined, entered: number, alreadyUnits: boolean): number {
+  const qty = Math.min(9999, Math.max(1, Math.trunc(entered) || 1));
+  if (alreadyUnits) return qty;
+  const pack = /^MDHLEG(?:-|$)/i.test(sku) || /hairpin leg \(pack of 2\)/i.test(title || '') ? 2 : 1;
+  return Math.min(9999, qty * pack);
+}
+
 const router = express.Router();
 const logger = getLogger('stock-in');
 
@@ -206,7 +218,7 @@ router.post('/sessions/:id/reopen', authMiddleware, async (req: AuthRequest, res
 /** POST /api/stock-in/scan — Lookup barcode/NW code + scan item (cumulative per SKU+colour) */
 router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { session_id, scan_input, colour, quantity = 1 } = req.body;
+    const { session_id, scan_input, colour, quantity = 1, quantity_is_units = false } = req.body;
 
     if (!session_id || !scan_input) {
       return res.status(400).json({ error: 'session_id and scan_input required' });
@@ -266,6 +278,7 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
     const nw_code = productInfo.nw_code;
     const medusa_sku = productInfo.medusa_sku;
     const colour_used = colour || productInfo.colour_name || productInfo.colour_code || '';
+    const units = stockInUnits(nw_code, productInfo.product_name, Number(quantity), quantity_is_units === true);
 
     // Check if this nw_code+colour already scanned in this session
     const existing = await query(
@@ -282,7 +295,7 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
          SET quantity_scanned = quantity_scanned + $1, updated_at = NOW()
          WHERE id = $2
          RETURNING *`,
-        [quantity, existing.rows[0].id]
+        [units, existing.rows[0].id]
       );
       item = result.rows[0];
       logger.info(`[stock-in] Incremented ${nw_code} (${colour_used}) to ${item.quantity_scanned}x in session ${session_id}`);
@@ -292,15 +305,15 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
         `INSERT INTO checkin_items (session_id, nw_code, colour, medusa_sku, quantity_scanned, scanned_at, created_at)
          VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
          RETURNING *`,
-        [session_id, nw_code, colour_used || null, medusa_sku || null, quantity]
+        [session_id, nw_code, colour_used || null, medusa_sku || null, units]
       );
       item = result.rows[0];
-      logger.info(`[stock-in] Scanned ${quantity}x ${nw_code} (${colour_used}) into session ${session_id}`);
+      logger.info(`[stock-in] Scanned ${units}x ${nw_code} (${colour_used}) into session ${session_id}`);
     }
 
     const scanLog = await query(
       `INSERT INTO checkin_scans (session_id, item_id, quantity) VALUES ($1, $2, $3) RETURNING id, item_id, quantity, scanned_at`,
-      [session_id, item.id, quantity]
+      [session_id, item.id, units]
     );
 
     res.json({
