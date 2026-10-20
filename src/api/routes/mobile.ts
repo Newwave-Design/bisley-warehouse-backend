@@ -258,12 +258,17 @@ router.post('/undo', authMiddleware, async (req: AuthRequest, res: Response) => 
 /**
  * GET /api/mobile/pick-lists — pick lists for the handheld
  *   ?status=PENDING,IN_PROGRESS (default) | any comma list | ALL     ?sort=asc (default, oldest first) | desc
+ *   ?sample=true  only lists that contain a SAMPLE SKU
  */
 router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const statusParam = ((req.query.status as string) || 'PENDING,IN_PROGRESS').toUpperCase();
     const statuses = statusParam === 'ALL' ? null : statusParam.split(',').map(s => s.trim());
     const orderDir = String(req.query.sort).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+    const sampleOnly = String(req.query.sample).toLowerCase() === 'true';
+    const sampleClause = sampleOnly
+      ? `AND EXISTS (SELECT 1 FROM pick_list_items s WHERE s.pick_list_id = pl.id AND s.product_sku ILIKE '%SAMPLE%')`
+      : '';
 
     const result = await query(`
       SELECT
@@ -272,10 +277,14 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
         (SELECT LEFT(pln.note_text, 120) FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL ORDER BY pln.created_at DESC LIMIT 1) AS flag_preview,
         COUNT(pli.id)::int                                                     AS total_items,
         COUNT(*) FILTER (WHERE pli.status = 'PICKED')::int                    AS items_picked,
-        COUNT(*) FILTER (WHERE pli.status = 'PENDING')::int                   AS items_pending
+        COUNT(*) FILTER (WHERE pli.status = 'PENDING')::int                   AS items_pending,
+        COUNT(*) FILTER (WHERE pli.product_sku ILIKE '%SAMPLE%')::int         AS sample_item_count,
+        COUNT(*) FILTER (WHERE pli.product_sku ILIKE '%SAMPLE%' AND pli.status = 'PICKED')::int AS sample_items_picked,
+        COALESCE(BOOL_OR(pli.product_sku ILIKE '%SAMPLE%'), false)             AS is_sample
       FROM pick_lists pl
       LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
       WHERE pl.is_archived = false AND ${paidSql('pl')} AND ($1::text[] IS NULL OR pl.status = ANY($1::text[]))
+      ${sampleClause}
       GROUP BY pl.id
       ORDER BY pl.created_at ${orderDir}
       LIMIT 100

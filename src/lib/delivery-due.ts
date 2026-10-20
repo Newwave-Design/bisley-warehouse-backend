@@ -1,6 +1,6 @@
 /**
  * Delivery due window per pick list, counted from the order date.
- *   Standard      3-6 weeks: every coloured line (and kit part) is an approved colour AND in stock.
+ *   Standard      2-4 weeks: every coloured line (and kit part) is an approved colour AND in stock.
  *   Non-standard  4-8 weeks: any line in a non-approved colour, or short of stock.
  * Traffic light: green = before the window, amber = inside it, red = after it. Finished lists get no light.
  * Stock is read live from warehouse_inventory, so a list moves bracket as stock arrives or runs out.
@@ -8,7 +8,7 @@
 import { query } from '../db/index.js';
 import { COLOUR_NAMES, extractColourCode } from './colour-names.js';
 
-export const STANDARD_WEEKS = { min: 3, max: 6 };
+export const STANDARD_WEEKS = { min: 2, max: 4 };
 export const NON_STANDARD_WEEKS = { min: 4, max: 8 };
 
 /** Approved colours (storefront list) plus the desktop finishes; Emerald (da8) is special-order only. */

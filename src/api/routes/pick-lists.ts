@@ -16,6 +16,7 @@ import { createUpsShipmentLabel } from '../../lib/ups.js';
 import { getOrderValues } from '../../lib/order-values.js';
 import { refreshKitsForSkus } from '../../lib/kit-refresh.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
+import { buildSampleAddressZpl, formatSampleAddressLabel } from '../../lib/sample-address-label.js';
 
 const router = express.Router();
 
@@ -216,6 +217,70 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
     console.error('Pick list fetch error:', error);
     const errorMsg = error instanceof Error ? error.message : String(error);
     return res.status(500).json({ error: 'Failed to fetch pick lists', details: errorMsg });
+  }
+});
+
+/**
+ * POST /api/pick-lists/sample-address-labels
+ * Builds a single ZPL job of 102×40 mm address labels (Zebra ZD421D, 203 dpi) for sample orders.
+ * Body: { pickListIds: string[] }
+ */
+router.post('/sample-address-labels', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const ids = Array.isArray(req.body?.pickListIds)
+      ? [...new Set((req.body.pickListIds as unknown[])
+          .map((id) => String(id || '').trim())
+          .filter((id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)))]
+      : [];
+    if (!ids.length) return res.status(400).json({ error: 'Select at least one sample order' });
+    if (ids.length > 200) return res.status(400).json({ error: 'Print at most 200 labels at a time' });
+
+    const result = await query(
+      `SELECT pl.id, pl.pick_list_number, pl.customer_name, pl.shipping_address,
+              (SELECT LEFT(pln.note_text, 120) FROM pick_list_notes pln
+                WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL
+                ORDER BY pln.created_at DESC LIMIT 1) AS flag_preview,
+              EXISTS (
+                SELECT 1 FROM pick_list_items pli
+                WHERE pli.pick_list_id = pl.id AND pli.product_sku ILIKE '%SAMPLE%'
+              ) AS is_sample
+       FROM pick_lists pl
+       WHERE pl.id = ANY($1::uuid[])`,
+      [ids]
+    );
+
+    const byId = new Map(result.rows.map((row: any) => [row.id, row]));
+    const labels = [];
+    const skipped: { pick_list_number?: string; id: string; reason: string }[] = [];
+
+    for (const id of ids) {
+      const row = byId.get(id);
+      if (!row) {
+        skipped.push({ id, reason: 'Order not found' });
+        continue;
+      }
+      if (!row.is_sample) {
+        skipped.push({ id, pick_list_number: row.pick_list_number, reason: 'Not a sample order' });
+        continue;
+      }
+      const formatted = formatSampleAddressLabel(row);
+      if ('skip' in formatted) {
+        skipped.push({ id, pick_list_number: row.pick_list_number, reason: formatted.skip });
+        continue;
+      }
+      labels.push(formatted);
+    }
+
+    return res.json({
+      count: labels.length,
+      labels,
+      skipped,
+      zpl: buildSampleAddressZpl(labels),
+      printer: { model: 'ZD421D', dpi: 203, label: '102x40mm' },
+    });
+  } catch (error) {
+    console.error('Sample address label error:', error);
+    return res.status(500).json({ error: 'Failed to build sample address labels' });
   }
 });
 
