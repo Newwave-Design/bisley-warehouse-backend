@@ -14,7 +14,8 @@ import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { moveStockBetweenBays, MoveError } from '../../lib/stock-move.js';
 import { paidSql } from '../../lib/payment-status.js';
-import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
+import { COLOUR_NAMES, enrichSampleItems, extractColourCode, sampleColourList } from '../../lib/colour-names.js';
+import { formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
 
 const router = express.Router();
@@ -272,7 +273,7 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
 
     const result = await query(`
       SELECT
-        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.customer_name,
+        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.customer_name, pl.shipping_address,
         EXISTS (SELECT 1 FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL) AS has_flag,
         (SELECT LEFT(pln.note_text, 120) FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL ORDER BY pln.created_at DESC LIMIT 1) AS flag_preview,
         COUNT(pli.id)::int                                                     AS total_items,
@@ -280,7 +281,10 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
         COUNT(*) FILTER (WHERE pli.status = 'PENDING')::int                   AS items_pending,
         COUNT(*) FILTER (WHERE pli.product_sku ILIKE '%SAMPLE%')::int         AS sample_item_count,
         COUNT(*) FILTER (WHERE pli.product_sku ILIKE '%SAMPLE%' AND pli.status = 'PICKED')::int AS sample_items_picked,
-        COALESCE(BOOL_OR(pli.product_sku ILIKE '%SAMPLE%'), false)             AS is_sample
+        COALESCE(BOOL_OR(pli.product_sku ILIKE '%SAMPLE%'), false)             AS is_sample,
+        json_agg(json_build_object(
+          'product_sku', pli.product_sku, 'colour_code', pli.colour_code, 'item_title', pli.item_title
+        ) ORDER BY pli.line_number) FILTER (WHERE pli.product_sku ILIKE '%SAMPLE%') AS sample_lines
       FROM pick_lists pl
       LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
       WHERE pl.is_archived = false AND ${paidSql('pl')} AND ($1::text[] IS NULL OR pl.status = ANY($1::text[]))
@@ -290,7 +294,15 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
       LIMIT 100
     `, [statuses]);
     const dues = await getDeliveryDues(result.rows.map((r: any) => r.id));
-    res.json({ pick_lists: result.rows.map((r: any) => ({ ...r, due: dues[r.id] ?? null })) });
+    res.json({
+      pick_lists: result.rows.map((r: any) => ({
+        ...r,
+        due: dues[r.id] ?? null,
+        address_text: formatShippingAddressText(r.shipping_address, r.customer_name),
+        sample_colours: sampleColourList(r.sample_lines),
+        sample_lines: undefined,
+      })),
+    });
   } catch (err) {
     res.status(500).json({ error: 'Failed to load pick lists' });
   }
@@ -386,7 +398,15 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
        WHERE pick_list_id = $1 AND is_flagged AND resolved_at IS NULL ORDER BY created_at`,
       [req.params.id]
     );
-    res.json({ ...pl.rows[0], due, items: items.rows, flag_notes: flagNotes.rows });
+    enrichSampleItems(items.rows);
+    const header = pl.rows[0];
+    res.json({
+      ...header,
+      due,
+      items: items.rows,
+      flag_notes: flagNotes.rows,
+      address_text: formatShippingAddressText(header.shipping_address, header.customer_name),
+    });
   } catch (err) {
     res.status(500).json({ error: 'Failed to load pick list detail' });
   }
@@ -490,6 +510,9 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
 
     const item = candidates[0];
     if (item.status === 'PICKED') return res.status(400).json({ error: 'Already picked' });
+    if (/SAMPLE/i.test(item.product_sku || '')) {
+      return res.status(400).json({ error: 'Colour samples are marked picked — they are not scanned' });
+    }
 
     // If this is a kit item and we're trying to scan a component
     if (isKitComponentScan && item.is_kit) {
@@ -580,6 +603,11 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
     const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : remainingQty;
     if (qty > remainingQty) {
       return res.status(400).json({ error: `Only ${remainingQty} remaining — reduce the quantity` });
+    }
+
+    // Colour samples are ticked by hand, not scanned.
+    if (/SAMPLE/i.test(item.rows[0].product_sku || '') && scanned_barcode) {
+      return res.status(400).json({ error: 'Colour samples are marked picked — they are not scanned' });
     }
 
     // Verify the scanned barcode matches the expected SKU

@@ -50,6 +50,33 @@ export function isFirstClassNote(text: string | null | undefined): boolean {
   return /first\s*class/i.test(text || '')
 }
 
+export function formatShippingAddressLines(
+  address: ShippingAddress | null | undefined,
+  customerName?: string | null,
+): string[] {
+  const a = address || {};
+  const name = clean(`${a.first_name || ''} ${a.last_name || ''}`) || clean(customerName);
+  const cityLine = [clean(a.city), clean(a.province)].filter(Boolean).join(', ');
+  const countryCode = clean(a.country_code).toUpperCase();
+  const country = countryCode && countryCode !== 'GB' ? countryCode : '';
+  return [
+    name,
+    clean(a.company),
+    clean(a.address_1),
+    clean(a.address_2),
+    cityLine,
+    clean(a.postal_code).toUpperCase(),
+    country,
+  ].filter(Boolean);
+}
+
+export function formatShippingAddressText(
+  address: ShippingAddress | null | undefined,
+  customerName?: string | null,
+): string {
+  return formatShippingAddressLines(address, customerName).join('\n');
+}
+
 export function formatSampleAddressLabel(input: {
   id: string
   pick_list_number: string

@@ -16,7 +16,8 @@ import { createUpsShipmentLabel } from '../../lib/ups.js';
 import { getOrderValues } from '../../lib/order-values.js';
 import { refreshKitsForSkus } from '../../lib/kit-refresh.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
-import { buildSampleAddressZpl, formatSampleAddressLabel } from '../../lib/sample-address-label.js';
+import { enrichSampleItems, sampleColourList } from '../../lib/colour-names.js';
+import { buildSampleAddressZpl, formatSampleAddressLabel, formatShippingAddressText } from '../../lib/sample-address-label.js';
 
 const router = express.Router();
 
@@ -176,7 +177,10 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          COUNT(pli.id) as item_count,
          SUM(CASE WHEN pli.status = 'PICKED' THEN 1 ELSE 0 END) as items_picked,
          SUM(CASE WHEN pli.product_sku ILIKE '%SAMPLE%' THEN 1 ELSE 0 END) as sample_item_count,
-         SUM(CASE WHEN pli.product_sku ILIKE '%SAMPLE%' AND pli.status = 'PICKED' THEN 1 ELSE 0 END) as sample_items_picked
+         SUM(CASE WHEN pli.product_sku ILIKE '%SAMPLE%' AND pli.status = 'PICKED' THEN 1 ELSE 0 END) as sample_items_picked,
+         json_agg(json_build_object(
+           'product_sku', pli.product_sku, 'colour_code', pli.colour_code, 'item_title', pli.item_title
+         ) ORDER BY pli.line_number) FILTER (WHERE pli.product_sku ILIKE '%SAMPLE%') AS sample_lines
          ${skuParamIndex > 0 ? `, MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_required END) as sku_quantity_required
                  , MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_picked END) as sku_quantity_picked` : ''}
        FROM pick_lists pl
@@ -201,6 +205,8 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
     const enrichedPickLists = await Promise.all(
       result.rows.map(async (pl: any) => ({
         ...pl,
+        sample_colours: sampleColourList(pl.sample_lines),
+        sample_lines: undefined,
         due: dues[pl.id] ?? null,
         stock_status: await getPickListStockStatus(pl.id),
         ...(values ? { order_value: values[pl.medusa_order_id] ?? null } : {}),
@@ -579,6 +585,9 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
        FROM pick_list_notes WHERE pick_list_id = $1 ORDER BY created_at DESC`,
       [pickListId]
     );
+
+    enrichSampleItems(itemsResult.rows);
+    pickList.address_text = formatShippingAddressText(pickList.shipping_address, pickList.customer_name);
 
     return res.json({
       pickList,

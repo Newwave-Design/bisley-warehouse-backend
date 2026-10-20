@@ -16,3 +16,53 @@ export function extractColourCode(sku: string): string | null {
   const m = /([a-z]{2}\d)$/.exec(lastSeg);
   return m ? m[1] : null;
 }
+
+export function isSampleSku(sku: string | null | undefined): boolean {
+  return /SAMPLE/i.test(sku || '');
+}
+
+/** Colour the warehouse actually picks for a sample swatch (not the SAMPLE SKU title). */
+export function sampleColourName(item: {
+  product_sku?: string | null;
+  colour_code?: string | null;
+  colour_name?: string | null;
+  product_title?: string | null;
+  item_title?: string | null;
+}): string {
+  const sku = item.product_sku || '';
+  const code = (item.colour_code || extractColourCode(sku) || '').toLowerCase();
+  if (code && COLOUR_NAMES[code]) return COLOUR_NAMES[code];
+  const mapped = (item.colour_name || '').trim();
+  if (mapped && !/sample/i.test(mapped)) return mapped;
+  const title = String(item.product_title || item.item_title || '')
+    .replace(/colour\s*samples?/ig, ' ')
+    .replace(/samples?/ig, ' ')
+    .replace(/[-–|/]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (title) return title;
+  return code ? code.toUpperCase() : (sku || 'Sample');
+}
+
+export function enrichSampleItems<T extends Record<string, any>>(items: T[]): T[] {
+  for (const item of items) {
+    if (!isSampleSku(item.product_sku)) continue;
+    item.is_sample = true;
+    item.colour_name = sampleColourName(item);
+  }
+  return items;
+}
+
+export function sampleColourList(items: any[] | null | undefined): string[] {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const item of items || []) {
+    if (!isSampleSku(item?.product_sku)) continue;
+    const name = sampleColourName(item);
+    const key = name.toLowerCase();
+    if (!name || seen.has(key)) continue;
+    seen.add(key);
+    names.push(name);
+  }
+  return names;
+}
