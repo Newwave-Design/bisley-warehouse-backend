@@ -9,6 +9,7 @@ import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { createNotificationOnce } from '../../lib/notifications.js';
 import { getOrderValues } from '../../lib/order-values.js';
+import { COLOUR_NAMES, extractColourCode, sampleColourLabel } from '../../lib/colour-names.js';
 
 /** Monthly net sales target in GBP (ex VAT). */
 export const MONTHLY_NET_TARGET_GBP = 90_000;
@@ -420,7 +421,19 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
       await getOrderValues(stale.rows.map((r: { order_id: string }) => r.order_id));
     }
 
-    const [netRows, unitRows] = await Promise.all([
+    const itemFrom = `
+      FROM pick_list_items pli
+      JOIN pick_lists pl ON pl.id = pli.pick_list_id
+      LEFT JOIN pick_lists parent ON parent.id = pl.parent_pick_list_id
+      LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
+      WHERE NOT COALESCE(pl.is_sandbox, false)
+        AND NOT COALESCE(pl.is_archived, false)
+        AND pl.status <> 'CANCELLED'
+        AND COALESCE(parent.status, pl.status) <> 'CANCELLED'
+        AND NOT COALESCE(parent.is_sandbox, false)
+        AND COALESCE(parent.created_at, pl.created_at)::date BETWEEN $1 AND $2`;
+
+    const [netRows, unitRows, sellerRows, categoryRows, colourRows, sampleRows, conversionRows] = await Promise.all([
       query(
         `SELECT pl.created_at::date::text AS day,
                 COUNT(*)::int AS order_count,
@@ -445,6 +458,112 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
          GROUP BY 1`,
         [from, to]
       ),
+      query<{ name: string; units: string; orders: string }>(
+        `SELECT COALESCE(NULLIF(wp.product_title, ''), NULLIF(pli.item_title, ''), pli.product_sku) AS name,
+                SUM(pli.quantity_required)::text AS units,
+                COUNT(DISTINCT COALESCE(parent.id, pl.id))::text AS orders
+         ${itemFrom}
+           AND pli.product_sku NOT ILIKE '%SAMPLE%'
+         GROUP BY 1
+         ORDER BY SUM(pli.quantity_required) DESC
+         LIMIT 8`,
+        [from, to]
+      ).catch((err) => {
+        console.warn('[reports/sales] sellers query failed:', err instanceof Error ? err.message : err);
+        return { rows: [] };
+      }),
+      query<{ name: string; units: string }>(
+        `SELECT CASE
+                  WHEN COALESCE(wp.product_title, pli.item_title, '') ILIKE '%fern%' THEN 'Fern'
+                  WHEN COALESCE(wp.product_title, pli.item_title, wp.product_handle, '') ILIKE '%multidesk%' THEN 'MultiDesk'
+                  WHEN COALESCE(wp.product_title, pli.item_title, '') ILIKE '%home filer%' THEN 'Home Filer'
+                  WHEN COALESCE(wp.product_title, pli.item_title, '') ILIKE '%plinth%' THEN 'Plinth'
+                  WHEN COALESCE(wp.product_title, pli.item_title, '') ILIKE '%castor%' THEN 'Castor bases'
+                  WHEN COALESCE(wp.product_title, pli.item_title, '') ILIKE '%insert%' THEN 'Insert trays'
+                  WHEN COALESCE(wp.product_title, pli.item_title, wp.product_handle, '') ~* '(multidrawer|29 series|12 series)' THEN 'MultiDrawer'
+                  WHEN COALESCE(NULLIF(wp.metadata->>'category', ''), '') <> '' THEN wp.metadata->>'category'
+                  ELSE COALESCE(
+                    NULLIF(initcap(replace(split_part(COALESCE(wp.product_handle, ''), '-', 1), '_', ' ')), ''),
+                    'Other'
+                  )
+                END AS name,
+                SUM(pli.quantity_required)::text AS units
+         ${itemFrom}
+           AND pli.product_sku NOT ILIKE '%SAMPLE%'
+         GROUP BY 1
+         ORDER BY SUM(pli.quantity_required) DESC
+         LIMIT 8`,
+        [from, to]
+      ).catch((err) => {
+        console.warn('[reports/sales] categories query failed:', err instanceof Error ? err.message : err);
+        return { rows: [] };
+      }),
+      query<{ name: string; code: string; units: string }>(
+        `SELECT COALESCE(NULLIF(wp.colour_name, ''), NULLIF(wp.colour_code, ''), 'Unknown') AS name,
+                COALESCE(NULLIF(wp.colour_code, ''), '') AS code,
+                SUM(pli.quantity_required)::text AS units
+         ${itemFrom}
+           AND pli.product_sku NOT ILIKE '%SAMPLE%'
+         GROUP BY 1, 2
+         ORDER BY SUM(pli.quantity_required) DESC
+         LIMIT 8`,
+        [from, to]
+      ).catch((err) => {
+        console.warn('[reports/sales] colours query failed:', err instanceof Error ? err.message : err);
+        return { rows: [] };
+      }),
+      query<{ sku: string; title: string; units: string }>(
+        `SELECT pli.product_sku AS sku,
+                COALESCE(NULLIF(pli.item_title, ''), pli.product_sku) AS title,
+                SUM(pli.quantity_required)::text AS units
+         ${itemFrom}
+           AND pli.product_sku ILIKE '%SAMPLE%'
+         GROUP BY 1, 2
+         ORDER BY SUM(pli.quantity_required) DESC
+         LIMIT 8`,
+        [from, to]
+      ).catch((err) => {
+        console.warn('[reports/sales] samples query failed:', err instanceof Error ? err.message : err);
+        return { rows: [] };
+      }),
+      query<{ sample_customers: string; converted: string }>(
+        `WITH sample_orders AS (
+           SELECT LOWER(TRIM(COALESCE(parent.customer_email, pl.customer_email))) AS email,
+                  MIN(COALESCE(parent.created_at, pl.created_at)) AS first_sample_at
+           ${itemFrom}
+             AND pli.product_sku ILIKE '%SAMPLE%'
+             AND COALESCE(parent.customer_email, pl.customer_email) IS NOT NULL
+             AND TRIM(COALESCE(parent.customer_email, pl.customer_email)) <> ''
+           GROUP BY 1
+         ),
+         product_orders AS (
+           SELECT LOWER(TRIM(COALESCE(parent.customer_email, pl.customer_email))) AS email,
+                  MIN(COALESCE(parent.created_at, pl.created_at)) AS first_product_at
+           FROM pick_list_items pli
+           JOIN pick_lists pl ON pl.id = pli.pick_list_id
+           LEFT JOIN pick_lists parent ON parent.id = pl.parent_pick_list_id
+           WHERE NOT COALESCE(pl.is_sandbox, false)
+             AND NOT COALESCE(pl.is_archived, false)
+             AND pl.status <> 'CANCELLED'
+             AND COALESCE(parent.status, pl.status) <> 'CANCELLED'
+             AND NOT COALESCE(parent.is_sandbox, false)
+             AND pli.product_sku NOT ILIKE '%SAMPLE%'
+             AND COALESCE(parent.customer_email, pl.customer_email) IS NOT NULL
+             AND TRIM(COALESCE(parent.customer_email, pl.customer_email)) <> ''
+           GROUP BY 1
+         )
+         SELECT COUNT(*)::text AS sample_customers,
+                COUNT(*) FILTER (
+                  WHERE p.first_product_at IS NOT NULL
+                    AND p.first_product_at > s.first_sample_at
+                )::text AS converted
+       FROM sample_orders s
+       LEFT JOIN product_orders p ON p.email = s.email`,
+        [from, to]
+      ).catch((err) => {
+        console.warn('[reports/sales] conversion query failed:', err instanceof Error ? err.message : err);
+        return { rows: [{ sample_customers: '0', converted: '0' }] };
+      }),
     ]);
 
     const netByDay = new Map(netRows.rows.map((r: any) => [String(r.day).slice(0, 10), r]));
@@ -472,6 +591,19 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
     const periodTarget = days.length ? days[days.length - 1].expected_net_gbp : 0;
     const daysWithTarget = days.map((d) => ({ ...d, target_net_gbp: periodTarget }));
 
+    const sampleByColour = new Map<string, number>();
+    for (const row of sampleRows.rows) {
+      const label = sampleColourLabel({ product_sku: row.sku, item_title: row.title });
+      sampleByColour.set(label, (sampleByColour.get(label) || 0) + (Number(row.units) || 0));
+    }
+    const topSamples = [...sampleByColour.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([name, units]) => ({ name, units }));
+
+    const sampleCustomers = Number(conversionRows.rows[0]?.sample_customers) || 0;
+    const converted = Number(conversionRows.rows[0]?.converted) || 0;
+
     res.json({
       from,
       to,
@@ -483,6 +615,29 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
         units: days.reduce((s, d) => s + d.units, 0),
       },
       days: daysWithTarget,
+      top_sellers: sellerRows.rows.map((r) => ({
+        name: r.name,
+        units: Number(r.units) || 0,
+        orders: Number(r.orders) || 0,
+      })),
+      top_categories: categoryRows.rows.map((r) => ({
+        name: r.name || 'Other',
+        units: Number(r.units) || 0,
+      })),
+      top_colours: colourRows.rows.map((r) => {
+        const code = (r.code || extractColourCode(r.name) || '').toLowerCase();
+        const mapped = code && COLOUR_NAMES[code] ? COLOUR_NAMES[code] : r.name;
+        return {
+          name: code && mapped.toLowerCase() !== code ? `${mapped} (${code})` : mapped,
+          units: Number(r.units) || 0,
+        };
+      }),
+      top_samples: topSamples,
+      sample_conversion: {
+        sample_customers: sampleCustomers,
+        converted,
+        rate: sampleCustomers ? Math.round((converted / sampleCustomers) * 1000) / 10 : 0,
+      },
     });
   } catch (err) {
     console.error('Sales report error:', err);

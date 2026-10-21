@@ -9,6 +9,7 @@ import cors from 'cors';
 import { initializePool, closePool } from './db/index.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureFulfillmentSchema } from './db/ensure-fulfillment-schema.js';
+import { ensurePickListEvents } from './db/ensure-pick-list-events.js';
 import { ensureStockSoldAudit } from './db/ensure-stock-sold-audit.js';
 import scanningRoutes from './api/routes/scanning.js';
 import pickListRoutes from './api/routes/pick-lists.js';
@@ -180,6 +181,12 @@ async function start() {
       await ensureStockSoldAudit();
     } catch (auditError) {
       console.warn('⚠️  Stock Sold audit bootstrap warning:', (auditError as Error).message);
+    }
+
+    try {
+      await ensurePickListEvents();
+    } catch (eventError) {
+      console.warn('⚠️  Pick list events bootstrap warning:', (eventError as Error).message);
     }
 
     // Start server

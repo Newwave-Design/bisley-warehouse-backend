@@ -16,10 +16,29 @@ import { createUpsShipmentLabel } from '../../lib/ups.js';
 import { getOrderValues } from '../../lib/order-values.js';
 import { refreshKitsForSkus } from '../../lib/kit-refresh.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
-import { enrichSampleItems, sampleColourList } from '../../lib/colour-names.js';
+import { COLOUR_NAMES, enrichSampleItems, extractColourCode, isSampleSku, sampleColourList, sampleColourName } from '../../lib/colour-names.js';
+import { actorName, PICK_LIST_STATUSES, recordPickListEvents, type PickListStatus } from '../../lib/pick-list-events.js';
 import { buildSampleAddressZpl, formatSampleAddressLabel, formatShippingAddressText } from '../../lib/sample-address-label.js';
 
 const router = express.Router();
+
+function formatPickListOverview(items: any[] | null | undefined) {
+  return (items || []).filter((item) => item?.product_sku).map((item) => {
+    const code = (item.colour_code || extractColourCode(item.product_sku || '') || '').toLowerCase();
+    const colourName = COLOUR_NAMES[code] || (isSampleSku(item.product_sku) ? sampleColourName(item) : '');
+    const colour = code && colourName && colourName.toLowerCase() !== code
+      ? `${colourName} (${code})`
+      : (colourName || code || '');
+    return {
+      title: item.item_title || item.product_sku,
+      sku: item.product_sku,
+      colour_code: code || null,
+      colour,
+      quantity_required: Number(item.quantity_required) || 0,
+      quantity_picked: Number(item.quantity_picked) || 0,
+    };
+  });
+}
 
 /** GET /api/pick-lists/sandbox — list only sandbox pick lists (must be before /:pickListId) */
 router.get('/sandbox', authMiddleware, async (req: Request, res: Response) => {
@@ -172,6 +191,9 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.is_archived,
          pl.archived_at,
          pl.payment_status,
+         pl.last_event_at,
+         pl.last_event_by,
+         pl.last_event_summary,
          EXISTS (SELECT 1 FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL) AS has_flag,
          (SELECT LEFT(pln.note_text, 120) FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL ORDER BY pln.created_at DESC LIMIT 1) AS flag_preview,
          COUNT(pli.id) as item_count,
@@ -179,12 +201,17 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          SUM(CASE WHEN pli.product_sku ILIKE '%SAMPLE%' THEN 1 ELSE 0 END) as sample_item_count,
          SUM(CASE WHEN pli.product_sku ILIKE '%SAMPLE%' AND pli.status = 'PICKED' THEN 1 ELSE 0 END) as sample_items_picked,
          json_agg(json_build_object(
-           'product_sku', pli.product_sku, 'colour_code', pli.colour_code, 'item_title', pli.item_title
-         ) ORDER BY pli.line_number) FILTER (WHERE pli.product_sku ILIKE '%SAMPLE%') AS sample_lines
+           'product_sku', pli.product_sku,
+           'colour_code', pli.colour_code,
+           'item_title', COALESCE(wp.product_title, pli.item_title),
+           'quantity_required', pli.quantity_required,
+           'quantity_picked', pli.quantity_picked
+         ) ORDER BY pli.line_number) FILTER (WHERE pli.id IS NOT NULL) AS items
          ${skuParamIndex > 0 ? `, MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_required END) as sku_quantity_required
                  , MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_picked END) as sku_quantity_picked` : ''}
        FROM pick_lists pl
        LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
+       LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
        ${whereClause}
        GROUP BY pl.id
        ORDER BY pl.created_at ${orderDir}
@@ -205,8 +232,8 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
     const enrichedPickLists = await Promise.all(
       result.rows.map(async (pl: any) => ({
         ...pl,
-        sample_colours: sampleColourList(pl.sample_lines),
-        sample_lines: undefined,
+        items: formatPickListOverview(pl.items),
+        sample_colours: sampleColourList(pl.items),
         due: dues[pl.id] ?? null,
         stock_status: await getPickListStockStatus(pl.id),
         ...(values ? { order_value: values[pl.medusa_order_id] ?? null } : {}),
@@ -277,6 +304,17 @@ router.post('/sample-address-labels', authMiddleware, async (req: Request, res: 
       labels.push(formatted);
     }
 
+    const printedIds = labels.map((label) => label.id);
+    if (printedIds.length) {
+      await recordPickListEvents({
+        ids: printedIds,
+        actor: actorName((req as AuthRequest).user),
+        action: 'print',
+        summary: 'Printed 102×40 mm address labels',
+        status: 'LABEL_PRINTED',
+      });
+    }
+
     return res.json({
       count: labels.length,
       labels,
@@ -287,6 +325,76 @@ router.post('/sample-address-labels', authMiddleware, async (req: Request, res: 
   } catch (error) {
     console.error('Sample address label error:', error);
     return res.status(500).json({ error: 'Failed to build sample address labels' });
+  }
+});
+
+function parseStatus(value: unknown): PickListStatus | null {
+  const status = String(value || '').toUpperCase().replace(/[-\s]/g, '_') as PickListStatus;
+  return (PICK_LIST_STATUSES as readonly string[]).includes(status) ? status : null;
+}
+
+function statusSummary(status: PickListStatus): string {
+  const labels: Record<string, string> = {
+    PENDING: 'Pending',
+    IN_PROGRESS: 'In progress',
+    PICKED: 'Picked',
+    PACKING: 'Packing',
+    PACKED: 'Packed',
+    LABEL_PRINTED: 'Printed',
+    AWAITING_STOCK: 'Awaiting stock',
+    DISPATCHED: 'Shipped',
+    CANCELLED: 'Cancelled',
+  };
+  return `Status changed to ${labels[status] || status}`;
+}
+
+/**
+ * POST /api/pick-lists/bulk-status
+ * Body: { pickListIds: string[], status: string }
+ */
+router.post('/bulk-status', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const status = parseStatus(req.body?.status);
+    if (!status) return res.status(400).json({ error: 'Unknown status' });
+    const ids = Array.isArray(req.body?.pickListIds)
+      ? [...new Set((req.body.pickListIds as unknown[]).map((id) => String(id || '').trim()).filter(Boolean))]
+      : [];
+    if (!ids.length) return res.status(400).json({ error: 'Select at least one pick list' });
+    await recordPickListEvents({
+      ids,
+      actor: actorName(req.user),
+      action: 'status',
+      summary: statusSummary(status),
+      status,
+    });
+    return res.json({ success: true, updated: ids.length, status });
+  } catch (error) {
+    console.error('Bulk status error:', error);
+    return res.status(500).json({ error: 'Failed to update status' });
+  }
+});
+
+/**
+ * PATCH /api/pick-lists/:pickListId/status
+ * Body: { status: string }
+ */
+router.patch('/:pickListId/status', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const status = parseStatus(req.body?.status);
+    if (!status) return res.status(400).json({ error: 'Unknown status' });
+    const found = await query(`SELECT id FROM pick_lists WHERE id = $1`, [req.params.pickListId]);
+    if (!found.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+    await recordPickListEvents({
+      ids: [req.params.pickListId],
+      actor: actorName(req.user),
+      action: 'status',
+      summary: statusSummary(status),
+      status,
+    });
+    return res.json({ success: true, status });
+  } catch (error) {
+    console.error('Status change error:', error);
+    return res.status(500).json({ error: 'Failed to update status' });
   }
 });
 
@@ -304,6 +412,12 @@ router.post('/:pickListId/resync', authMiddleware, requirePermission('system_adm
 
     const skus = await query(`SELECT DISTINCT product_sku FROM pick_list_items WHERE pick_list_id = $1`, [pickListId]);
     const result = await refreshKitsForSkus(skus.rows.map((r: any) => r.product_sku));
+    await recordPickListEvents({
+      ids: [pickListId],
+      actor: actorName((req as AuthRequest).user),
+      action: 'resync',
+      summary: 'Resynced kit components from Medusa',
+    });
     return res.json(result);
   } catch (error: any) {
     console.error('Pick list resync error:', error);
@@ -1035,6 +1149,12 @@ router.post('/:pickListId/mark-samples-picked', authMiddleware, async (req: Requ
         `UPDATE pick_lists SET status = 'IN_PROGRESS', updated_at = NOW() WHERE id = $1 AND status = 'PENDING'`,
         [pickListId]
       );
+      await recordPickListEvents({
+        ids: [pickListId],
+        actor: actorName((req as AuthRequest).user),
+        action: 'pick',
+        summary: `Marked ${marked.rows.length} sample colour${marked.rows.length === 1 ? '' : 's'} picked`,
+      });
     }
 
     return res.json({ success: true, marked: marked.rows.length });

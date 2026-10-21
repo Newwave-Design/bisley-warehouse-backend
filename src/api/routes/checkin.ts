@@ -17,7 +17,38 @@ import express, { Response } from 'express';
 import { stockInUnits } from './stock-in.js';
 import { query } from '../../db/index.js';
 import { failedScansFor } from '../../lib/failed-scans.js';
+import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
+
+async function enrichCheckinItems(items: any[]) {
+  const keys = [...new Set(items.flatMap((i) => [i.medusa_sku, i.nw_code].filter(Boolean)))]
+  if (!keys.length) return items
+  const products = await query(
+    `SELECT variant_sku, nw_code, colour_code, colour_name, product_title
+     FROM wms_products
+     WHERE variant_sku = ANY($1::text[]) OR nw_code = ANY($1::text[])`,
+    [keys],
+  )
+  const bySku = new Map<string, any>()
+  const byNw = new Map<string, any>()
+  for (const p of products.rows) {
+    if (p.variant_sku) bySku.set(p.variant_sku, p)
+    if (p.nw_code) byNw.set(p.nw_code, p)
+  }
+  return items.map((i) => {
+    const p = bySku.get(i.medusa_sku) || bySku.get(i.nw_code) || byNw.get(i.nw_code)
+    const sku = i.medusa_sku || p?.variant_sku || i.nw_code || ''
+    const code = (p?.colour_code || extractColourCode(sku) || '').toLowerCase()
+    const colourName = COLOUR_NAMES[code] || p?.colour_name || i.colour || ''
+    return {
+      ...i,
+      sku,
+      colour_code: code || null,
+      colour_name: colourName,
+      description: p?.product_title || i.nw_code || sku,
+    }
+  })
+}
 
 const router = express.Router();
 
@@ -144,6 +175,7 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
       `SELECT * FROM checkin_items WHERE session_id = $1 AND removed_at IS NULL ORDER BY scanned_at DESC`,
       [req.params.id]
     );
+    const enrichedItems = await enrichCheckinItems(items.rows);
 
     const discrepancies = await query(
       `SELECT * FROM checkin_discrepancies WHERE session_id = $1 ORDER BY discrepancy_type, nw_code`,
@@ -161,7 +193,7 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
       order_line_items = lines.rows;
     }
 
-    res.json({ ...session.rows[0], items: items.rows, discrepancies: discrepancies.rows, order_line_items, failed_scans: await failedScansFor('STOCK_IN', req.params.id) });
+    res.json({ ...session.rows[0], items: enrichedItems, discrepancies: discrepancies.rows, order_line_items, failed_scans: await failedScansFor('STOCK_IN', req.params.id) });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch session' });
   }
