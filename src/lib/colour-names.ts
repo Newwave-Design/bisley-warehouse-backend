@@ -21,6 +21,13 @@ export function isSampleSku(sku: string | null | undefined): boolean {
   return /SAMPLE/i.test(sku || '');
 }
 
+export function sampleColourCode(item: {
+  product_sku?: string | null;
+  colour_code?: string | null;
+}): string {
+  return (item.colour_code || extractColourCode(item.product_sku || '') || '').toLowerCase();
+}
+
 /** Colour the warehouse actually picks for a sample swatch (not the SAMPLE SKU title). */
 export function sampleColourName(item: {
   product_sku?: string | null;
@@ -30,9 +37,9 @@ export function sampleColourName(item: {
   item_title?: string | null;
 }): string {
   const sku = item.product_sku || '';
-  const code = (item.colour_code || extractColourCode(sku) || '').toLowerCase();
+  const code = sampleColourCode(item);
   if (code && COLOUR_NAMES[code]) return COLOUR_NAMES[code];
-  const mapped = (item.colour_name || '').trim();
+  const mapped = (item.colour_name || '').replace(/\s*\([a-z]{2}\d\)\s*$/i, '').trim();
   if (mapped && !/sample/i.test(mapped)) return mapped;
   const title = String(item.product_title || item.item_title || '')
     .replace(/colour\s*samples?/ig, ' ')
@@ -44,11 +51,27 @@ export function sampleColourName(item: {
   return code ? code.toUpperCase() : (sku || 'Sample');
 }
 
+/** Display name plus Bisley code, e.g. Bisley Orange (code). */
+export function sampleColourLabel(item: {
+  product_sku?: string | null;
+  colour_code?: string | null;
+  colour_name?: string | null;
+  product_title?: string | null;
+  item_title?: string | null;
+}): string {
+  const name = sampleColourName(item);
+  const code = sampleColourCode(item);
+  if (!code || name.toLowerCase() === code) return name;
+  return `${name} (${code})`;
+}
+
 export function enrichSampleItems<T extends Record<string, any>>(items: T[]): T[] {
   for (const item of items) {
     if (!isSampleSku(item.product_sku)) continue;
     item.is_sample = true;
-    item.colour_name = sampleColourName(item);
+    const code = sampleColourCode(item);
+    if (code && !item.colour_code) item.colour_code = code;
+    item.colour_name = sampleColourLabel(item);
   }
   return items;
 }
@@ -58,7 +81,7 @@ export function sampleColourList(items: any[] | null | undefined): string[] {
   const seen = new Set<string>();
   for (const item of items || []) {
     if (!isSampleSku(item?.product_sku)) continue;
-    const name = sampleColourName(item);
+    const name = sampleColourLabel(item);
     const key = name.toLowerCase();
     if (!name || seen.has(key)) continue;
     seen.add(key);
