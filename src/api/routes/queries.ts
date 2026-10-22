@@ -28,6 +28,9 @@ router.get('/', async (req: Request, res: Response) => {
   try {
     const { status, priority, search, assigned_to, sort_by = 'created_at', page = 1, limit = 50 } = req.query
     const offset = ((Number(page) - 1) * Number(limit))
+    const sortColumn = ['created_at', 'updated_at', 'status', 'priority', 'query_number'].includes(String(sort_by))
+      ? String(sort_by)
+      : 'created_at'
 
     let query = `
       SELECT 
@@ -57,12 +60,18 @@ router.get('/', async (req: Request, res: Response) => {
       params.push(assigned_to)
     }
     if (search) {
-      query += ` AND (q.customer_name ILIKE $${params.length + 1} OR q.customer_email ILIKE $${params.length + 1} OR q.subject ILIKE $${params.length + 1})`
-      const searchTerm = `%${search}%`
-      params.push(searchTerm, searchTerm, searchTerm)
+      // One placeholder, used everywhere. Pushing a value per ILIKE makes Postgres
+      // reject the query (more bound parameters than placeholders).
+      params.push(`%${String(search).trim()}%`)
+      const p = params.length
+      query += ` AND (
+        q.customer_name ILIKE $${p} OR q.customer_email ILIKE $${p} OR q.customer_phone ILIKE $${p}
+        OR q.subject ILIKE $${p} OR q.description ILIKE $${p} OR q.query_number ILIKE $${p}
+        OR EXISTS (SELECT 1 FROM query_records qrs WHERE qrs.query_id = q.id AND (qrs.content ILIKE $${p} OR qrs.record_title ILIKE $${p}))
+      )`
     }
 
-    query += ` GROUP BY q.id, au.id ORDER BY q.${sort_by} DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`
+    query += ` GROUP BY q.id, au.id ORDER BY q.${sortColumn} DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`
     params.push(limit, offset)
 
     const result = await getPool().query(query, params)

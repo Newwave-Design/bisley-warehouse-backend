@@ -1199,7 +1199,7 @@ CREATE TABLE IF NOT EXISTS customer_queries (
   query_number VARCHAR(50) NOT NULL UNIQUE,
   customer_name VARCHAR(255) NOT NULL,
   customer_email VARCHAR(255),
-  customer_phone VARCHAR(20),
+  customer_phone TEXT,
   subject VARCHAR(500) NOT NULL,
   description TEXT,
   status VARCHAR(50) NOT NULL DEFAULT 'open',
@@ -1215,6 +1215,8 @@ CREATE INDEX IF NOT EXISTS idx_customer_queries_status ON customer_queries(statu
 CREATE INDEX IF NOT EXISTS idx_customer_queries_assigned_to ON customer_queries(assigned_to);
 CREATE INDEX IF NOT EXISTS idx_customer_queries_created_at ON customer_queries(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_customer_queries_customer_email ON customer_queries(customer_email);
+-- Existing databases were created with VARCHAR(20), which rejects two phone numbers.
+ALTER TABLE customer_queries ALTER COLUMN customer_phone TYPE TEXT;
 
 -- ================================================================================
 -- QUERY RECORDS (Communication history for a customer query)

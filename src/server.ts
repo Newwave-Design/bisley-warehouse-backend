@@ -11,6 +11,8 @@ import { runMigrations } from './db/migrate.js';
 import { ensureFulfillmentSchema } from './db/ensure-fulfillment-schema.js';
 import { ensurePickListEvents } from './db/ensure-pick-list-events.js';
 import { ensureStockSoldAudit } from './db/ensure-stock-sold-audit.js';
+import { ensurePackagingSchema } from './db/ensure-packaging-schema.js';
+import packagingRoutes from './api/routes/packaging.js';
 import scanningRoutes from './api/routes/scanning.js';
 import pickListRoutes from './api/routes/pick-lists.js';
 import inventorySyncRoutes from './api/routes/inventory-sync.js';
@@ -109,6 +111,7 @@ app.use('/api/stock-in', stockInRoutes);
 app.use('/api/move-sessions', moveSessionRoutes);
 app.use('/api/products', productsRoutes);
 app.use('/api/box-sizes', boxSizesRoutes);
+app.use('/api/packaging', packagingRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/genero', generoRoutes);
@@ -181,6 +184,12 @@ async function start() {
       await ensureStockSoldAudit();
     } catch (auditError) {
       console.warn('⚠️  Stock Sold audit bootstrap warning:', (auditError as Error).message);
+    }
+
+    try {
+      await ensurePackagingSchema();
+    } catch (packagingError) {
+      console.warn('⚠️  Packaging schema bootstrap warning:', (packagingError as Error).message);
     }
 
     try {
