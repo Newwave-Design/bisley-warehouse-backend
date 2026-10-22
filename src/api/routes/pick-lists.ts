@@ -18,6 +18,7 @@ import { refreshKitsForSkus } from '../../lib/kit-refresh.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
 import { COLOUR_NAMES, enrichSampleItems, extractColourCode, isSampleSku, sampleColourList, sampleColourName } from '../../lib/colour-names.js';
 import { actorName, PICK_LIST_STATUSES, recordPickListEvents, type PickListStatus } from '../../lib/pick-list-events.js';
+import { fulfillPickListInMedusa, fulfillPickListsInMedusa } from '../../lib/medusa-fulfillment.js';
 import { buildSampleAddressZpl, formatSampleAddressLabel, formatShippingAddressText } from '../../lib/sample-address-label.js';
 
 const router = express.Router();
@@ -367,7 +368,11 @@ router.post('/bulk-status', authMiddleware, async (req: AuthRequest, res: Respon
       summary: statusSummary(status),
       status,
     });
-    return res.json({ success: true, updated: ids.length, status });
+    let medusa_sync = undefined;
+    if (status === 'DISPATCHED') {
+      medusa_sync = await fulfillPickListsInMedusa(ids);
+    }
+    return res.json({ success: true, updated: ids.length, status, medusa_sync });
   } catch (error) {
     console.error('Bulk status error:', error);
     return res.status(500).json({ error: 'Failed to update status' });
@@ -391,7 +396,11 @@ router.patch('/:pickListId/status', authMiddleware, async (req: AuthRequest, res
       summary: statusSummary(status),
       status,
     });
-    return res.json({ success: true, status });
+    let medusa_sync = undefined;
+    if (status === 'DISPATCHED') {
+      medusa_sync = await fulfillPickListInMedusa(req.params.pickListId);
+    }
+    return res.json({ success: true, status, medusa_sync });
   } catch (error) {
     console.error('Status change error:', error);
     return res.status(500).json({ error: 'Failed to update status' });
@@ -1509,16 +1518,25 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: AuthRequest, r
       if (!result.ok) syncErrors.push(`${sku}: ${result.error}`);
     }
 
+    const medusa_sync = await fulfillPickListInMedusa(pickListId);
     res.json({
       success: true,
       dispatched: itemCount,
       skus_synced: syncSkus.length - syncErrors.length,
       sync_errors: syncErrors.length > 0 ? syncErrors : undefined,
       short_skus: shortfalls.length > 0 ? shortfalls : undefined,
+      medusa_sync,
     });
   } catch (error) {
     console.error('Pick list dispatch Medusa sync error:', error);
-    res.json({ success: true, dispatched: itemCount, sync_errors: ['Medusa stock sync failed - run a stock sync'], short_skus: shortfalls.length > 0 ? shortfalls : undefined });
+    const medusa_sync = await fulfillPickListInMedusa(pickListId);
+    res.json({
+      success: true,
+      dispatched: itemCount,
+      sync_errors: ['Medusa stock sync failed - run a stock sync'],
+      short_skus: shortfalls.length > 0 ? shortfalls : undefined,
+      medusa_sync,
+    });
   }
 });
 
