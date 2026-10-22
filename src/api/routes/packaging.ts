@@ -204,14 +204,63 @@ router.get('/products', async (req: Request, res: Response) => {
     const { method, q, active } = req.query;
     const conds = ['1=1'];
     const params: any[] = [];
-    if (method) { params.push(method); conds.push(`method = $${params.length}`); }
-    if (active !== 'all') conds.push('is_active = true');
+    if (method) { params.push(method); conds.push(`s.method = $${params.length}`); }
+    if (active !== 'all') conds.push('s.is_active = true');
     if (q) {
       params.push(`%${String(q).trim()}%`);
-      conds.push(`(product_code ILIKE $${params.length} OR product_title ILIKE $${params.length} OR product_range ILIKE $${params.length})`);
+      conds.push(`(s.product_code ILIKE $${params.length} OR s.product_title ILIKE $${params.length} OR s.product_range ILIKE $${params.length})`);
     }
     const result = await query(
-      `SELECT * FROM packaging_product_specs WHERE ${conds.join(' AND ')} ORDER BY product_code`,
+      `WITH weeks AS (
+         SELECT GREATEST(
+           1.0,
+           EXTRACT(EPOCH FROM (NOW() - MIN(pl.created_at))) / 604800.0
+         ) AS n
+         FROM pick_lists pl
+         WHERE NOT pl.is_sandbox
+           AND pl.status <> 'CANCELLED'
+           AND pl.payment_status IN ('captured', 'partially_refunded')
+       ),
+       sales AS (
+         SELECT
+           CASE
+             WHEN position('-' IN pli.product_sku) > 0
+             THEN left(pli.product_sku, length(pli.product_sku) - position('-' IN reverse(pli.product_sku)))
+             ELSE pli.product_sku
+           END AS product_code,
+           SUM(pli.quantity_required)::numeric AS units_sold
+         FROM pick_list_items pli
+         JOIN pick_lists pl ON pl.id = pli.pick_list_id
+         WHERE NOT pl.is_sandbox
+           AND pl.status <> 'CANCELLED'
+           AND pl.payment_status IN ('captured', 'partially_refunded')
+           AND pli.product_sku NOT ILIKE '%SAMPLE%'
+           AND COALESCE(pli.is_custom, false) = false
+         GROUP BY 1
+       ),
+       prices AS (
+         SELECT
+           CASE
+             WHEN position('-' IN wp.variant_sku) > 0
+             THEN left(wp.variant_sku, length(wp.variant_sku) - position('-' IN reverse(wp.variant_sku)))
+             ELSE wp.variant_sku
+           END AS product_code,
+           MIN(wp.price_gbp) AS price_gbp
+         FROM wms_products wp
+         WHERE wp.price_gbp IS NOT NULL
+         GROUP BY 1
+       )
+       SELECT s.*,
+              COALESCE(sales.units_sold, 0)::numeric AS units_sold,
+              ROUND((COALESCE(sales.units_sold, 0) / weeks.n)::numeric, 1) AS qty_per_week,
+              ROUND(weeks.n::numeric, 1) AS weeks_covered,
+              prices.price_gbp
+       FROM packaging_product_specs s
+       CROSS JOIN weeks
+       LEFT JOIN sales ON sales.product_code = s.product_code
+       LEFT JOIN prices ON prices.product_code = s.product_code
+       WHERE ${conds.join(' AND ')}
+       ORDER BY s.product_code`,
       params
     );
     res.json({ products: result.rows });
