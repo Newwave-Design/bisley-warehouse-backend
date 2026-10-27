@@ -6,7 +6,9 @@
  * Custom lines have no catalogue SKU. A part code in the title (PLKCSYT10/34) is the supplier SKU.
  * Delivery charges are left off. Order 196 was sent from the factory and is left off.
  * Spreadsheets carry the supplier's own part number + colour code (wms_products.supplier_part_code /
- * supplier_colour_code). A row with no part number uses the line title as the SKU.
+ * supplier_colour_code) as the full SKU (PART-COLOUR). A colour with no part code of its own uses the
+ * part code shared by the other colours of that same part. If there is no supplier code at all, the
+ * row uses our SKU, not the product title.
  *
  * GET  /api/supplier-reorders            — all rows with last-sent info
  * GET  /api/supplier-reorders/suppliers  — saved suppliers
@@ -38,6 +40,8 @@ export interface ReorderLine {
   supplier_sku: string | null;
   supplier_colour: string;
   supplier_inferred: boolean;
+  /** Colour code on our SKU, e.g. bz2. Empty for custom lines. */
+  colour_code: string;
   /** Units to put on the supplier spreadsheet. For a swapped tray this is packs of 5, not singles sold. */
   quantity: number;
   /** Units the customer bought, before the 5-pack conversion. */
@@ -68,6 +72,16 @@ export function trayOrderQuantity(sku: string, sold: number): number {
 
 /** Paid custom order supplied direct from the factory — not re-ordered here. */
 const FACTORY_SUPPLIED_ORDER = 'order_01M45V8869WZV1XQHSZK99X6RX';
+
+/** `163-bz2` + `bz2` → `163`. Null when the SKU does not end in that colour code. */
+export function partPrefix(sku: string, colourCode: string): string | null {
+  const code = colourCode.trim();
+  if (!code) return null;
+  const suffix = `-${code}`;
+  if (!sku.toLowerCase().endsWith(suffix.toLowerCase())) return null;
+  const prefix = sku.slice(0, sku.length - suffix.length);
+  return prefix || null;
+}
 
 /** Part code typed on a custom line, e.g. "Replacement lock PLKCSYT10/34 (Tambour)". */
 export function customPartCode(title: string): string | null {
@@ -110,7 +124,7 @@ export async function buildLines(): Promise<ReorderLine[]> {
       for (const c of r.kit_components as Comp[]) componentSkus.add(c.sku);
     }
   }
-  const compInfo = new Map<string, { title: string; colour: string; supplier_sku: string | null; supplier_colour: string; inferred: boolean }>();
+  const compInfo = new Map<string, { title: string; colour: string; colour_code: string; supplier_sku: string | null; supplier_colour: string; inferred: boolean }>();
   if (componentSkus.size) {
     const cr = await query(
       `SELECT DISTINCT ON (variant_sku) variant_sku, product_title, colour_name, colour_code, supplier_part_code, supplier_colour_code, supplier_code_source
@@ -121,6 +135,7 @@ export async function buildLines(): Promise<ReorderLine[]> {
       compInfo.set(c.variant_sku, {
         title: c.product_title ?? '',
         colour: c.colour_name || c.colour_code || '',
+        colour_code: c.colour_code || '',
         supplier_sku: c.supplier_part_code ?? null,
         supplier_colour: c.supplier_colour_code ?? '',
         inferred: c.supplier_code_source === 'inferred',
@@ -152,6 +167,7 @@ export async function buildLines(): Promise<ReorderLine[]> {
         supplier_sku: code,
         supplier_colour: '',
         supplier_inferred: false,
+        colour_code: '',
         quantity: qty,
         sold_quantity: qty,
         note: '',
@@ -172,6 +188,7 @@ export async function buildLines(): Promise<ReorderLine[]> {
           supplier_sku: info?.supplier_sku ?? null,
           supplier_colour: info?.supplier_colour ?? '',
           supplier_inferred: info?.inferred ?? false,
+          colour_code: info?.colour_code || '',
           quantity: sold,
           sold_quantity: sold,
           note: '',
@@ -188,6 +205,7 @@ export async function buildLines(): Promise<ReorderLine[]> {
         supplier_sku: r.supplier_part_code ?? null,
         supplier_colour: r.supplier_colour_code ?? '',
         supplier_inferred: r.supplier_code_source === 'inferred',
+        colour_code: r.wp_colour || r.item_colour || '',
         quantity: qty,
         sold_quantity: qty,
         note: '',
@@ -195,8 +213,56 @@ export async function buildLines(): Promise<ReorderLine[]> {
     }
   }
 
+  await fillMissingSupplierCodes(lines);
   await applyTrayFivePacks(lines);
   return lines;
+}
+
+/**
+ * A colour missing from the barcode list still belongs to a part. If every other colour of that
+ * same part (163-ab9, 163-bx6, …) carries one supplier part code, use it. Never borrow a code from
+ * a different part that happens to sit on the same Medusa product (CB3 must not become CB5).
+ */
+async function fillMissingSupplierCodes(lines: ReorderLine[]): Promise<void> {
+  const pending = lines.filter(l => !l.supplier_sku && partPrefix(l.order_sku || l.sku, l.colour_code));
+  if (!pending.length) return;
+  const prefixes = [...new Set(pending.map(l => partPrefix(l.order_sku || l.sku, l.colour_code)!))];
+  const found = await query(
+    `SELECT wp.variant_sku, wp.supplier_part_code
+     FROM wms_products wp
+     JOIN unnest($1::text[]) AS p(prefix)
+       ON left(wp.variant_sku, length(p.prefix) + 1) = p.prefix || '-'
+     WHERE wp.supplier_part_code IS NOT NULL AND wp.supplier_part_code <> ''
+       AND NOT wp.is_archived`,
+    [prefixes]
+  );
+  const partsByPrefix = new Map<string, Set<string>>(prefixes.map(p => [p, new Set()]));
+  for (const row of found.rows) {
+    const sku = String(row.variant_sku);
+    const part = String(row.supplier_part_code);
+    const prefix = prefixes.filter(p => sku.startsWith(`${p}-`)).sort((a, b) => b.length - a.length)[0];
+    if (prefix) partsByPrefix.get(prefix)!.add(part);
+  }
+  for (const l of pending) {
+    const parts = partsByPrefix.get(partPrefix(l.order_sku || l.sku, l.colour_code)!);
+    if (!parts || parts.size !== 1) continue;
+    l.supplier_sku = [...parts][0];
+    l.supplier_colour = l.colour_code;
+    l.supplier_inferred = true;
+  }
+}
+
+/** SKU, colour and full SKU for one spreadsheet row. Title is only used when there is no SKU at all. */
+export function sheetCells(l: Pick<ReorderLine, 'supplier_sku' | 'supplier_colour' | 'order_sku' | 'sku' | 'title' | 'colour_code'>): { sku: string; colour: string; full: string } {
+  if (l.supplier_sku) {
+    const colour = l.supplier_colour || '';
+    return { sku: l.supplier_sku, colour, full: colour ? `${l.supplier_sku}-${colour}` : l.supplier_sku };
+  }
+  const catalogue = l.order_sku && l.order_sku !== 'CUSTOM' ? l.order_sku : (l.sku && l.sku !== 'CUSTOM' ? l.sku : '');
+  const full = catalogue || l.title || 'CUSTOM';
+  const prefix = partPrefix(full, l.colour_code);
+  if (prefix) return { sku: prefix, colour: l.colour_code, full };
+  return { sku: full, colour: '', full };
 }
 
 type PackInfo = { title: string; supplier_sku: string | null; supplier_colour: string; inferred: boolean };
@@ -311,25 +377,21 @@ router.post('/send', authMiddleware, requirePermission('manage_orders'), async (
       return res.status(409).json({ error: 'Some rows no longer exist — refresh and try again' });
     }
 
-    // One row per supplier SKU + colour, quantities summed across the ticked order lines.
-    // No supplier part number: the line title stands in as the SKU so the row can still be emailed.
-    const grouped = new Map<string, { sku: string; colour: string; title: string; quantity: number; note: string }>();
+    // One row per full SKU, quantities summed across the ticked order lines.
+    const grouped = new Map<string, { sku: string; colour: string; title: string; full: string; quantity: number; note: string }>();
     for (const l of selected) {
-      const sku = l.supplier_sku || l.title || l.order_sku || l.sku;
-      const colour = l.supplier_sku ? l.supplier_colour : '';
-      const key = `${sku}|${colour}`;
-      const g = grouped.get(key);
+      const cells = sheetCells(l);
+      const g = grouped.get(cells.full);
       if (g) {
         g.quantity += l.quantity;
         if (l.note) g.note = l.note;
-      } else grouped.set(key, { sku, colour, title: l.title, quantity: l.quantity, note: l.note });
+      } else grouped.set(cells.full, { ...cells, title: l.title, quantity: l.quantity, note: l.note });
     }
     const sheetRows = [...grouped.values()].sort((a, b) => a.sku.localeCompare(b.sku) || a.colour.localeCompare(b.colour));
 
     const aoa: (string | number)[][] = [['SKU', 'Title', 'Colour', 'Full SKU', 'Quantity', 'Note']];
     for (const r of sheetRows) {
-      const full = r.colour ? `${r.sku}-${r.colour}` : r.sku;
-      aoa.push([safeCell(r.sku), safeCell(r.title), safeCell(r.colour), safeCell(full), r.quantity, safeCell(r.note)]);
+      aoa.push([safeCell(r.sku), safeCell(r.title), safeCell(r.colour), safeCell(r.full), r.quantity, safeCell(r.note)]);
     }
     const ws = XLSX.utils.aoa_to_sheet(aoa);
     ws['!cols'] = [{ wch: 40 }, { wch: 50 }, { wch: 14 }, { wch: 40 }, { wch: 10 }, { wch: 24 }];
