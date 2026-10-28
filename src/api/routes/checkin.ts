@@ -14,10 +14,13 @@
  */
 
 import express, { Response } from 'express';
-import { stockInUnits } from './stock-in.js';
-import { query } from '../../db/index.js';
+import { stockInUnits, getHoldingLocation, resolveColourCode } from './stock-in.js';
+import { query, getPool } from '../../db/index.js';
+import { toUuidOrNull } from './mobile.js';
 import { failedScansFor } from '../../lib/failed-scans.js';
 import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
+import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
+import { unblockBackorderedPickLists } from './pick-lists.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 
 async function enrichCheckinItems(items: any[]) {
@@ -373,35 +376,84 @@ router.post('/sessions/:id/complete', authMiddleware, async (req: AuthRequest, r
     const session = await query(`SELECT * FROM checkin_sessions WHERE id = $1`, [req.params.id]);
     if (!session.rows[0]) return res.status(404).json({ error: 'Session not found' });
 
-    await query(
-      `UPDATE checkin_sessions SET status = 'COMPLETE', completed_at = NOW(), updated_at = NOW() WHERE id = $1`,
-      [req.params.id]
-    );
-
-    if (session.rows[0].order_id) {
-      await query(
-        `UPDATE supplier_orders SET status = 'RECEIVED', received_at = NOW(), updated_at = NOW() WHERE id = $1`,
-        [session.rows[0].order_id]
-      );
+    if (session.rows[0].status === 'COMPLETE') {
+      return res.status(400).json({ error: 'Session is already complete' });
     }
 
-    // Move all scanned items to requires_location_queue
+    const holdingLocationId = await getHoldingLocation();
+    const userId = toUuidOrNull(req.user?.id);
     const items = await query(`SELECT * FROM checkin_items WHERE session_id = $1 AND removed_at IS NULL`, [req.params.id]);
+    const prepared: { sku: string; colourCode: string; qty: number; item: any }[] = [];
     for (const item of items.rows) {
-      await query(
-        `INSERT INTO requires_location_queue (session_id, order_id, nw_code, colour, medusa_sku, quantity, status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', NOW(), NOW())
-         ON CONFLICT DO NOTHING`,
-        [req.params.id, session.rows[0].order_id, item.nw_code, item.colour, item.medusa_sku, item.quantity_scanned]
-      );
+      const sku = item.medusa_sku || item.nw_code;
+      prepared.push({ sku, colourCode: await resolveColourCode(sku, item.colour), qty: item.quantity_scanned, item });
     }
+
+    const client = await getPool().connect();
+    const syncedSkus = new Set<string>();
+    try {
+      await client.query('BEGIN');
+      const locked = await client.query(`SELECT status FROM checkin_sessions WHERE id = $1 FOR UPDATE`, [req.params.id]);
+      if (locked.rows[0]?.status === 'COMPLETE') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Session is already complete' });
+      }
+      for (const p of prepared) {
+        await client.query(
+          `INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, 'Bisley', NOW(), NOW())
+           ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
+           DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()`,
+          [holdingLocationId, p.sku, p.colourCode, p.qty]
+        );
+        if (userId) {
+          await client.query(
+            `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, colour_code, quantity, notes, performed_by, checkin_session_id)
+             VALUES ('RECEIVE', $1, $2, $3, $4, 'Checked in to holding bay', $5, $6)`,
+            [holdingLocationId, p.sku, p.colourCode, p.qty, userId, req.params.id]
+          );
+        }
+        await client.query(
+          `INSERT INTO requires_location_queue (session_id, order_id, nw_code, colour, medusa_sku, quantity, location_id, status, assigned_by, assigned_at, stocked_at, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'STOCKED', $8, NOW(), NOW(), NOW(), NOW())`,
+          [req.params.id, session.rows[0].order_id, p.item.nw_code, p.item.colour, p.item.medusa_sku, p.qty, holdingLocationId, req.user?.email || 'warehouse']
+        );
+        syncedSkus.add(p.sku);
+      }
+      await client.query(
+        `UPDATE checkin_sessions SET status = 'COMPLETE', completed_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        [req.params.id]
+      );
+      if (session.rows[0].order_id) {
+        await client.query(
+          `UPDATE supplier_orders SET status = 'RECEIVED', received_at = NOW(), updated_at = NOW() WHERE id = $1`,
+          [session.rows[0].order_id]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (stockErr) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw stockErr;
+    } finally {
+      client.release();
+    }
+
+    for (const sku of syncedSkus) {
+      const totalResult = await query(
+        `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
+        [sku]
+      );
+      const newTotal = Math.max(0, parseInt(totalResult.rows[0]?.qty ?? '0') - parseInt(totalResult.rows[0]?.reserved ?? '0'));
+      await syncSkuToMedusa(sku, newTotal);
+    }
+    if (syncedSkus.size) await unblockBackorderedPickLists([...syncedSkus]);
 
     const summary = await query(
       `SELECT COUNT(*) as items, SUM(quantity_scanned) as units FROM checkin_items WHERE session_id = $1 AND removed_at IS NULL`,
       [req.params.id]
     );
 
-    res.json({ success: true, queued_for_location: items.rows.length, ...summary.rows[0] });
+    res.json({ success: true, queued_for_location: prepared.length, ...summary.rows[0] });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to complete session' });

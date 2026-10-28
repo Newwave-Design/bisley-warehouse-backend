@@ -43,21 +43,18 @@ export function stockInUnits(sku: string, title: string | null | undefined, ente
 const router = express.Router();
 const logger = getLogger('stock-in');
 
-/** Get or create default "Receiving" location for stock-in */
-async function getReceivingLocation(): Promise<string> {
+/** The bay every scanned receipt is assigned to until someone moves it. */
+export async function getHoldingLocation(): Promise<string> {
   const result = await query(
-    `SELECT id FROM warehouse_locations WHERE location_code = 'RECEIVING' LIMIT 1`
+    `SELECT id FROM warehouse_locations WHERE location_code = 'HOLDING' AND is_active = true LIMIT 1`
   );
-  if (result.rows[0]) {
-    return result.rows[0].id;
-  }
+  if (result.rows[0]) return result.rows[0].id;
 
-  // Create default RECEIVING location if it doesn't exist
   const created = await query(
     `INSERT INTO warehouse_locations (location_code, aisle_code, bay_code, bin_code, description)
-     VALUES ('RECEIVING', 'RCV', 'RCV', 'RCV', 'Default receiving bay for new stock')
-     RETURNING id`,
-    []
+     VALUES ('HOLDING', 'HLD', 'HLD', '01', 'Holding bay')
+     ON CONFLICT (location_code) DO UPDATE SET is_active = true, description = 'Holding bay', updated_at = NOW()
+     RETURNING id`
   );
   return created.rows[0].id;
 }
@@ -68,7 +65,7 @@ async function getReceivingLocation(): Promise<string> {
  * Resolve the real short code from wms_products; truncate as a last resort so the
  * insert never fails on a length constraint.
  */
-async function resolveColourCode(sku: string, checkinColour: string | null): Promise<string> {
+export async function resolveColourCode(sku: string, checkinColour: string | null): Promise<string> {
   const result = await query(
     `SELECT colour_code FROM wms_products WHERE variant_sku = $1 AND colour_code IS NOT NULL LIMIT 1`,
     [sku]
@@ -533,15 +530,14 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
 
     logger.info(`[stock-in] Confirming ${items.rows.length} items to warehouse from session ${sessionId}`);
 
-    // Get or create RECEIVING location
-    let receivingLocationId: string;
+    let holdingLocationId: string;
     try {
-      receivingLocationId = await getReceivingLocation();
-      logger.info(`[stock-in] Using receiving location: ${receivingLocationId}`);
+      holdingLocationId = await getHoldingLocation();
+      logger.info(`[stock-in] Using holding bay: ${holdingLocationId}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : JSON.stringify(err);
-      logger.error(`[stock-in] Failed to get receiving location: ${msg}`);
-      return res.status(500).json({ error: `Failed to get receiving location: ${msg}` });
+      logger.error(`[stock-in] Failed to get holding bay: ${msg}`);
+      return res.status(500).json({ error: `Failed to get holding bay: ${msg}` });
     }
 
     const defaultLiability = 'Bisley';
@@ -574,13 +570,13 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
            ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
            DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()
            RETURNING id, quantity`,
-          [receivingLocationId, p.sku, p.colourCode, p.qty, defaultLiability]
+          [holdingLocationId, p.sku, p.colourCode, p.qty, defaultLiability]
         );
         if (!upsert.rows[0]) throw new Error(`Insert returned no rows for ${p.sku}`);
         await client.query(
           `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, colour_code, quantity, notes, performed_by, checkin_session_id)
            VALUES ('RECEIVE', $1, $2, $3, $4, 'Stock-in confirmed', $5, $6)`,
-          [receivingLocationId, p.sku, p.colourCode, p.qty, userId, sessionId]
+          [holdingLocationId, p.sku, p.colourCode, p.qty, userId, sessionId]
         );
         syncedSkus.add(p.sku);
         stocked++;
