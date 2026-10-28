@@ -1604,4 +1604,37 @@ FROM (
 WHERE a.id = f.id AND a.week_start <> f.wk
   AND NOT EXISTS (SELECT 1 FROM settlement_weeks s WHERE s.week_start = a.week_start AND s.locked_at IS NOT NULL);
 
+-- Customer-service knowledge base. Articles are the reusable answers.
+-- Spare parts are a classification of a SKU: stock quantity stays on warehouse_inventory.
+CREATE TABLE IF NOT EXISTS knowledge_articles (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title VARCHAR(200) NOT NULL,
+  question TEXT,
+  answer TEXT NOT NULL,
+  category VARCHAR(40) NOT NULL DEFAULT 'common_query',
+  tags TEXT[] NOT NULL DEFAULT '{}',
+  related_skus TEXT[] NOT NULL DEFAULT '{}',
+  is_published BOOLEAN NOT NULL DEFAULT true,
+  created_by VARCHAR(255),
+  updated_by VARCHAR(255),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_articles_updated ON knowledge_articles(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS spare_parts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  sku VARCHAR(100) NOT NULL UNIQUE,
+  title VARCHAR(255) NOT NULL,
+  description TEXT,
+  image_url VARCHAR(500),
+  notes TEXT,
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  created_by VARCHAR(255),
+  updated_by VARCHAR(255),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_spare_parts_active ON spare_parts(is_active, sku);
+
 `;

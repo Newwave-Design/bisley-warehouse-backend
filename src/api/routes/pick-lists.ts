@@ -758,24 +758,31 @@ router.post('/:pickListId/notes', authMiddleware, async (req: AuthRequest, res: 
 
 /**
  * PATCH /api/pick-lists/:pickListId/notes/:noteId
- * Raises or clears a flag, and resolves or reopens it. Body: { is_flagged?: boolean, resolved?: boolean }
+ * Edits the note text, raises or clears a flag, and resolves or reopens it.
+ * Body: { note_text?: string, is_flagged?: boolean, resolved?: boolean }
  */
 router.patch('/:pickListId/notes/:noteId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { pickListId, noteId } = req.params;
     const isFlagged = req.body?.is_flagged;
     const resolved = req.body?.resolved;
+    const hasNoteText = req.body?.note_text !== undefined;
+    const noteText = hasNoteText && typeof req.body.note_text === 'string' ? req.body.note_text.trim() : '';
     if (isFlagged !== undefined && typeof isFlagged !== 'boolean') return res.status(400).json({ error: 'is_flagged must be a boolean' });
     if (resolved !== undefined && typeof resolved !== 'boolean') return res.status(400).json({ error: 'resolved must be a boolean' });
+    if (hasNoteText && !noteText) return res.status(400).json({ error: 'note_text cannot be empty' });
+    if (noteText.length > 2000) return res.status(400).json({ error: 'note_text must be 2000 characters or fewer' });
+    if (!hasNoteText && isFlagged === undefined && resolved === undefined) return res.status(400).json({ error: 'Nothing to update' });
 
     const result = await query(
       `UPDATE pick_list_notes SET
+         note_text = COALESCE($6, note_text),
          is_flagged = COALESCE($3::boolean, is_flagged),
          resolved_at = CASE WHEN $4::boolean IS NULL THEN resolved_at WHEN $4::boolean THEN NOW() ELSE NULL END,
          resolved_by = CASE WHEN $4::boolean IS NULL THEN resolved_by WHEN $4::boolean THEN $5 ELSE NULL END
        WHERE id = $1 AND pick_list_id = $2
        RETURNING *`,
-      [noteId, pickListId, isFlagged ?? null, resolved ?? null, req.user?.email ?? null]
+      [noteId, pickListId, isFlagged ?? null, resolved ?? null, req.user?.email ?? null, hasNoteText ? noteText : null]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Note not found' });
     return res.json({ note: result.rows[0] });
