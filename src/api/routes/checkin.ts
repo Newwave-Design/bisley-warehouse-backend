@@ -19,7 +19,6 @@ import { query, getPool } from '../../db/index.js';
 import { toUuidOrNull } from './mobile.js';
 import { failedScansFor } from '../../lib/failed-scans.js';
 import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
-import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 
@@ -438,14 +437,6 @@ router.post('/sessions/:id/complete', authMiddleware, async (req: AuthRequest, r
       client.release();
     }
 
-    for (const sku of syncedSkus) {
-      const totalResult = await query(
-        `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
-        [sku]
-      );
-      const newTotal = Math.max(0, parseInt(totalResult.rows[0]?.qty ?? '0') - parseInt(totalResult.rows[0]?.reserved ?? '0'));
-      await syncSkuToMedusa(sku, newTotal);
-    }
     if (syncedSkus.size) await unblockBackorderedPickLists([...syncedSkus]);
 
     const summary = await query(
