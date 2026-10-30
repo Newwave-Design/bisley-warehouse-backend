@@ -17,6 +17,7 @@ import { paidSql } from '../../lib/payment-status.js';
 import { COLOUR_NAMES, enrichSampleItems, extractColourCode, sampleColourList } from '../../lib/colour-names.js';
 import { formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
+import { attachPackaging } from '../../lib/pick-list-packaging.js';
 
 const router = express.Router();
 
@@ -273,7 +274,12 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
 
     const result = await query(`
       SELECT
-        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.customer_name, pl.shipping_address,
+        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at,
+        COALESCE(
+          (SELECT parent.created_at FROM pick_lists parent WHERE parent.id = pl.parent_pick_list_id),
+          pl.created_at
+        ) AS order_date,
+        pl.customer_name, pl.shipping_address,
         EXISTS (SELECT 1 FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL) AS has_flag,
         (SELECT LEFT(pln.note_text, 120) FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL ORDER BY pln.created_at DESC LIMIT 1) AS flag_preview,
         COUNT(pli.id)::int                                                     AS total_items,
@@ -290,8 +296,7 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
       WHERE pl.is_archived = false AND ${paidSql('pl')} AND ($1::text[] IS NULL OR pl.status = ANY($1::text[]))
       ${sampleClause}
       GROUP BY pl.id
-      ORDER BY pl.created_at ${orderDir}
-      LIMIT 100
+      ORDER BY order_date ${orderDir}
     `, [statuses]);
     const dues = await getDeliveryDues(result.rows.map((r: any) => r.id));
     res.json({
@@ -307,6 +312,31 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
     res.status(500).json({ error: 'Failed to load pick lists' });
   }
 });
+
+/** Packaging for the sold line and for each kit component, using the same Stock → Packaging records as desktop. */
+async function attachMobilePackaging(rows: any[]) {
+  const targets: { sku: string; quantity_required: number; target: any }[] = [];
+  for (const item of rows) {
+    targets.push({
+      sku: item.product_sku || '',
+      quantity_required: Number(item.quantity_required) || 0,
+      target: item,
+    });
+    if (!Array.isArray(item.kit_components)) continue;
+    for (const comp of item.kit_components) {
+      if (!comp?.sku || comp.sku === item.product_sku) continue;
+      targets.push({
+        sku: comp.sku,
+        quantity_required: (Number(comp.required_quantity) || 1) * (Number(item.quantity_required) || 1),
+        target: comp,
+      });
+    }
+  }
+  const [packed] = await attachPackaging([targets.map(row => ({ sku: row.sku, quantity_required: row.quantity_required }))]);
+  packed.forEach((row, index) => {
+    if (row.packaging) targets[index].target.packaging = row.packaging;
+  });
+}
 
 /** GET /api/mobile/pick-lists/:id — pick list detail with product thumbnails, customer info, and kit components */
 router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
@@ -374,9 +404,11 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
         list.push({ location_code: b.location_code, qty: b.quantity });
         baysBySku.set(b.product_sku, list);
       }
-      for (const item of items.rows) {
-        if (!Array.isArray(item.kit_components)) continue;
-        item.kit_components = item.kit_components.map((c: any) => {
+    for (const item of items.rows) {
+      if (!Array.isArray(item.kit_components)) continue;
+      item.kit_components = item.kit_components
+        .filter((c: any) => c?.sku && c.sku !== item.product_sku)
+        .map((c: any) => {
           const p: any = infoBySku.get(c.sku);
           const code = extractColourCode(c.sku);
           return {
@@ -388,8 +420,14 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
             stock_locations: baysBySku.get(c.sku) ?? [],
           };
         });
+      if (!item.kit_components.length) {
+        item.is_kit = false;
+        item.kit_components = null;
       }
     }
+    }
+
+    await attachMobilePackaging(items.rows);
 
     const due = (await getDeliveryDues([req.params.id]))[req.params.id] ?? null;
     // Unresolved flags, full text, so the picker can read them before handling the order

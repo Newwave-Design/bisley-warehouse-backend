@@ -20,6 +20,7 @@ import { COLOUR_NAMES, enrichSampleItems, extractColourCode, isSampleSku, sample
 import { actorName, PICK_LIST_STATUSES, recordPickListEvents, type PickListStatus } from '../../lib/pick-list-events.js';
 import { fulfillPickListInMedusa, fulfillPickListsInMedusa } from '../../lib/medusa-fulfillment.js';
 import { buildSampleAddressZpl, formatSampleAddressLabel, formatShippingAddressText } from '../../lib/sample-address-label.js';
+import { attachPackaging } from '../../lib/pick-list-packaging.js';
 
 const router = express.Router();
 
@@ -37,8 +38,66 @@ function formatPickListOverview(items: any[] | null | undefined) {
       colour,
       quantity_required: Number(item.quantity_required) || 0,
       quantity_picked: Number(item.quantity_picked) || 0,
+      thumbnail: item.variant_thumbnail || item.product_thumbnail || null,
     };
   });
+}
+
+/** Replace kit lines with the pieces to pick. The kit SKU itself is not a pick. */
+async function expandKitPicksByList<T extends { sku: string; quantity_required: number; quantity_picked: number }>(groups: T[][]): Promise<T[][]> {
+  const skus = [...new Set(groups.flat().map(i => i.sku).filter(Boolean))];
+  if (!skus.length) return groups;
+  const kits = await query(
+    `SELECT DISTINCT ON (variant_sku) variant_sku, is_kit, kit_components
+     FROM wms_products WHERE variant_sku = ANY($1::text[])
+     ORDER BY variant_sku, is_archived`,
+    [skus]
+  );
+  const bySku = new Map(kits.rows.map((r: { variant_sku: string }) => [r.variant_sku, r]));
+  const componentSkus = new Set<string>();
+  for (const row of kits.rows as { variant_sku: string; is_kit: boolean; kit_components: { sku?: string }[] }[]) {
+    if (!row.is_kit || !Array.isArray(row.kit_components)) continue;
+    for (const c of row.kit_components) {
+      if (c?.sku && c.sku !== row.variant_sku) componentSkus.add(c.sku);
+    }
+  }
+  const info = new Map<string, { product_title: string; colour_name: string; colour_code: string; variant_thumbnail: string; product_thumbnail: string }>();
+  if (componentSkus.size) {
+    const found = await query(
+      `SELECT DISTINCT ON (variant_sku) variant_sku, product_title, colour_name, colour_code, variant_thumbnail, product_thumbnail
+       FROM wms_products WHERE variant_sku = ANY($1::text[])
+       ORDER BY variant_sku, is_archived`,
+      [[...componentSkus]]
+    );
+    for (const row of found.rows) info.set(row.variant_sku, row);
+  }
+  return groups.map(items => items.flatMap(item => {
+    const kit = bySku.get(item.sku) as { is_kit?: boolean; kit_components?: { sku?: string; required_quantity?: number }[] } | undefined;
+    const parts = (kit?.is_kit && Array.isArray(kit.kit_components) ? kit.kit_components : [])
+      .filter(c => c?.sku && c.sku !== item.sku);
+    if (!parts.length) return [item];
+    const header = { ...item, kit_header: true };
+    return [header, ...parts.map(c => {
+      const meta = info.get(c.sku as string);
+      const per = Number(c.required_quantity) || 1;
+      const code = (meta?.colour_code || extractColourCode(c.sku as string) || '').toLowerCase();
+      const colourName = meta?.colour_name || COLOUR_NAMES[code] || '';
+      const colour = code && colourName && colourName.toLowerCase() !== code
+        ? `${colourName} (${code})`
+        : (colourName || code || '');
+      return {
+        ...item,
+        title: meta?.product_title || c.sku,
+        sku: c.sku,
+        colour_code: code || null,
+        colour,
+        quantity_required: item.quantity_required * per,
+        quantity_picked: item.quantity_picked * per,
+        thumbnail: meta?.variant_thumbnail || meta?.product_thumbnail || null,
+        kit_part: true,
+      };
+    })];
+  }));
 }
 
 /** GET /api/pick-lists/sandbox — list only sandbox pick lists (must be before /:pickListId) */
@@ -72,12 +131,101 @@ const UNFULFILLED_STATUSES = ['PENDING', 'IN_PROGRESS', 'PICKED', 'PACKING', 'PA
  * Helper: Calculate stock availability for a pick list
  * Returns { total_required, total_available, items_with_shortage, progress_percent }
  */
+async function explodeKitStockLines(items: { product_sku: string; quantity_required: number; quantity_picked: number }[]) {
+  const skus = [...new Set(items.map(i => i.product_sku).filter(Boolean))];
+  if (!skus.length) return items;
+  const kits = await query(
+    `SELECT DISTINCT ON (variant_sku) variant_sku, is_kit, kit_components
+     FROM wms_products WHERE variant_sku = ANY($1::text[])
+     ORDER BY variant_sku, is_archived`,
+    [skus]
+  );
+  const bySku = new Map(kits.rows.map((r: { variant_sku: string }) => [r.variant_sku, r]));
+  return items.flatMap(item => {
+    const kit = bySku.get(item.product_sku) as { is_kit?: boolean; kit_components?: { sku?: string; required_quantity?: number }[] } | undefined;
+    const parts = (kit?.is_kit && Array.isArray(kit.kit_components) ? kit.kit_components : [])
+      .filter(c => c?.sku && c.sku !== item.product_sku);
+    if (!parts.length) return [item];
+    return parts.map(c => {
+      const per = Number(c.required_quantity) || 1;
+      return {
+        product_sku: c.sku as string,
+        quantity_required: Number(item.quantity_required) * per,
+        quantity_picked: Number(item.quantity_picked) * per,
+      };
+    });
+  });
+}
+
+/** Detail page rows: a kit stays as a heading, and the pick rows are its components with their own stock. */
+async function expandDetailKitItems(items: any[]) {
+  const skus = [...new Set(items.map(i => i.product_sku).filter(Boolean))];
+  if (!skus.length) return items;
+  const kits = await query(
+    `SELECT DISTINCT ON (variant_sku) variant_sku, is_kit, kit_components
+     FROM wms_products WHERE variant_sku = ANY($1::text[])
+     ORDER BY variant_sku, is_archived`,
+    [skus]
+  );
+  const bySku = new Map(kits.rows.map((r: { variant_sku: string }) => [r.variant_sku, r]));
+  const componentSkus = new Set<string>();
+  for (const row of kits.rows as { variant_sku: string; is_kit: boolean; kit_components: { sku?: string }[] }[]) {
+    if (!row.is_kit || !Array.isArray(row.kit_components)) continue;
+    for (const c of row.kit_components) {
+      if (c?.sku && c.sku !== row.variant_sku) componentSkus.add(c.sku);
+    }
+  }
+  const info = new Map<string, any>();
+  if (componentSkus.size) {
+    const found = await query(
+      `SELECT DISTINCT ON (wp.variant_sku)
+              wp.variant_sku, wp.product_title, wp.colour_name, wp.colour_code,
+              COALESCE(SUM(wi.quantity), 0)::int AS available_stock,
+              (ARRAY_AGG(wl.location_code ORDER BY wi.quantity DESC NULLS LAST))[1] AS location_code
+       FROM wms_products wp
+       LEFT JOIN warehouse_inventory wi ON wi.product_sku = wp.variant_sku
+       LEFT JOIN warehouse_locations wl ON wl.id = wi.location_id
+       WHERE wp.variant_sku = ANY($1::text[])
+       GROUP BY wp.variant_sku, wp.product_title, wp.colour_name, wp.colour_code, wp.is_archived
+       ORDER BY wp.variant_sku, wp.is_archived`,
+      [[...componentSkus]]
+    );
+    for (const row of found.rows) info.set(row.variant_sku, row);
+  }
+  return items.flatMap(item => {
+    const kit = bySku.get(item.product_sku) as { is_kit?: boolean; kit_components?: { sku?: string; required_quantity?: number }[] } | undefined;
+    const parts = (kit?.is_kit && Array.isArray(kit.kit_components) ? kit.kit_components : [])
+      .filter(c => c?.sku && c.sku !== item.product_sku);
+    if (!parts.length) return [item];
+    const header = { ...item, kit_header: true, available_stock: null };
+    return [header, ...parts.map(c => {
+      const meta = info.get(c.sku as string);
+      const per = Number(c.required_quantity) || 1;
+      return {
+        ...item,
+        id: `${item.id}:${c.sku}`,
+        pick_item_id: item.id,
+        product_sku: c.sku,
+        product_title: meta?.product_title || c.sku,
+        colour_name: meta?.colour_name || null,
+        colour_code: meta?.colour_code || extractColourCode(c.sku as string),
+        quantity_required: Number(item.quantity_required) * per,
+        quantity_picked: Number(item.quantity_picked) * per,
+        available_stock: Number(meta?.available_stock) || 0,
+        location_code: item.location_code || meta?.location_code || null,
+        kit_part: true,
+        kit_header: false,
+      };
+    })];
+  });
+}
+
 async function getPickListStockStatus(pickListId: string) {
   const itemsResult = await query(
     `SELECT product_sku, quantity_required, quantity_picked FROM pick_list_items WHERE pick_list_id = $1`,
     [pickListId]
   );
-  const items = itemsResult.rows;
+  const items = await explodeKitStockLines(itemsResult.rows);
   
   let totalRequired = 0;
   let totalAvailable = 0;
@@ -125,8 +273,8 @@ async function getPickListStockStatus(pickListId: string) {
  *   search=smith                 matches customer name/email, pick list number or Medusa order id
  *   sku=H2910NL-av1              only pick lists containing this SKU (also returns per-line qty for it)
  *   sample=true                  only pick lists with a sample line (SKU contains SAMPLE); adds sample_item_count / sample_items_picked
- *   sort=asc|desc                default asc (oldest-first picking queue); Customer Orders view uses desc
- *   limit=50&offset=0
+ *   sort=asc|desc                default asc (oldest-first by pick-list created time); Customer Orders view uses desc
+ *   limit=50&offset=0            limit=0 returns every matching list (desktop pick lists)
  *   include_values=true          adds order_value { gross, net, vat, refunded, currency } per list (live from Medusa)
  *   payment=all                  include orders that are not paid yet (default: paid orders only)
  */
@@ -175,8 +323,12 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const orderDir = (sort as string)?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
     const countParams = params.slice();
-
-    params.push(parseInt(limit as string), parseInt(offset as string));
+    const unlimited = String(limit) === '0';
+    let pageSql = '';
+    if (!unlimited) {
+      params.push(parseInt(limit as string) || 50, parseInt(offset as string) || 0);
+      pageSql = `LIMIT $${params.length - 1} OFFSET $${params.length}`;
+    }
 
     const result = await query(
       `SELECT 
@@ -185,6 +337,10 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.medusa_order_id,
          pl.status,
          pl.created_at,
+         COALESCE(
+           (SELECT parent.created_at FROM pick_lists parent WHERE parent.id = pl.parent_pick_list_id),
+           pl.created_at
+         ) AS order_date,
          pl.customer_name,
          pl.customer_email,
          pl.shipping_method_name,
@@ -206,7 +362,9 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
            'colour_code', pli.colour_code,
            'item_title', COALESCE(wp.product_title, pli.item_title),
            'quantity_required', pli.quantity_required,
-           'quantity_picked', pli.quantity_picked
+           'quantity_picked', pli.quantity_picked,
+           'variant_thumbnail', wp.variant_thumbnail,
+           'product_thumbnail', wp.product_thumbnail
          ) ORDER BY pli.line_number) FILTER (WHERE pli.id IS NOT NULL) AS items
          ${skuParamIndex > 0 ? `, MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_required END) as sku_quantity_required
                  , MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_picked END) as sku_quantity_picked` : ''}
@@ -216,7 +374,7 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
        ${whereClause}
        GROUP BY pl.id
        ORDER BY pl.created_at ${orderDir}
-       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+       ${pageSql}`,
       params
     );
 
@@ -230,13 +388,16 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
       ? await getOrderValues(result.rows.map((pl: any) => pl.medusa_order_id))
       : null;
     const dues = await getDeliveryDues(result.rows.map((pl: any) => pl.id));
+    const includeStock = String(req.query.include_stock) === 'true';
+    const expandedItems = await attachPackaging(await expandKitPicksByList(result.rows.map((pl: any) => formatPickListOverview(pl.items))));
     const enrichedPickLists = await Promise.all(
-      result.rows.map(async (pl: any) => ({
+      result.rows.map(async (pl: any, index: number) => ({
         ...pl,
-        items: formatPickListOverview(pl.items),
+        items: expandedItems[index],
+        item_count: expandedItems[index].filter((item: { kit_header?: boolean }) => !item.kit_header).length,
         sample_colours: sampleColourList(pl.items),
         due: dues[pl.id] ?? null,
-        stock_status: await getPickListStockStatus(pl.id),
+        ...(includeStock ? { stock_status: await getPickListStockStatus(pl.id) } : {}),
         ...(values ? { order_value: values[pl.medusa_order_id] ?? null } : {}),
       }))
     );
@@ -244,8 +405,8 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
     return res.json({
       pickLists: enrichedPickLists,
       total: countResult.rows[0]?.total ?? result.rows.length,
-      limit: parseInt(limit as string),
-      offset: parseInt(offset as string),
+      limit: unlimited ? 0 : parseInt(limit as string),
+      offset: unlimited ? 0 : parseInt(offset as string),
     });
   } catch (error) {
     console.error('Pick list fetch error:', error);
@@ -711,12 +872,20 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
 
     enrichSampleItems(itemsResult.rows);
     pickList.address_text = formatShippingAddressText(pickList.shipping_address, pickList.customer_name);
+    const expanded = await expandDetailKitItems(itemsResult.rows);
+    const [items] = await attachPackaging([
+      expanded.map((item: { product_sku?: string; quantity_required?: number }) => ({
+        ...item,
+        sku: item.product_sku || '',
+        quantity_required: Number(item.quantity_required) || 0,
+      })),
+    ]);
 
     return res.json({
       pickList,
       due,
       stock_status: stockStatus,
-      items: itemsResult.rows,
+      items,
       packages: packagesResult.rows,
       parentPickList: parentResult.rows[0] ?? null,
       childPickLists: childrenResult.rows,
