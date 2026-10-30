@@ -343,6 +343,7 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          ) AS order_date,
          pl.customer_name,
          pl.customer_email,
+         pl.shipping_address,
          pl.shipping_method_name,
          pl.dispatched_at,
          pl.is_archived,
