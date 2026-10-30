@@ -1637,4 +1637,24 @@ CREATE TABLE IF NOT EXISTS spare_parts (
 );
 CREATE INDEX IF NOT EXISTS idx_spare_parts_active ON spare_parts(is_active, sku);
 
+-- Re-orders v2. The buying list is still calculated from paid orders.
+-- A line leaves that list when the old spreadsheet send already includes it, or when someone marks it sent to Chris.
+-- trigger_quantity is the on-hand level at or below which the SKU needs reordering. Blank means no trigger.
+CREATE TABLE IF NOT EXISTS reorder_v2_line_marks (
+  pick_list_item_id UUID NOT NULL,
+  sku VARCHAR(100) NOT NULL,
+  sent_to_chris_at TIMESTAMP,
+  sent_to_chris_by VARCHAR(255),
+  PRIMARY KEY (pick_list_item_id, sku)
+);
+
+CREATE TABLE IF NOT EXISTS reorder_v2_sku_flags (
+  sku VARCHAR(100) PRIMARY KEY,
+  do_not_reorder BOOLEAN NOT NULL DEFAULT false,
+  trigger_quantity INTEGER,
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_by VARCHAR(255)
+);
+ALTER TABLE reorder_v2_sku_flags ADD COLUMN IF NOT EXISTS trigger_quantity INTEGER;
+
 `;

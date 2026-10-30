@@ -83,10 +83,26 @@ export function partPrefix(sku: string, colourCode: string): string | null {
   return prefix || null;
 }
 
-/** Part code typed on a custom line, e.g. "Replacement lock PLKCSYT10/34 (Tambour)". */
+/** Part code typed on a custom line.
+ *  Slash codes such as PLKCSYT10/34 are unchanged.
+ *  Other codes are the uppercase token in the title, with or without digits: P400496P2, PTRKCASTW.
+ *  A code that is only inside brackets still counts, e.g. (PFBBSPSFP1).
+ *  When one code sits outside the brackets, it wins over a model mentioned inside.
+ */
 export function customPartCode(title: string): string | null {
-  const match = title.toUpperCase().match(/\b(?=[A-Z0-9.]*\d)[A-Z][A-Z0-9.]*(?:\/[A-Z0-9.]+)+\b/);
-  return match?.[0] ?? null;
+  const slash = title.toUpperCase().match(/\b(?=[A-Z0-9.]*\d)[A-Z][A-Z0-9.]*(?:\/[A-Z0-9.]+)+\b/);
+  if (slash) return slash[0];
+
+  const found: { code: string; inParen: boolean }[] = [];
+  for (const m of title.matchAll(/\b[A-Z][A-Z0-9]{4,}\b/g)) {
+    const before = title.slice(0, m.index ?? 0);
+    found.push({ code: m[0], inParen: before.lastIndexOf('(') > before.lastIndexOf(')') });
+  }
+  const outside = found.filter(t => !t.inParen);
+  const pool = outside.length ? outside : found;
+  if (!pool.length) return null;
+  pool.sort((a, b) => b.code.length - a.code.length);
+  return pool[0].code;
 }
 
 function isChargeTitle(title: string): boolean {
@@ -324,7 +340,7 @@ router.get('/', authMiddleware, requirePermission('manage_orders'), async (_req:
 
     res.json({
       lines: lines.map(l => {
-        const s = sentByKey.get(l.key);
+        const s = sentByKey.get(l.key) ?? sentByKey.get(`${l.pick_list_item_id}|CUSTOM`);
         return {
           ...l,
           sent_at: s ? new Date(s.sent_at).toISOString() : null,
