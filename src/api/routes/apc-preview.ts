@@ -154,11 +154,24 @@ function collectionDateOf(value: unknown): string {
   return nextCollectionDate();
 }
 
+function fieldErrors(entry: any): string[] {
+  const fields = asList<any>(entry?.ErrorFields?.ErrorField || entry?.ErrorFields);
+  return fields.map((field) => {
+    const name = text(field?.FieldName).trim();
+    const message = text(field?.ErrorMessage || field?.Description).trim();
+    if (!message) return '';
+    return name ? `${name}: ${message}` : message;
+  }).filter(Boolean);
+}
+
 function apcMessages(node: any): { ok: boolean; detail: string } {
   const raw = node?.Messages?.Message || node?.Messages;
   const list = asList<any>(raw).filter((entry) => entry && (entry.Code || entry.Description || typeof entry === 'string'));
   const codes = list.map((entry) => text(entry?.Code).toUpperCase());
-  const detail = list.map((entry) => text(entry?.Description || entry)).filter(Boolean).join(' ');
+  const detail = list.flatMap((entry) => {
+    const description = text(entry?.Description || (typeof entry === 'string' ? entry : '')).trim();
+    return [description, ...fieldErrors(entry)].filter(Boolean);
+  }).join('. ');
   const ok = !codes.length || codes.every((code) => ['', '0', '00', 'SUCCESS', 'OK'].includes(code));
   return { ok, detail };
 }
@@ -220,7 +233,8 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     const list = found.rows[0] as { pick_list_number?: string; customer_name?: string; customer_email?: string; shipping_address?: any } | undefined;
     if (!list) return res.status(404).json({ error: 'Unknown order' });
 
-    const skus = [...new Set(pieces.map((piece) => piece.sku).filter(Boolean))];
+    const requestedSkus = [...new Set(asList<any>(req.body?.skus).map((sku) => text(sku).trim()).filter(Boolean))];
+    const skus = requestedSkus.length ? requestedSkus : [...new Set(pieces.map((piece) => piece.sku).filter(Boolean))];
     if (skus.length) {
       const already = await query(
         `SELECT sku FROM collection_bookings
@@ -294,6 +308,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     const message = order ? apcMessages(order) : { ok: false, detail: '' };
     const waybill = order ? findWaybill(order) : '';
     if (!response.ok || !payload || !message.ok) {
+      console.error('APC rejected the collection', message.detail || response.status);
       return res.status(502).json({ error: message.detail || 'APC did not accept the collection. Nothing was saved.' });
     }
     if (!waybill) {
