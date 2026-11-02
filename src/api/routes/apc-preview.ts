@@ -1,14 +1,24 @@
 /**
- * Local preview of an APC collection quote.
- * Calls the live service check only. There is no booking call.
+ * APC collection quote and booking.
+ * A quote only asks which services can collect. Book collection creates the consignment.
  */
 
 import express, { Response } from 'express';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
-import { query } from '../../db/index.js';
+import { getPool, query } from '../../db/index.js';
 
 const router = express.Router();
 const QUOTE_URL = 'https://apc.hypaship.com/api/3.0/ServiceAvailability.json';
+const ORDER_URL = 'https://apc.hypaship.com/api/3.0/Orders.json';
+const COLLECTION = {
+  CompanyName: 'Ovara',
+  AddressLine1: 'Unit B7A, Brecon House',
+  AddressLine2: 'Mamhilad Park Estate',
+  PostalCode: 'NP4 0HZ',
+  City: 'Pontypool',
+  County: 'Torfaen',
+  CountryCode: 'GB',
+};
 
 interface PieceInput {
   weightKg?: number | string;
@@ -138,11 +148,203 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
   }
 });
 
-router.post('/book', (_req, res: Response) => {
-  res.status(403).json({
-    booked: false,
-    error: 'Booking is switched off on this preview. Nothing was sent to APC.',
-  });
+function collectionDateOf(value: unknown): string {
+  const raw = text(value).trim();
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(raw)) return raw;
+  return nextCollectionDate();
+}
+
+function apcMessages(node: any): { ok: boolean; detail: string } {
+  const raw = node?.Messages?.Message || node?.Messages;
+  const list = asList<any>(raw).filter((entry) => entry && (entry.Code || entry.Description || typeof entry === 'string'));
+  const codes = list.map((entry) => text(entry?.Code).toUpperCase());
+  const detail = list.map((entry) => text(entry?.Description || entry)).filter(Boolean).join(' ');
+  const ok = !codes.length || codes.every((code) => ['', '0', '00', 'SUCCESS', 'OK'].includes(code));
+  return { ok, detail };
+}
+
+function findWaybill(order: any): string {
+  const direct = text(order?.WayBill || order?.Waybill || order?.CarrierWaybill).trim();
+  if (direct) return direct;
+  for (const depot of asList<any>(order?.Depots?.Depot)) {
+    const value = text(depot?.Waybill || depot?.WayBill).trim();
+    if (value) return value;
+  }
+  return '';
+}
+
+function deliveryFrom(row: { customer_name?: string; customer_email?: string; shipping_address?: any }) {
+  const address = row.shipping_address || {};
+  const person = text(`${address.first_name || ''} ${address.last_name || ''}`).trim() || text(row.customer_name).trim();
+  const company = text(address.company).trim();
+  return {
+    company: company || person,
+    person,
+    email: text(row.customer_email || address.email).trim(),
+    phone: text(address.phone).trim(),
+    line1: text(address.address_1).trim(),
+    line2: text(address.address_2).trim(),
+    city: text(address.city).trim(),
+    county: text(address.province).trim(),
+    postcode: text(address.postal_code).trim().toUpperCase(),
+    country: text(address.country_code, 'GB').trim().toUpperCase() || 'GB',
+  };
+}
+
+router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const remoteUser = authHeader();
+  if (!remoteUser) return res.status(500).json({ error: 'APC login is not configured' });
+
+  const pickListId = text(req.body?.pickListId).trim();
+  if (!/^[0-9a-f-]{36}$/i.test(pickListId)) return res.status(400).json({ error: 'Choose an order to book' });
+  const serviceCode = text(req.body?.serviceCode).trim();
+  const serviceName = text(req.body?.serviceName).trim().slice(0, 120);
+  if (!serviceCode) return res.status(400).json({ error: 'Choose an APC service' });
+
+  const pieces = asList<any>(req.body?.pieces).slice(0, 20).map((piece) => ({
+    sku: text(piece?.sku).trim(),
+    title: text(piece?.title).trim().slice(0, 160),
+    weightKg: text(piece?.weightKg).trim(),
+    lengthCm: text(piece?.lengthCm).trim(),
+    widthCm: text(piece?.widthCm).trim(),
+    heightCm: text(piece?.heightCm).trim(),
+  })).filter((piece) => piece.weightKg && piece.lengthCm && piece.widthCm && piece.heightCm);
+  if (!pieces.length) return res.status(400).json({ error: 'Add at least one box' });
+
+  try {
+    const found = await query(
+      `SELECT id, pick_list_number, customer_name, customer_email, shipping_address
+         FROM pick_lists WHERE id = $1`,
+      [pickListId]
+    );
+    const list = found.rows[0] as { pick_list_number?: string; customer_name?: string; customer_email?: string; shipping_address?: any } | undefined;
+    if (!list) return res.status(404).json({ error: 'Unknown order' });
+
+    const skus = [...new Set(pieces.map((piece) => piece.sku).filter(Boolean))];
+    if (skus.length) {
+      const already = await query(
+        `SELECT sku FROM collection_bookings
+          WHERE pick_list_id = $1 AND sku = ANY($2::text[]) AND status <> 'cancelled'`,
+        [pickListId, skus]
+      );
+      if (already.rows.length) return res.status(409).json({ error: 'One of these items already has a collection' });
+    }
+
+    const delivery = deliveryFrom(list);
+    if (!['GB', 'UK'].includes(delivery.country)) {
+      return res.status(400).json({ error: 'APC collections are only booked to a UK address' });
+    }
+    if (!delivery.line1 || !delivery.city || !delivery.postcode || !delivery.company) {
+      return res.status(400).json({ error: 'This order needs a name, street, city and postcode before it can be booked' });
+    }
+
+    const items = pieces.map((piece) => ({
+      Type: 'ALL',
+      Weight: piece.weightKg,
+      Length: piece.lengthCm,
+      Width: piece.widthCm,
+      Height: piece.heightCm,
+      Reference: (piece.sku || piece.title || 'Box').slice(0, 30),
+    }));
+    const reference = text(list.pick_list_number).trim().slice(0, 20);
+    const contact: Record<string, string> = {};
+    if (delivery.person) contact.PersonName = delivery.person;
+    if (delivery.phone) contact.PhoneNumber = delivery.phone;
+    if (delivery.email) contact.Email = delivery.email;
+
+    const response = await fetch(ORDER_URL, {
+      method: 'POST',
+      headers: {
+        'remote-user': remoteUser,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        Orders: {
+          Order: {
+            CollectionDate: collectionDateOf(req.body?.collectionDate),
+            ReadyAt: '09:00',
+            ClosedAt: '17:00',
+            ProductCode: serviceCode,
+            Reference: reference,
+            Collection: COLLECTION,
+            Delivery: {
+              CompanyName: delivery.company,
+              AddressLine1: delivery.line1,
+              AddressLine2: delivery.line2,
+              PostalCode: delivery.postcode,
+              City: delivery.city,
+              County: delivery.county,
+              CountryCode: 'GB',
+              ...(Object.keys(contact).length ? { Contact: contact } : {}),
+            },
+            GoodsInfo: { GoodsValue: '50', Fragile: 'false' },
+            ShipmentDetails: {
+              NumberOfPieces: String(items.length),
+              Items: { Item: items.length === 1 ? items[0] : items },
+            },
+          },
+        },
+      }),
+    });
+    const raw = await response.text();
+    let payload: any = null;
+    try { payload = JSON.parse(raw); } catch { payload = null; }
+    const order = asList<any>(payload?.Orders?.Order || payload?.Order)[0] || payload;
+    const message = order ? apcMessages(order) : { ok: false, detail: '' };
+    const waybill = order ? findWaybill(order) : '';
+    if (!response.ok || !payload || !message.ok) {
+      return res.status(502).json({ error: message.detail || 'APC did not accept the collection. Nothing was saved.' });
+    }
+    if (!waybill) {
+      return res.status(502).json({ error: 'APC replied without a tracking number. Check APC before booking this order again.' });
+    }
+
+    const tracked = asList<any>(order?.ShipmentDetails?.Items?.Item);
+    const savedPieces = pieces.map((piece, index) => ({
+      reference: items[index].Reference,
+      trackingNumber: text(tracked[index]?.TrackingNumber || tracked.find((item) => text(item?.Reference) === items[index].Reference)?.TrackingNumber),
+      title: piece.title,
+      weightKg: piece.weightKg,
+      lengthCm: piece.lengthCm,
+      widthCm: piece.widthCm,
+      heightCm: piece.heightCm,
+    }));
+    const orderNumber = text(order?.OrderNumber).trim();
+    const summary = [delivery.company, delivery.line1, delivery.city, delivery.postcode].filter(Boolean).join(', ');
+    const rowSkus = skus.length ? skus : [`extra-${Date.now().toString(36)}`];
+
+    const client = await getPool().connect();
+    const saved = [];
+    try {
+      await client.query('BEGIN');
+      for (const sku of rowSkus) {
+        const inserted = await client.query(
+          `INSERT INTO collection_bookings
+             (pick_list_id, sku, courier, service_code, service_name, waybill, apc_order_number,
+              collection_postcode, delivery_postcode, delivery_summary, pieces, status)
+           VALUES ($1, $2, 'APC', $3, $4, $5, $6, $7, $8, $9, $10::jsonb, 'booked')
+           RETURNING id, pick_list_id, sku, courier, service_code, service_name, waybill,
+                     collection_postcode, delivery_postcode, delivery_summary, pieces, status`,
+          [pickListId, sku, serviceCode, serviceName || null, waybill, orderNumber || null, COLLECTION.PostalCode, delivery.postcode, summary, JSON.stringify(savedPieces)]
+        );
+        saved.push(inserted.rows[0]);
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      console.error('Saving APC collection failed', error instanceof Error ? error.message : 'query failed');
+      return res.status(500).json({ error: `APC created tracking ${waybill}, but it could not be saved here. Do not book it again.` });
+    } finally {
+      client.release();
+    }
+
+    console.log(`APC collection booked ${waybill} for pick list ${pickListId}`);
+    return res.status(201).json({ booked: true, waybill, bookings: saved });
+  } catch (error) {
+    console.error('APC booking failed', error instanceof Error ? error.message : 'request failed');
+    return res.status(502).json({ error: 'Could not reach APC. Nothing was saved.' });
+  }
 });
 
 function collectLabels(payload: any): { trackingNumber: string; format: string; content: string }[] {
