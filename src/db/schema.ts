@@ -448,6 +448,7 @@ CREATE TABLE IF NOT EXISTS pick_scans (
 );
 CREATE INDEX IF NOT EXISTS idx_pick_scans_item ON pick_scans(pick_list_item_id);
 CREATE INDEX IF NOT EXISTS idx_pick_scans_list ON pick_scans(pick_list_id);
+ALTER TABLE pick_scans ADD COLUMN IF NOT EXISTS component_sku VARCHAR(100);
 
 CREATE TABLE IF NOT EXISTS pick_list_packages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

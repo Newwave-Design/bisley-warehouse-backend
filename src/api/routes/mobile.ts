@@ -450,16 +450,62 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
   }
 });
 
+/** Parts of a kit line, excluding a component that is just the line's own SKU. */
+async function kitPartsOf(itemId: string): Promise<{ sku: string; required_quantity: number }[]> {
+  const item = await query(`SELECT product_sku FROM pick_list_items WHERE id = $1`, [itemId]);
+  const sku = item.rows[0]?.product_sku;
+  if (!sku) return [];
+  const kit = await query(
+    `SELECT kit_components FROM wms_products
+      WHERE variant_sku = $1 AND kit_components IS NOT NULL AND jsonb_array_length(kit_components) > 0
+      ORDER BY jsonb_array_length(kit_components) DESC
+      LIMIT 1`,
+    [sku]
+  );
+  const parts = Array.isArray(kit.rows[0]?.kit_components) ? kit.rows[0].kit_components : [];
+  return parts
+    .filter((part: any) => part?.sku && part.sku !== sku)
+    .map((part: any) => ({ sku: part.sku, required_quantity: Math.max(1, Number(part.required_quantity) || 1) }));
+}
+
+async function resolveScanSku(barcode: string | null, componentSku: string | null): Promise<string | null> {
+  if (componentSku) return componentSku;
+  if (!barcode) return null;
+  const mapped = await query(
+    `SELECT product_sku FROM barcode_mappings WHERE barcode = $1 AND is_active = true LIMIT 1`,
+    [barcode]
+  );
+  return mapped.rows[0]?.product_sku ?? barcode;
+}
+
 /** Recompute a pick_list_item's quantity_picked/status from its pick_scans, then the parent pick_list's status. */
 async function recomputePickItem(pickListId: string, itemId: string) {
-  const sum = await query(
-    `SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM pick_scans WHERE pick_list_item_id = $1`,
+  const scans = await query(
+    `SELECT quantity, scanned_barcode, component_sku FROM pick_scans WHERE pick_list_item_id = $1`,
     [itemId]
   );
   const item = await query(`SELECT quantity_required FROM pick_list_items WHERE id = $1`, [itemId]);
   const required = item.rows[0]?.quantity_required ?? 0;
-  const picked = Math.min(sum.rows[0].qty, required);
-  const status = picked >= required && required > 0 ? 'PICKED' : picked > 0 ? 'PICKING' : 'PENDING';
+  const parts = await kitPartsOf(itemId);
+
+  let picked: number;
+  let status: string;
+  if (parts.length) {
+    const got = new Map<string, number>();
+    for (const scan of scans.rows) {
+      const sku = await resolveScanSku(scan.scanned_barcode, scan.component_sku);
+      if (!sku) continue;
+      got.set(sku, (got.get(sku) ?? 0) + Number(scan.quantity));
+    }
+    const complete = parts.reduce((min, part) => Math.min(min, Math.floor((got.get(part.sku) ?? 0) / part.required_quantity)), required);
+    const done = required > 0 && parts.every((part) => (got.get(part.sku) ?? 0) >= part.required_quantity * required);
+    picked = Math.max(0, Math.min(complete, required));
+    status = done ? 'PICKED' : scans.rows.length ? 'PICKING' : 'PENDING';
+  } else {
+    const sum = scans.rows.reduce((total: number, scan: any) => total + Number(scan.quantity), 0);
+    picked = Math.min(sum, required);
+    status = picked >= required && required > 0 ? 'PICKED' : picked > 0 ? 'PICKING' : 'PENDING';
+  }
 
   const updated = await query(
     `UPDATE pick_list_items SET quantity_picked = $1, status = $2, updated_at = NOW() WHERE id = $3 RETURNING *`,
@@ -519,7 +565,7 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
     // Check if the scanned SKU is a kit component
     for (const item of allItems) {
       if (item.is_kit && item.kit_components) {
-        const components = (item.kit_components as any[]);
+        const components = (item.kit_components as any[]).filter((c: any) => c?.sku && c.sku !== item.product_sku);
         const matchingComponent = components.find((c: any) => c.sku === scannedSku);
         if (matchingComponent) {
           isKitComponentScan = true;
@@ -554,12 +600,23 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
 
     // If this is a kit item and we're trying to scan a component
     if (isKitComponentScan && item.is_kit) {
-      // For kits, we accept the component scan and record it
-      // The picker must scan all components to complete the kit pick
-      const remainingQty = item.quantity_required - item.quantity_picked;
-      const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : remainingQty;
-      if (qty > remainingQty) {
-        return res.status(400).json({ error: `Only ${remainingQty} remaining — reduce the quantity` });
+      const part = (item.kit_components as any[]).find((c: any) => c.sku === scannedSku);
+      const per = Math.max(1, Number(part?.required_quantity) || 1);
+      const need = per * Number(item.quantity_required);
+      const already = await query(
+        `SELECT quantity, scanned_barcode, component_sku FROM pick_scans WHERE pick_list_item_id = $1`,
+        [item.id]
+      );
+      let got = 0;
+      for (const scan of already.rows) {
+        const sku = await resolveScanSku(scan.scanned_barcode, scan.component_sku);
+        if (sku === scannedSku) got += Number(scan.quantity);
+      }
+      const left = need - got;
+      if (left <= 0) return res.status(400).json({ error: `${scannedSku} is already scanned` });
+      const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
+      if (qty > left) {
+        return res.status(400).json({ error: `Only ${left} remaining — reduce the quantity` });
       }
 
       let locationId: string | null = null;
@@ -569,9 +626,9 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
       }
 
       await query(
-        `INSERT INTO pick_scans (pick_list_id, pick_list_item_id, quantity, location_id, scanned_barcode, performed_by)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [pickListId, item.id, qty, locationId, scanned_barcode, toUuidOrNull(req.user?.id)]
+        `INSERT INTO pick_scans (pick_list_id, pick_list_item_id, quantity, location_id, scanned_barcode, performed_by, component_sku)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [pickListId, item.id, qty, locationId, scanned_barcode, toUuidOrNull(req.user?.id), scannedSku]
       );
       if (locationId) {
         await query(`UPDATE pick_list_items SET picked_from_location_id = $1 WHERE id = $2`, [locationId, item.id]);
@@ -585,12 +642,10 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
         item: updatedItem,
         note: `Kit component ${scannedSku} scanned. Scan remaining components to complete this kit.`
       });
-    } else if (item.is_kit) {
-      // Trying to scan the parent kit SKU directly - not allowed
-      return res.status(400).json({ 
-        error: `This is a kit product. You must scan its individual components instead.`,
-        components: item.kit_components || [],
-        instruction: 'Scan each component SKU separately to complete this pick.'
+    } else if ((await kitPartsOf(item.id)).length) {
+      return res.status(400).json({
+        error: 'This is a kit product. You must scan its individual components instead.',
+        instruction: 'Scan each component SKU separately to complete this pick.',
       });
     } else {
       // Regular non-kit item
@@ -636,6 +691,9 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
     );
     if (!item.rows[0]) return res.status(404).json({ error: 'Item not found' });
     if (item.rows[0].status === 'PICKED') return res.status(400).json({ error: 'Already picked' });
+    if ((await kitPartsOf(itemId)).length) {
+      return res.status(400).json({ error: 'Scan the body and the handles separately' });
+    }
 
     const remainingQty = item.rows[0].quantity_required - item.rows[0].quantity_picked;
     const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : remainingQty;
@@ -687,7 +745,7 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
 router.get('/pick-lists/:id/scans', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(`
-      SELECT ps.id, ps.pick_list_item_id, ps.quantity, ps.scanned_barcode, ps.created_at,
+      SELECT ps.id, ps.pick_list_item_id, ps.quantity, ps.scanned_barcode, ps.component_sku, ps.created_at,
              pli.product_sku, pli.colour_code,
              l.location_code,
              wp.product_title, wp.colour_name
