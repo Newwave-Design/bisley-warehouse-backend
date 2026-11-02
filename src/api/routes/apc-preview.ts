@@ -18,6 +18,11 @@ const COLLECTION = {
   City: 'Pontypool',
   County: 'Torfaen',
   CountryCode: 'GB',
+  // A collection away from the APC account address is a third-party pickup, so APC requires a contact.
+  Contact: {
+    PersonName: 'Ovara Warehouse',
+    PhoneNumber: '01495830401',
+  },
 };
 
 interface PieceInput {
@@ -263,7 +268,8 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     const reference = text(list.pick_list_number).trim().slice(0, 20);
     const contact: Record<string, string> = {};
     if (delivery.person) contact.PersonName = delivery.person;
-    if (delivery.phone) contact.PhoneNumber = delivery.phone;
+    const deliveryPhone = delivery.phone.replace(/[^\d+]/g, '').replace(/^\+44/, '0').replace(/^44(?=\d{10}$)/, '0');
+    if (deliveryPhone) contact.PhoneNumber = deliveryPhone;
     if (delivery.email) contact.Email = delivery.email;
 
     const response = await fetch(ORDER_URL, {
