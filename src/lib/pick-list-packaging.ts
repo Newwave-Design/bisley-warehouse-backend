@@ -41,7 +41,9 @@ export async function attachPackaging<T extends { sku: string; quantity_required
   if (!skus.length) return groups;
 
   const [specs, boms] = await Promise.all([
-    query(`SELECT product_code, method FROM packaging_product_specs WHERE is_active`),
+    query(`SELECT product_code, method, preferred_courier, weight_grams,
+                  length_packed_mm, width_packed_mm, height_packed_mm
+           FROM packaging_product_specs WHERE is_active`),
     query(
       `SELECT b.product_code, b.sku, b.method, b.option_rank,
               i.code, i.name, i.item_type, l.qty
@@ -53,12 +55,28 @@ export async function attachPackaging<T extends { sku: string; quantity_required
     ),
   ]);
 
-  const specByCode = new Map<string, string>();
+  const specByCode = new Map<string, {
+    method: string
+    courier: string | null
+    weight: number | null
+    length: number | null
+    width: number | null
+    height: number | null
+  }>();
   const codes: string[] = [];
-  for (const row of specs.rows as { product_code: string; method: string }[]) {
+  for (const row of specs.rows as { product_code: string; method: string; preferred_courier: string | null; weight_grams: number | null; length_packed_mm: number | null; width_packed_mm: number | null; height_packed_mm: number | null }[]) {
     const code = String(row.product_code || '').toUpperCase();
     if (!code || specByCode.has(code)) continue;
-    specByCode.set(code, row.method);
+    const rawCourier = String(row.preferred_courier || '').trim();
+    const courier = /^dx$/i.test(rawCourier) ? 'DX' : /apc/i.test(rawCourier) ? 'APC' : (rawCourier || null);
+    specByCode.set(code, {
+      method: row.method,
+      courier,
+      weight: row.weight_grams,
+      length: row.length_packed_mm,
+      width: row.width_packed_mm,
+      height: row.height_packed_mm,
+    });
     codes.push(code);
   }
   codes.sort((a, b) => b.length - a.length);
@@ -100,8 +118,10 @@ export async function attachPackaging<T extends { sku: string; quantity_required
     const code = bom ? '' : matchCode(item.sku);
     const productBom = code ? bomByProduct.get(code) : undefined;
     const chosen = bom || productBom;
-    const method = chosen?.method || (code ? specByCode.get(code) : specByCode.get(exact)) || '';
-    if (!method && !chosen) return item;
+    const productCode = codes.find(entry => exact === entry || exact.startsWith(`${entry}-`)) || '';
+    const spec = productCode ? specByCode.get(productCode) : specByCode.get(exact);
+    const method = chosen?.method || spec?.method || '';
+    if (!method && !chosen && !spec?.courier) return item;
     const per = item.quantity_required > 0 ? item.quantity_required : 1;
     const lines = (chosen?.lines || []).map(line => ({
       code: line.code,
@@ -118,6 +138,11 @@ export async function attachPackaging<T extends { sku: string; quantity_required
         type: PACKAGING_SHIP_TYPE[method] || null,
         note: lines.length ? null : (PACKAGING_METHOD_NOTE[method] || null),
         items: lines,
+        preferred_courier: spec?.courier || null,
+        weight_grams: spec?.weight ?? null,
+        length_packed_mm: spec?.length ?? null,
+        width_packed_mm: spec?.width ?? null,
+        height_packed_mm: spec?.height ?? null,
       },
     };
   }));

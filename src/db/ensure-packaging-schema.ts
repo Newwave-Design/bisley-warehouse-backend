@@ -86,6 +86,7 @@ export async function ensurePackagingSchema() {
       updated_at TIMESTAMP DEFAULT NOW()
     )`,
     `CREATE INDEX IF NOT EXISTS idx_packaging_specs_method ON packaging_product_specs(method, is_active)`,
+    `ALTER TABLE packaging_product_specs ADD COLUMN IF NOT EXISTS preferred_courier VARCHAR(20)`,
 
     `CREATE TABLE IF NOT EXISTS packaging_boms (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -200,6 +201,27 @@ export async function ensurePackagingSchema() {
       amount_gbp DECIMAL(10,2) NOT NULL DEFAULT 0,
       extra JSONB NOT NULL DEFAULT '{}'::jsonb
     )`,
+
+    `CREATE TABLE IF NOT EXISTS collection_bookings (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      pick_list_id UUID NOT NULL,
+      sku VARCHAR(120) NOT NULL,
+      courier VARCHAR(20) NOT NULL,
+      service_code VARCHAR(40),
+      service_name VARCHAR(120),
+      waybill VARCHAR(32),
+      apc_order_number VARCHAR(32),
+      collection_postcode VARCHAR(16),
+      delivery_postcode VARCHAR(16),
+      delivery_summary TEXT,
+      pieces JSONB NOT NULL DEFAULT '[]'::jsonb,
+      status VARCHAR(30) NOT NULL DEFAULT 'booked',
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_bookings_line
+      ON collection_bookings (pick_list_id, sku)
+      WHERE status <> 'cancelled'`,
 
     `CREATE TABLE IF NOT EXISTS packaging_field_defs (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

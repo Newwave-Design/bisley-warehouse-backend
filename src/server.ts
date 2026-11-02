@@ -47,6 +47,7 @@ import returnsRoutes from './api/routes/returns.js';
 import stockInRoutes from './api/routes/stock-in.js';
 import moveSessionRoutes from './api/routes/move-sessions.js';
 import barcodeTestRoutes from './api/routes/barcode-test.js';
+import apcPreviewRoutes from './api/routes/apc-preview.js';
 import shippingOptionsRoutes from './routes/shipping-options.js';
 import { createNotificationOnce } from './lib/notifications.js';
 import { reconcileOrders, syncOpenOrders } from './api/routes/webhooks.js';
@@ -136,6 +137,7 @@ app.use('/api/queries', queriesRoutes);
 app.use('/api/knowledge', knowledgeRoutes);
 app.use('/api/returns', returnsRoutes);
 app.use('/api/barcode-test', barcodeTestRoutes);
+app.use('/api/apc', apcPreviewRoutes);
 app.use('/api', shippingOptionsRoutes);
 
 // 404 handler

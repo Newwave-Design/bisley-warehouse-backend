@@ -274,7 +274,7 @@ router.post('/products', requirePermission('manage_settings'), async (req: Reque
     const body = pick(req.body, [
       'product_code', 'product_title', 'product_range', 'length_mm', 'width_mm', 'height_mm',
       'length_packed_mm', 'width_packed_mm', 'height_packed_mm', 'packed_dims_checked', 'weight_grams',
-      'method', 'stocked', 'listed', 'is_active', 'units_per_month', 'notes', 'extra',
+      'method', 'stocked', 'listed', 'is_active', 'units_per_month', 'notes', 'extra', 'preferred_courier',
     ]);
     if (!body.product_code) return res.status(400).json({ error: 'product_code is required' });
     if (body.method && !METHODS.includes(body.method)) return res.status(400).json({ error: `method must be one of ${METHODS.join(', ')}` });
@@ -294,9 +294,12 @@ router.patch('/products/:id', requirePermission('manage_settings'), async (req: 
     const body = pick(req.body, [
       'product_code', 'product_title', 'product_range', 'length_mm', 'width_mm', 'height_mm',
       'length_packed_mm', 'width_packed_mm', 'height_packed_mm', 'packed_dims_checked', 'weight_grams',
-      'method', 'stocked', 'listed', 'is_active', 'units_per_month', 'notes', 'extra',
+      'method', 'stocked', 'listed', 'is_active', 'units_per_month', 'notes', 'extra', 'preferred_courier',
     ]);
     if (body.method && !METHODS.includes(body.method)) return res.status(400).json({ error: `method must be one of ${METHODS.join(', ')}` });
+    if (body.preferred_courier != null && body.preferred_courier !== '' && !['APC', 'DX'].includes(body.preferred_courier)) {
+      return res.status(400).json({ error: 'preferred_courier must be APC or DX' });
+    }
     body.updated_at = new Date();
     const { sets, values, next } = setClause(body);
     const result = await query(

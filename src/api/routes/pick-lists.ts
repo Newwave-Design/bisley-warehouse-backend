@@ -95,6 +95,7 @@ async function expandKitPicksByList<T extends { sku: string; quantity_required: 
         quantity_picked: item.quantity_picked * per,
         thumbnail: meta?.variant_thumbnail || meta?.product_thumbnail || null,
         kit_part: true,
+        kit_parent_sku: item.sku,
       };
     })];
   }));
