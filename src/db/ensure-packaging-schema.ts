@@ -222,6 +222,7 @@ export async function ensurePackagingSchema() {
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_bookings_line
       ON collection_bookings (pick_list_id, sku)
       WHERE status <> 'cancelled'`,
+    `ALTER TABLE collection_bookings ADD COLUMN IF NOT EXISTS collection_date VARCHAR(40)`,
 
     `CREATE TABLE IF NOT EXISTS booking_templates (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

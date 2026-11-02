@@ -311,6 +311,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       heightCm: piece.heightCm,
     }));
     const orderNumber = text(order?.OrderNumber).trim();
+    const collectionDate = (text(order?.CollectionDate).trim() || text(req.body?.collectionDate).trim()).slice(0, 40) || null;
     const summary = [delivery.company, delivery.line1, delivery.city, delivery.postcode].filter(Boolean).join(', ');
     const rowSkus = skus.length ? skus : [`extra-${Date.now().toString(36)}`];
 
@@ -322,11 +323,11 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         const inserted = await client.query(
           `INSERT INTO collection_bookings
              (pick_list_id, sku, courier, service_code, service_name, waybill, apc_order_number,
-              collection_postcode, delivery_postcode, delivery_summary, pieces, status)
-           VALUES ($1, $2, 'APC', $3, $4, $5, $6, $7, $8, $9, $10::jsonb, 'booked')
+              collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date)
+           VALUES ($1, $2, 'APC', $3, $4, $5, $6, $7, $8, $9, $10::jsonb, 'booked', $11)
            RETURNING id, pick_list_id, sku, courier, service_code, service_name, waybill,
-                     collection_postcode, delivery_postcode, delivery_summary, pieces, status`,
-          [pickListId, sku, serviceCode, serviceName || null, waybill, orderNumber || null, COLLECTION.PostalCode, delivery.postcode, summary, JSON.stringify(savedPieces)]
+                     collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date`,
+          [pickListId, sku, serviceCode, serviceName || null, waybill, orderNumber || null, COLLECTION.PostalCode, delivery.postcode, summary, JSON.stringify(savedPieces), collectionDate]
         );
         saved.push(inserted.rows[0]);
       }
@@ -369,7 +370,7 @@ router.get('/bookings', authMiddleware, async (_req: AuthRequest, res: Response)
   try {
     const result = await query(
       `SELECT id, pick_list_id, sku, courier, service_code, service_name, waybill,
-              collection_postcode, delivery_postcode, delivery_summary, pieces, status
+              collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date
        FROM collection_bookings
        WHERE status <> 'cancelled'
        ORDER BY created_at DESC`
