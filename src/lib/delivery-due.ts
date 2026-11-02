@@ -29,6 +29,8 @@ export interface DeliveryDue {
   latest: string;
   light: 'green' | 'amber' | 'red' | null;
   reasons: string[];
+  /** Every remaining line can be picked from what is on the shelf. Samples are ignored. */
+  in_stock: boolean;
 }
 
 /** Null when the SKU carries no colour (nothing to approve). */
@@ -85,6 +87,7 @@ export async function getDeliveryDues(pickListIds: string[]): Promise<Record<str
   const today = utcDay(new Date());
   for (const pl of lists.rows) {
     const reasons: string[] = [];
+    let inStock = true;
     const note = (msg: string) => { if (!reasons.includes(msg)) reasons.push(msg); };
 
     for (const it of itemsByList.get(pl.id) ?? []) {
@@ -102,7 +105,10 @@ export async function getDeliveryDues(pickListIds: string[]): Promise<Record<str
         const short = parts.length > 0
           ? parts.some(p => (componentStock.get(p.sku) ?? 0) < p.required_quantity * remaining)
           : it.stock < remaining;
-        if (short) note(`Not fully in stock: ${it.product_sku}`);
+        if (short) {
+          inStock = false;
+          note(`Not fully in stock: ${it.product_sku}`);
+        }
       }
     }
 
@@ -121,6 +127,7 @@ export async function getDeliveryDues(pickListIds: string[]): Promise<Record<str
       latest: iso(end),
       light,
       reasons,
+      in_stock: inStock,
     };
   }
   return out;
