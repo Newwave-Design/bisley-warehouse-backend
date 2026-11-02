@@ -563,7 +563,7 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
     );
 
     // Check if the scanned SKU is a kit component
-    for (const item of allItems) {
+    for (const item of allItems.rows) {
       if (item.is_kit && item.kit_components) {
         const components = (item.kit_components as any[]).filter((c: any) => c?.sku && c.sku !== item.product_sku);
         const matchingComponent = components.find((c: any) => c.sku === scannedSku);
@@ -578,10 +578,11 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
 
     // If not a kit component scan, try direct SKU match
     if (!isKitComponentScan) {
-      candidates = await query(
+      const direct = await query(
         `SELECT * FROM pick_list_items WHERE pick_list_id = $1 AND product_sku = $2 ORDER BY line_number ASC`,
         [pickListId, scannedSku]
       );
+      candidates = direct.rows;
     }
 
     if (!candidates.length) {
