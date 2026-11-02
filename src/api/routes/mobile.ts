@@ -292,7 +292,7 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
           'product_sku', pli.product_sku, 'colour_code', pli.colour_code, 'item_title', pli.item_title
         ) ORDER BY pli.line_number) FILTER (WHERE pli.product_sku ILIKE '%SAMPLE%') AS sample_lines
       FROM pick_lists pl
-      LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
+      LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id AND COALESCE(pli.is_archived, false) = false
       WHERE pl.is_archived = false AND ${paidSql('pl')} AND ($1::text[] IS NULL OR pl.status = ANY($1::text[]))
       ${sampleClause}
       GROUP BY pl.id
@@ -373,7 +373,7 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
       FROM pick_list_items pli
       LEFT JOIN warehouse_locations l ON l.id = pli.picked_from_location_id
       LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
-      WHERE pli.pick_list_id = $1
+      WHERE pli.pick_list_id = $1 AND COALESCE(pli.is_archived, false) = false
       ORDER BY pli.line_number
     `, [req.params.id]);
 
