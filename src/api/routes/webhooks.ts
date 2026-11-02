@@ -28,6 +28,9 @@ if (!WEBHOOK_SECRET) {
   console.warn('[webhooks] MEDUSA_WEBHOOK_SECRET not set — /api/webhooks/medusa will reject all requests');
 }
 
+// Order payloads include full product details and exceed express's 100kb default (413)
+const WEBHOOK_BODY_LIMIT = '1mb';
+
 function verifySignature(rawBody: Buffer, signature: string): boolean {
   try {
     const expected = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('hex');
@@ -39,7 +42,7 @@ function verifySignature(rawBody: Buffer, signature: string): boolean {
   }
 }
 
-router.post('/medusa', express.raw({ type: '*/*' }), async (req: Request, res: Response) => {
+router.post('/medusa', express.raw({ type: '*/*', limit: WEBHOOK_BODY_LIMIT }), async (req: Request, res: Response) => {
   try {
     const sig = (req.headers['x-medusa-signature'] as string) ?? '';
     if (!WEBHOOK_SECRET || !verifySignature(req.body as Buffer, sig)) {
@@ -711,7 +714,7 @@ router.get('/test-order', async (req: Request, res: Response) => {
  * Payload: { event: "fulfillment.created", order_id, fulfillment_id, timestamp }
  * Signature: x-medusa-signature header (HMAC SHA-256)
  */
-router.post('/medusa/fulfillment-created', express.raw({ type: '*/*' }), async (req: Request, res: Response) => {
+router.post('/medusa/fulfillment-created', express.raw({ type: '*/*', limit: WEBHOOK_BODY_LIMIT }), async (req: Request, res: Response) => {
   try {
     const sig = (req.headers['x-medusa-signature'] as string) ?? '';
     if (!WEBHOOK_SECRET || !verifySignature(req.body as Buffer, sig)) {

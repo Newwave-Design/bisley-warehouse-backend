@@ -60,6 +60,17 @@ const STATEMENTS: string[] = [
   `ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS selected_courier_code VARCHAR(50)`,
   `ALTER TABLE product_fulfillment_profiles ADD COLUMN IF NOT EXISTS estimated_shipping_cost_gbp DECIMAL(10,2)`,
   `ALTER TABLE product_fulfillment_profiles ADD COLUMN IF NOT EXISTS estimated_shipping_currency VARCHAR(10)`,
+  `ALTER TABLE product_fulfillment_profiles ADD COLUMN IF NOT EXISTS estimated_shipping_cost_high_gbp DECIMAL(10,2)`,
+  `ALTER TABLE product_fulfillment_profiles ADD COLUMN IF NOT EXISTS estimated_shipping_ni_gbp DECIMAL(10,2)`,
+  `ALTER TABLE product_fulfillment_profiles ADD COLUMN IF NOT EXISTS estimated_shipping_roi_gbp DECIMAL(10,2)`,
+  `ALTER TABLE product_fulfillment_profiles ADD COLUMN IF NOT EXISTS shipping_band VARCHAR(160)`,
+  `ALTER TABLE product_fulfillment_profiles ADD COLUMN IF NOT EXISTS shipping_estimate_notes TEXT`,
+  `ALTER TABLE product_fulfillment_profiles ADD COLUMN IF NOT EXISTS shipping_estimate_at TIMESTAMP`,
+  `INSERT INTO shipping_services (courier_code, courier_name, service_code, service_name, service_level, shipment_mode, integration_type, constraints, metadata, sort_order)
+   VALUES
+    ('apc', 'APC', 'apc_nd_1600', 'APC Next Day 16:00', 'standard', 'parcel', 'manual', '{"max_weight_kg":30}'::jsonb, '{"source":"monex-2026-10-30","volumetric_divisor":6000}'::jsonb, 12),
+    ('apc', 'APC', 'apc_nc_1600', 'APC Next Day 16:00 (longer)', 'standard', 'parcel', 'manual', '{"max_weight_kg":30}'::jsonb, '{"source":"monex-2026-10-30","volumetric_divisor":6000}'::jsonb, 13)
+   ON CONFLICT (service_code) DO NOTHING`,
   `ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS selected_service_code VARCHAR(80)`,
   `ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS shipping_requirements JSONB NOT NULL DEFAULT '{}'::jsonb`,
   `ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS parcel_count INTEGER NOT NULL DEFAULT 0`,

@@ -66,14 +66,58 @@ async function fetchOrderValue(orderId: string): Promise<OrderValue | null> {
   };
 }
 
+function fromRow(row: any): OrderValue | null {
+  if (row?.order_gross_gbp == null && row?.order_net_gbp == null) return null;
+  return {
+    gross: Number(row.order_gross_gbp) || 0,
+    net: Number(row.order_net_gbp) || 0,
+    vat: Number(row.order_vat_gbp) || 0,
+    refunded: Number(row.order_refunded_gbp) || 0,
+    currency: String(row.order_currency || 'GBP').toUpperCase(),
+  };
+}
+
 export async function getOrderValues(orderIds: string[]): Promise<Record<string, OrderValue | null>> {
   const out: Record<string, OrderValue | null> = {};
+  const unique = [...new Set(orderIds.filter(Boolean))];
   const missing: string[] = [];
 
-  for (const id of new Set(orderIds.filter(Boolean))) {
+  for (const id of unique) {
     const hit = cache.get(id);
-    if (hit && Date.now() - hit.at < hit.ttl) out[id] = hit.value;
+    if (hit && Date.now() - hit.at < hit.ttl && hit.value) out[id] = hit.value;
     else missing.push(id);
+  }
+
+  if (missing.length) {
+    try {
+      const stored = await query(
+        `SELECT medusa_order_id, order_gross_gbp, order_net_gbp, order_vat_gbp,
+                order_refunded_gbp, order_currency, order_value_checked_at
+         FROM pick_lists
+         WHERE parent_pick_list_id IS NULL
+           AND (medusa_order_id = ANY($1::text[]) OR split_part(medusa_order_id, '-BO', 1) = ANY($1::text[]))`,
+        [missing.map(rootMedusaOrderId)]
+      );
+      const byRoot = new Map<string, OrderValue>();
+      for (const row of stored.rows) {
+        const value = fromRow(row);
+        if (value) byRoot.set(rootMedusaOrderId(row.medusa_order_id), value);
+      }
+      const stillMissing: string[] = [];
+      for (const id of missing) {
+        const value = byRoot.get(rootMedusaOrderId(id));
+        if (!value) {
+          stillMissing.push(id);
+          continue;
+        }
+        cache.set(id, { at: Date.now(), ttl: TTL_MS, value });
+        out[id] = value;
+      }
+      missing.length = 0;
+      missing.push(...stillMissing);
+    } catch {
+      // Fall through to live Medusa for anything still missing
+    }
   }
 
   for (let i = 0; i < missing.length; i += CONCURRENCY) {
