@@ -29,7 +29,25 @@ const PACKAGING_METHOD_NOTE: Record<string, string> = {
   needs_packaging: 'Not set',
 };
 
-type PackagingLine = { code: string; name: string; item_type: string; qty: number };
+type PackagingLine = {
+  code: string
+  name: string
+  item_type: string
+  qty: number
+  box: { code: string; length: number; width: number; height: number } | null
+};
+
+/** Outer size written on the box as "740L 1,185W 155H, 1,925L&W". The girth after the comma is not a side. */
+function parseBoxSize(formula: string | null | undefined): { length: number; width: number; height: number } | null {
+  const head = String(formula || '').split(/,(?=\s*\d[\d,]*\s*L&W)/i)[0];
+  const length = head.match(/(\d[\d,]*(?:\.\d+)?)\s*L/i);
+  const width = head.match(/(\d[\d,]*(?:\.\d+)?)\s*W/i);
+  const height = head.match(/(\d[\d,]*(?:\.\d+)?)\s*H/i);
+  if (!length || !width || !height) return null;
+  const sides = [length, width, height].map((side) => Math.round(Number(side[1].replace(/,/g, ''))));
+  if (sides.some((side) => !Number.isFinite(side) || side <= 0)) return null;
+  return { length: sides[0], width: sides[1], height: sides[2] };
+}
 
 /**
  * Packaging already kept under Stock → Packaging.
@@ -46,7 +64,9 @@ export async function attachPackaging<T extends { sku: string; quantity_required
            FROM packaging_product_specs WHERE is_active`),
     query(
       `SELECT b.product_code, b.sku, b.method, b.option_rank,
-              i.code, i.name, i.item_type, l.qty
+              i.code, i.name, i.item_type, l.qty,
+              i.internal_length_mm, i.internal_width_mm, i.internal_height_mm,
+              i.extra->>'box_size_formula' AS box_size_formula
        FROM packaging_boms b
        LEFT JOIN packaging_bom_lines l ON l.bom_id = b.id
        LEFT JOIN packaging_items i ON i.id = l.packaging_item_id
@@ -83,7 +103,20 @@ export async function attachPackaging<T extends { sku: string; quantity_required
 
   const bomBySku = new Map<string, { method: string; rank: number; lines: PackagingLine[] }>();
   const bomByProduct = new Map<string, { method: string; rank: number; lines: PackagingLine[] }>();
-  for (const row of boms.rows as { product_code: string | null; sku: string | null; method: string; option_rank: number; code: string | null; name: string | null; item_type: string | null; qty: string | null }[]) {
+  for (const row of boms.rows as {
+    product_code: string | null
+    sku: string | null
+    method: string
+    option_rank: number
+    code: string | null
+    name: string | null
+    item_type: string | null
+    qty: string | null
+    internal_length_mm: number | null
+    internal_width_mm: number | null
+    internal_height_mm: number | null
+    box_size_formula: string | null
+  }[]) {
     const skuKey = row.sku ? String(row.sku).toUpperCase() : '';
     const productKey = row.product_code ? String(row.product_code).toUpperCase() : '';
     const map = skuKey ? bomBySku : bomByProduct;
@@ -96,11 +129,16 @@ export async function attachPackaging<T extends { sku: string; quantity_required
     }
     if ((Number(row.option_rank) || 1) !== entry.rank) continue;
     if (row.code) {
+      const drawn = [row.internal_length_mm, row.internal_width_mm, row.internal_height_mm].map((side) => Number(side) || 0);
+      const outer = row.item_type === 'box'
+        ? (parseBoxSize(row.box_size_formula) || (drawn.every((side) => side > 0) ? { length: drawn[0], width: drawn[1], height: drawn[2] } : null))
+        : null;
       entry.lines.push({
         code: row.code,
         name: row.name || row.code,
         item_type: row.item_type || 'other',
         qty: Number(row.qty) || 1,
+        box: outer ? { code: row.code, ...outer } : null,
       });
     }
   }
@@ -130,6 +168,7 @@ export async function attachPackaging<T extends { sku: string; quantity_required
       item_label: PACKAGING_ITEM_LABEL[line.item_type] || line.item_type,
       qty: Math.round(line.qty * per * 100) / 100,
     }));
+    const box = (chosen?.lines || []).find(line => line.box)?.box || null;
     return {
       ...item,
       packaging: {
@@ -143,6 +182,10 @@ export async function attachPackaging<T extends { sku: string; quantity_required
         length_packed_mm: spec?.length ?? null,
         width_packed_mm: spec?.width ?? null,
         height_packed_mm: spec?.height ?? null,
+        box_code: box?.code || null,
+        box_length_mm: box?.length ?? null,
+        box_width_mm: box?.width ?? null,
+        box_height_mm: box?.height ?? null,
       },
     };
   }));

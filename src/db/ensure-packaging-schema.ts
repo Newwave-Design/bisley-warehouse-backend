@@ -223,6 +223,17 @@ export async function ensurePackagingSchema() {
       ON collection_bookings (pick_list_id, sku)
       WHERE status <> 'cancelled'`,
 
+    `CREATE TABLE IF NOT EXISTS booking_templates (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name VARCHAR(160) NOT NULL,
+      product_code VARCHAR(80) NOT NULL,
+      tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+      pieces JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_booking_templates_product ON booking_templates (upper(product_code))`,
+
     `CREATE TABLE IF NOT EXISTS packaging_field_defs (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       entity VARCHAR(30) NOT NULL,

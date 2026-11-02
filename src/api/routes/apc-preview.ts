@@ -228,4 +228,180 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
   }
 });
 
+const FAMILY_RULES: [RegExp, string][] = [
+  [/^fern-/, 'Fern'],
+  [/multidesk/, 'MultiDesk'],
+  [/multidrawer|multi-drawer/, 'MultiDrawer'],
+  [/filing-cabinet/, 'Filing Cabinets'],
+  [/locker/, 'Lockers'],
+  [/note-pedestal|pedestal/, 'Pedestals'],
+  [/plan-file|plan-chest/, 'Plan Files'],
+  [/home-filer|suspension-filing/, 'Home Filer'],
+  [/glide/, 'Glide'],
+  [/^bob-/, 'BOB'],
+];
+
+function familyFromHandle(handle: string): string {
+  const value = handle.toLowerCase();
+  for (const [rule, label] of FAMILY_RULES) if (rule.test(value)) return label;
+  return '';
+}
+
+function codesFromQuery(value: unknown): string[] {
+  return [...new Set(String(value || '').split(',').map((code) => code.trim().toUpperCase()).filter(Boolean))];
+}
+
+interface TemplatePiece {
+  title: string
+  productCode: string
+  weightKg: string
+  lengthCm: string
+  widthCm: string
+  heightCm: string
+  custom: boolean
+  boxCode: string
+}
+
+function cleanPieces(value: unknown): TemplatePiece[] {
+  return asList<any>(value).slice(0, 20).map((piece) => ({
+    title: text(piece?.title).trim().slice(0, 160),
+    productCode: text(piece?.productCode).trim().toUpperCase().slice(0, 80),
+    weightKg: text(piece?.weightKg).trim(),
+    lengthCm: text(piece?.lengthCm).trim(),
+    widthCm: text(piece?.widthCm).trim(),
+    heightCm: text(piece?.heightCm).trim(),
+    custom: piece?.custom === true || !text(piece?.productCode).trim(),
+    boxCode: text(piece?.boxCode).trim(),
+  })).filter((piece) => piece.weightKg && piece.lengthCm && piece.widthCm && piece.heightCm);
+}
+
+function pieceKey(pieces: TemplatePiece[]): string {
+  return pieces
+    .map((piece) => [piece.title, piece.productCode, piece.weightKg, piece.lengthCm, piece.widthCm, piece.heightCm, piece.custom ? '1' : '0'].join('|'))
+    .sort()
+    .join('\n');
+}
+
+function cleanTags(value: unknown): string[] {
+  const tags = asList<unknown>(value).map((tag) => text(tag).trim()).filter(Boolean);
+  return [...new Set(tags)].slice(0, 12);
+}
+
+async function tagsForProducts(codes: string[]) {
+  const ranges = await query(`SELECT product_range, product_label, match_rules FROM box_size_requirements ORDER BY sort_order, product_range`);
+  const families = new Set<string>(FAMILY_RULES.map((rule) => rule[1]));
+  const types = new Set<string>();
+  for (const row of ranges.rows as { product_range: string; product_label: string }[]) {
+    if (row.product_range) families.add(row.product_range);
+    if (row.product_label) types.add(row.product_label);
+  }
+  const suggested = new Set<string>();
+  if (codes.length) {
+    const products = await query(
+      `SELECT DISTINCT product_handle, product_title
+         FROM wms_products
+        WHERE upper(variant_sku) = ANY($1::text[])
+           OR EXISTS (SELECT 1 FROM unnest($1::text[]) code WHERE upper(variant_sku) LIKE code || '-%')`,
+      [codes]
+    );
+    for (const product of products.rows as { product_handle: string | null; product_title: string | null }[]) {
+      const handle = String(product.product_handle || '');
+      const title = String(product.product_title || '');
+      const family = familyFromHandle(handle);
+      if (family) suggested.add(family);
+      const variant = { title, handle, width_mm: null as number | null };
+      for (const row of ranges.rows as { product_range: string; product_label: string; match_rules: { field?: string; contains?: string; width_mm?: number }[] }[]) {
+        const rules = Array.isArray(row.match_rules) ? row.match_rules : [];
+        const matched = rules.some((rule) => {
+          const haystack = (rule.field === 'handle' ? handle : title).toLowerCase();
+          if (!haystack.includes(String(rule.contains || '').toLowerCase())) return false;
+          return rule.width_mm == null || variant.width_mm === rule.width_mm;
+        });
+        if (!matched) continue;
+        if (row.product_range) suggested.add(row.product_range);
+        if (row.product_label) suggested.add(row.product_label);
+      }
+    }
+  }
+  return {
+    suggested: [...suggested],
+    options: [
+      ...[...families].sort().map((label) => ({ group: 'Family', label })),
+      ...[...types].sort().map((label) => ({ group: 'Type', label })),
+    ],
+  };
+}
+
+router.get('/templates', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const codes = codesFromQuery(req.query.codes);
+    const tags = await tagsForProducts(codes);
+    if (!codes.length) return res.json({ templates: [], tagOptions: tags.options, suggestedTags: [] });
+    const found = await query(
+      `SELECT id, name, product_code, tags, pieces, updated_at
+         FROM booking_templates
+        WHERE upper(product_code) = ANY($1::text[])
+           OR ($2::text[] <> '{}' AND tags ?| $2::text[])
+        ORDER BY updated_at DESC`,
+      [codes, tags.suggested]
+    );
+    return res.json({ templates: found.rows, tagOptions: tags.options, suggestedTags: tags.suggested });
+  } catch (error) {
+    console.error('Booking templates failed', error instanceof Error ? error.message : 'query failed');
+    return res.status(500).json({ error: 'Could not load templates' });
+  }
+});
+
+router.post('/templates', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const productCode = text(req.body?.productCode).trim().toUpperCase();
+  const pieces = cleanPieces(req.body?.pieces);
+  if (!productCode) return res.status(400).json({ error: 'A product code is required' });
+  if (!pieces.length) return res.status(400).json({ error: 'Add at least one box' });
+  const name = text(req.body?.name).trim().slice(0, 160) || pieces.map((piece) => piece.title || 'Extra box').join(' + ').slice(0, 160);
+  const tags = cleanTags(req.body?.tags);
+  try {
+    const existing = await query(
+      `SELECT id, name, product_code, tags, pieces, updated_at
+         FROM booking_templates WHERE upper(product_code) = $1`,
+      [productCode]
+    );
+    const same = (existing.rows as { pieces: TemplatePiece[] }[]).find((row) => pieceKey(cleanPieces(row.pieces)) === pieceKey(pieces));
+    if (same) return res.json({ template: same, created: false });
+    const saved = await query(
+      `INSERT INTO booking_templates (name, product_code, tags, pieces)
+       VALUES ($1, $2, $3::jsonb, $4::jsonb)
+       RETURNING id, name, product_code, tags, pieces, updated_at`,
+      [name, productCode, JSON.stringify(tags), JSON.stringify(pieces)]
+    );
+    return res.status(201).json({ template: saved.rows[0], created: true });
+  } catch (error) {
+    console.error('Save booking template failed', error instanceof Error ? error.message : 'query failed');
+    return res.status(500).json({ error: 'Could not save the template' });
+  }
+});
+
+router.patch('/templates/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const id = text(req.params.id);
+  if (!/^[0-9a-f-]{36}$/i.test(id)) return res.status(400).json({ error: 'Unknown template' });
+  const name = req.body?.name != null ? text(req.body.name).trim().slice(0, 160) : null;
+  const tags = req.body?.tags != null ? cleanTags(req.body.tags) : null;
+  if (!name && !tags) return res.status(400).json({ error: 'Nothing to change' });
+  try {
+    const saved = await query(
+      `UPDATE booking_templates
+          SET name = COALESCE($2, name),
+              tags = COALESCE($3::jsonb, tags),
+              updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, product_code, tags, pieces, updated_at`,
+      [id, name || null, tags ? JSON.stringify(tags) : null]
+    );
+    if (!saved.rows[0]) return res.status(404).json({ error: 'Unknown template' });
+    return res.json({ template: saved.rows[0] });
+  } catch (error) {
+    console.error('Update booking template failed', error instanceof Error ? error.message : 'query failed');
+    return res.status(500).json({ error: 'Could not update the template' });
+  }
+});
+
 export default router;
