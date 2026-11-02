@@ -1,6 +1,6 @@
 /**
  * One row per listed product (not per colour).
- * Prices and packaging/shipping come from the SmartSuite product export.
+ * Prices, packaging, courier cost and the customer shipping charge come from SmartSuite.
  * Cost comes from Chris Miller's order spreadsheet where that product has a buy price.
  */
 import express from 'express';
