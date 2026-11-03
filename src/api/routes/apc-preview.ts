@@ -456,6 +456,76 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
   }
 });
 
+router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const remoteUser = authHeader();
+  if (!remoteUser) {
+    return res.status(500).json({ error: 'APC login is not configured on this computer' });
+  }
+  const id = text(req.params.id);
+  if (!/^[0-9a-f-]{36}$/i.test(id)) {
+    return res.status(400).json({ error: 'Unknown booking' });
+  }
+
+  try {
+    const found = await query(
+      `SELECT id, pick_list_id, waybill, apc_order_number, courier, status
+       FROM collection_bookings WHERE id = $1`,
+      [id]
+    );
+    const booking = found.rows[0] as {
+      pick_list_id?: string; waybill?: string; apc_order_number?: string; courier?: string; status?: string
+    } | undefined;
+    if (!booking) return res.status(404).json({ error: 'Unknown booking' });
+    if (booking.status === 'cancelled') return res.json({ cancelled: true });
+    if (booking.courier !== 'APC') return res.status(409).json({ error: 'Only an APC collection can be cancelled here.' });
+
+    const orderNumber = text(booking.apc_order_number).trim();
+    const waybill = text(booking.waybill).trim();
+    const lookup = orderNumber || waybill;
+    if (!lookup) return res.status(409).json({ error: 'This booking has no APC order to cancel.' });
+
+    const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(lookup)}.json${orderNumber ? '' : '?searchtype=CarrierWaybill'}`;
+    const response = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'remote-user': remoteUser,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({ Orders: { Order: { Status: 'CANCELLED' } } }),
+    });
+    const raw = await response.text();
+    let payload: any = null;
+    try { payload = JSON.parse(raw); } catch { payload = null; }
+    const order = payload ? (asList<any>(payload?.Orders?.Order || payload?.Order)[0] || payload) : null;
+    const message = order ? apcMessages(order) : { ok: false, detail: '' };
+    const detail = `${message.detail} ${raw}`.toLowerCase();
+    const alreadyGone = /cancel|not found|does not exist/.test(detail);
+    if ((!response.ok || !message.ok) && !alreadyGone) {
+      return res.status(502).json({ error: message.detail || 'APC did not cancel the collection. It is still booked here.' });
+    }
+
+    await query(
+      `UPDATE collection_bookings
+          SET status = 'cancelled', updated_at = NOW()
+        WHERE pick_list_id = $1 AND waybill = $2 AND status <> 'cancelled'`,
+      [booking.pick_list_id, waybill]
+    );
+    if (waybill) {
+      await query(
+        `UPDATE pick_lists
+            SET tracking_number = NULL, carrier = NULL, updated_at = NOW()
+          WHERE id = $1 AND tracking_number = $2`,
+        [booking.pick_list_id, waybill]
+      );
+    }
+    return res.json({ cancelled: true });
+  } catch (error) {
+    console.error('APC cancel failed', error instanceof Error ? error.message : 'request failed');
+    return res.status(502).json({ error: 'Could not reach APC. The collection is still booked here.' });
+  }
+});
+
 const FAMILY_RULES: [RegExp, string][] = [
   [/^fern-/, 'Fern'],
   [/multidesk/, 'MultiDesk'],
