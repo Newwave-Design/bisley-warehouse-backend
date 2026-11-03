@@ -354,6 +354,7 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.dispatched_at,
          pl.is_archived,
          pl.archived_at,
+         pl.deferred_at,
          pl.payment_status,
          pl.last_event_at,
          pl.last_event_by,
@@ -551,6 +552,21 @@ router.post('/bulk-status', authMiddleware, async (req: AuthRequest, res: Respon
  * PATCH /api/pick-lists/:pickListId/status
  * Body: { status: string }
  */
+router.patch('/:pickListId/defer', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const deferred = req.body?.deferred !== false
+    const result = await query(
+      `UPDATE pick_lists SET deferred_at = ${deferred ? 'NOW()' : 'NULL'}
+       WHERE id = $1 RETURNING id, deferred_at`,
+      [req.params.pickListId]
+    )
+    if (!result.rows.length) return res.status(404).json({ error: 'Pick list not found' })
+    res.json({ pickList: result.rows[0] })
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to update deferral', details: error.message })
+  }
+})
+
 router.patch('/:pickListId/status', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const status = parseStatus(req.body?.status);
