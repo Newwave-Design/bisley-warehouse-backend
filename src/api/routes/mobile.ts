@@ -17,7 +17,7 @@ import { paidSql } from '../../lib/payment-status.js';
 import { COLOUR_NAMES, enrichSampleItems, extractColourCode, sampleColourList } from '../../lib/colour-names.js';
 import { formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
-import { attachPackaging } from '../../lib/pick-list-packaging.js';
+import { attachPackaging, shippingOption } from '../../lib/pick-list-packaging.js';
 
 const router = express.Router();
 
@@ -290,7 +290,8 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
         COALESCE(BOOL_OR(pli.product_sku ILIKE '%SAMPLE%'), false)             AS is_sample,
         json_agg(json_build_object(
           'product_sku', pli.product_sku, 'colour_code', pli.colour_code, 'item_title', pli.item_title
-        ) ORDER BY pli.line_number) FILTER (WHERE pli.product_sku ILIKE '%SAMPLE%') AS sample_lines
+        ) ORDER BY pli.line_number) FILTER (WHERE pli.product_sku ILIKE '%SAMPLE%') AS sample_lines,
+        json_agg(pli.product_sku) FILTER (WHERE pli.product_sku IS NOT NULL AND pli.product_sku NOT ILIKE '%SAMPLE%') AS item_skus
       FROM pick_lists pl
       LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id AND COALESCE(pli.is_archived, false) = false
       WHERE pl.is_archived = false AND ${paidSql('pl')} AND ($1::text[] IS NULL OR pl.status = ANY($1::text[]))
@@ -306,6 +307,8 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
         address_text: formatShippingAddressText(r.shipping_address, r.customer_name),
         sample_colours: sampleColourList(r.sample_lines),
         sample_lines: undefined,
+        shipping_type: [...new Set((Array.isArray(r.item_skus) ? r.item_skus : []).map((sku: string) => shippingOption(sku)).filter(Boolean))].join(' · '),
+        item_skus: undefined,
       })),
     });
   } catch (err) {

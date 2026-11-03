@@ -7,7 +7,7 @@ const SHIPPING_OPTION: Record<string, string> = JSON.parse(
 );
 
 /** Assembled MultiDesks are APC consignments, whatever their parts are linked to. */
-function shippingOption(sku: string, productCode: string): string | null {
+export function shippingOption(sku: string, productCode = ''): string | null {
   const upper = sku.toUpperCase();
   if (/^MD[MP]/.test(upper)) return 'APC - Consignment';
   const normalised = upper.replace(/-(\dS)(?=-|$)/, '/$1');
