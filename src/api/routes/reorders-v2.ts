@@ -30,7 +30,7 @@ interface SentRow { pick_list_item_id: string; sku: string; sent_at: Date; sent_
 interface MarkRow { pick_list_item_id: string; sku: string; sent_to_chris_at: Date; sent_to_chris_by: string | null }
 
 async function loadState() {
-  const [lines, sent, marks, flags, stock, costs] = await Promise.all([
+  const [lines, sent, marks, flags, stock, costs, bonded] = await Promise.all([
     buildLines(),
     query(`
       SELECT DISTINCT ON (l.pick_list_item_id, l.sku)
@@ -44,13 +44,26 @@ async function loadState() {
     query(`SELECT sku, trigger_quantity FROM reorder_v2_sku_flags WHERE trigger_quantity IS NOT NULL`),
     query(`SELECT product_sku, COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory GROUP BY product_sku`),
     query(`SELECT variant_sku, MAX(unit_cost_gbp)::float AS unit_cost_gbp FROM wms_products WHERE unit_cost_gbp IS NOT NULL GROUP BY variant_sku`),
+    query(`
+      SELECT DISTINCT soi.product_sku
+      FROM supplier_order_items soi
+      JOIN supplier_orders so ON so.id = soi.supplier_order_id
+      WHERE so.order_number IN ('OV010-504108', 'OV010-504206')
+        AND EXISTS (
+          SELECT 1 FROM warehouse_inventory wi
+          WHERE wi.product_sku = soi.product_sku
+          GROUP BY wi.product_sku
+          HAVING SUM(wi.quantity) > 0
+        )
+    `),
   ]);
   const sentByKey = new Map<string, SentRow>(sent.rows.map((r: SentRow) => [`${r.pick_list_item_id}|${r.sku}`, r]));
   const markByKey = new Map<string, MarkRow>(marks.rows.map((r: MarkRow) => [`${r.pick_list_item_id}|${r.sku}`, r]));
   const triggers = new Map<string, number>(flags.rows.map((r: { sku: string; trigger_quantity: number }) => [r.sku, Number(r.trigger_quantity)]));
   const onHand = new Map<string, number>(stock.rows.map((r: { product_sku: string; qty: number }) => [r.product_sku, r.qty]));
   const unitCost = new Map<string, number>(costs.rows.map((r: { variant_sku: string; unit_cost_gbp: number }) => [r.variant_sku, Number(r.unit_cost_gbp)]));
-  return { lines, sentByKey, markByKey, triggers, onHand, unitCost };
+  const bondedSkus = new Set<string>(bonded.rows.map((r: { product_sku: string }) => r.product_sku));
+  return { lines, sentByKey, markByKey, triggers, onHand, unitCost, bondedSkus };
 }
 
 function buySku(l: ReorderLine): string {
@@ -90,6 +103,7 @@ function presentLine(l: ReorderLine, state: Awaited<ReturnType<typeof loadState>
     trigger_quantity: trigger,
     needs_reorder: needsReorder(onHand, trigger),
     on_hand: onHand,
+    bonded: state.bondedSkus.has(buy) || state.bondedSkus.has(l.sku),
   };
 }
 
@@ -150,6 +164,7 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
       already_bought: g.already_bought,
       cover_weeks: recentWeekly > 0 ? Math.round((onHand / recentWeekly) * 10) / 10 : null,
       unsent_buy_units: g.unsent_buy_units,
+      bonded: state.bondedSkus.has(g.sku) || [...g.sold_skus].some((sku) => state.bondedSkus.has(sku)),
     };
   });
 
@@ -195,6 +210,7 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
       already_bought: 0,
       cover_weeks: null,
       unsent_buy_units: 0,
+      bonded: state.bondedSkus.has(sku),
     });
   }
 
