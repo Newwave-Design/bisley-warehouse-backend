@@ -1,4 +1,22 @@
+import { readFileSync } from 'fs';
 import { query } from '../db/index.js';
+
+/** SmartSuite "Link to Shipping" title for each listed product code. */
+const SHIPPING_OPTION: Record<string, string> = JSON.parse(
+  readFileSync(new URL('../data/shipping-options.json', import.meta.url), 'utf8')
+);
+
+/** Assembled MultiDesks are APC consignments, whatever their parts are linked to. */
+function shippingOption(sku: string, productCode: string): string | null {
+  const upper = sku.toUpperCase();
+  if (/^MD[MP]/.test(upper)) return 'APC - Consignment';
+  const normalised = upper.replace(/-(\dS)(?=-|$)/, '/$1');
+  if (SHIPPING_OPTION[normalised]) return SHIPPING_OPTION[normalised];
+  if (productCode && SHIPPING_OPTION[productCode]) return SHIPPING_OPTION[productCode];
+  const code = Object.keys(SHIPPING_OPTION).sort((a, b) => b.length - a.length)
+    .find((entry) => normalised === entry || normalised.startsWith(`${entry}-`));
+  return code ? SHIPPING_OPTION[code] : null;
+}
 
 /** Ship class the pick list shows. Packaging stores method, not the words parcel/box/pallet. */
 const PACKAGING_SHIP_TYPE: Record<string, 'Parcel' | 'Box' | 'Pallet'> = {
@@ -159,7 +177,8 @@ export async function attachPackaging<T extends { sku: string; quantity_required
     const productCode = codes.find(entry => exact === entry || exact.startsWith(`${entry}-`)) || '';
     const spec = productCode ? specByCode.get(productCode) : specByCode.get(exact);
     const method = chosen?.method || spec?.method || '';
-    if (!method && !chosen && !spec?.courier) return item;
+    const option = shippingOption(item.sku, productCode || exact);
+    if (!method && !chosen && !spec?.courier && !option) return item;
     const per = item.quantity_required > 0 ? item.quantity_required : 1;
     const lines = (chosen?.lines || []).map(line => ({
       code: line.code,
@@ -178,6 +197,7 @@ export async function attachPackaging<T extends { sku: string; quantity_required
         note: lines.length ? null : (PACKAGING_METHOD_NOTE[method] || null),
         items: lines,
         preferred_courier: spec?.courier || null,
+        shipping_option: option,
         weight_grams: spec?.weight ?? null,
         length_packed_mm: spec?.length ?? null,
         width_packed_mm: spec?.width ?? null,
