@@ -274,7 +274,7 @@ async function getPickListStockStatus(pickListId: string) {
  *   is_archived=true|false       filter by archive status (default false = show active lists only)
  *   search=smith                 matches customer name/email, pick list number or Medusa order id
  *   sku=H2910NL-av1              only pick lists containing this SKU (also returns per-line qty for it)
- *   sample=true                  only pick lists with a sample line (SKU contains SAMPLE); adds sample_item_count / sample_items_picked
+ *   sample=true                  only orders whose lines are all samples (SKU contains SAMPLE); adds sample_item_count / sample_items_picked
  *   sort=asc|desc                default asc (oldest-first by pick-list created time); Customer Orders view uses desc
  *   limit=50&offset=0            limit=0 returns every matching list (desktop pick lists)
  *   include_values=true          adds order_value { gross, net, vat, refunded, currency } per list (live from Medusa)
@@ -322,7 +322,8 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
     }
 
     if (String(req.query.sample).toLowerCase() === 'true') {
-      conditions.push(`EXISTS (SELECT 1 FROM pick_list_items pli3 WHERE pli3.pick_list_id = pl.id AND pli3.product_sku ILIKE '%SAMPLE%')`);
+      conditions.push(`EXISTS (SELECT 1 FROM pick_list_items pli3 WHERE pli3.pick_list_id = pl.id AND NOT pli3.is_archived AND pli3.product_sku ILIKE '%SAMPLE%')`);
+      conditions.push(`NOT EXISTS (SELECT 1 FROM pick_list_items pli4 WHERE pli4.pick_list_id = pl.id AND NOT pli4.is_archived AND pli4.product_sku NOT ILIKE '%SAMPLE%')`);
     }
 
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
