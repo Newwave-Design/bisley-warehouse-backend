@@ -278,7 +278,7 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
 
     const result = await query(`
       SELECT
-        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at,
+        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at,
         COALESCE(
           (SELECT parent.created_at FROM pick_lists parent WHERE parent.id = pl.parent_pick_list_id),
           pl.created_at
@@ -349,7 +349,7 @@ async function attachMobilePackaging(rows: any[]) {
 router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const pl = await query(`
-      SELECT id, pick_list_number, medusa_order_id, status, created_at,
+      SELECT id, pick_list_number, medusa_order_id, status, created_at, deferred_at,
              customer_name, customer_email, shipping_address
       FROM pick_lists WHERE id = $1
     `, [req.params.id]);
