@@ -359,6 +359,7 @@ ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_sandbox BOOLEAN NOT NULL DEFA
 -- Medusa's payment_status for the order (captured = paid); lists only reach the pick queue once paid
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS payment_status VARCHAR(40);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS payment_checked_at TIMESTAMP;
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS purchase_order_number VARCHAR(80);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS parent_pick_list_id UUID REFERENCES pick_lists(id) ON DELETE SET NULL;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS medusa_fulfillment_id VARCHAR(100);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT false;

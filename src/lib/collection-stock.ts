@@ -34,7 +34,7 @@ export async function takeStockForBookedCollection(pickListId: string, preferred
   const userId = await actorId(preferredActor);
   if (!userId) return;
   const found = await query(
-    `SELECT pl.id, pl.medusa_order_id, pl.is_sandbox, pl.payment_status,
+    `SELECT pl.id, pl.medusa_order_id, pl.is_sandbox, pl.payment_status, pl.purchase_order_number,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT cb.sku), NULL) AS skus
      FROM pick_lists pl
      JOIN collection_bookings cb ON cb.pick_list_id = pl.id AND cb.status <> 'cancelled'

@@ -1,5 +1,6 @@
 /**
- * Order payment status: only paid orders reach the pick queue, Supplier Re-orders and dispatch.
+ * Order payment status: paid orders reach the pick queue and dispatch.
+ * An order with a customer purchase order number does too, because those are paid after delivery.
  *
  * pick_lists.payment_status mirrors Medusa's order.payment_status ('captured' = paid). It is set when the order arrives
  * (with a few quick re-checks, because card payments can be captured moments after the order is placed) and refreshed
@@ -11,13 +12,18 @@ import { scheduleAllocationRun } from './allocation.js';
 
 export const PAID_STATUSES = ['captured', 'partially_refunded'] as const;
 
-/** SQL condition: the pick list (alias) is paid, or is a sandbox list. */
+/** SQL condition: the pick list (alias) is paid, has a purchase order, or is a sandbox list. */
 export function paidSql(alias = 'pl'): string {
-  return `(${alias}.is_sandbox OR ${alias}.payment_status IN ('captured', 'partially_refunded'))`;
+  return `(${alias}.is_sandbox OR ${alias}.payment_status IN ('captured', 'partially_refunded') OR COALESCE(${alias}.purchase_order_number, '') <> '')`;
 }
 
-export function isPaid(pickList: { is_sandbox?: boolean; payment_status?: string | null }): boolean {
-  return !!pickList.is_sandbox || PAID_STATUSES.includes(pickList.payment_status as any);
+export function isPaid(pickList: { is_sandbox?: boolean; payment_status?: string | null; purchase_order_number?: string | null }): boolean {
+  return !!pickList.is_sandbox || !!String(pickList.purchase_order_number || '').trim() || PAID_STATUSES.includes(pickList.payment_status as any);
+}
+
+export function purchaseOrderOf(metadata: Record<string, unknown> | null | undefined): string | null {
+  const value = metadata?.purchase_order_number;
+  return typeof value === 'string' && value.trim() ? value.trim().slice(0, 80) : null;
 }
 
 async function fetchStatuses(ids: string[]): Promise<Map<string, string>> {
@@ -25,14 +31,20 @@ async function fetchStatuses(ids: string[]): Promise<Map<string, string>> {
   for (let i = 0; i < ids.length; i += 40) {
     const batch = ids.slice(i, i + 40);
     const qs = batch.map((id) => `id=${encodeURIComponent(id)}`).join('&');
-    const data = await medusaGet(`/admin/orders?${qs}&limit=${batch.length}&fields=id,payment_status`);
+    const data = await medusaGet(`/admin/orders?${qs}&limit=${batch.length}&fields=id,payment_status,metadata`);
     for (const o of data?.orders ?? []) if (o.payment_status) out.set(o.id, o.payment_status);
+    for (const o of data?.orders ?? []) {
+      const po = purchaseOrderOf(o.metadata);
+      if (po) await storePurchaseOrder(o.id, po);
+    }
   }
   // The list hides archived orders, so look up whatever is still missing one by one
   for (const id of ids) {
     if (out.has(id)) continue;
-    const data = await medusaGet(`/admin/orders/${encodeURIComponent(id)}?fields=id,payment_status`);
+    const data = await medusaGet(`/admin/orders/${encodeURIComponent(id)}?fields=id,payment_status,metadata`);
     if (data?.order?.payment_status) out.set(id, data.order.payment_status);
+    const po = purchaseOrderOf(data?.order?.metadata);
+    if (po) await storePurchaseOrder(id, po);
   }
   return out;
 }
@@ -44,6 +56,15 @@ export async function storePaymentStatus(orderId: string, status: string): Promi
   await query(`UPDATE pick_lists SET payment_status = $2, payment_checked_at = NOW() WHERE ${match}`, [orderId, status]);
   if (changed.rows.length) scheduleAllocationRun(`payment status of order ${orderId} is now ${status}`);
   return changed.rows.length > 0;
+}
+
+async function storePurchaseOrder(orderId: string, purchaseOrder: string): Promise<void> {
+  const match = `(medusa_order_id = $1 OR left(medusa_order_id, length($1) + 3) = $1 || '-BO')`;
+  await query(
+    `UPDATE pick_lists SET purchase_order_number = $2, updated_at = NOW()
+     WHERE ${match} AND COALESCE(purchase_order_number, '') = ''`,
+    [orderId, purchaseOrder],
+  );
 }
 
 /** Look up the given Medusa orders and store their payment status on the matching pick lists (including split children). */

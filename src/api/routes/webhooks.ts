@@ -99,7 +99,7 @@ export interface ReconcileResult {
 
 const SKIP_STATUSES = new Set(['canceled', 'cancelled', 'archived', 'draft']);
 const SHIPPED_FULFILMENT = new Set(['fulfilled', 'shipped', 'delivered', 'canceled']);
-const ORDER_FIELDS = 'id,display_id,email,status,fulfillment_status,created_at,items.id,items.title,items.quantity,items.variant_id,items.product_id,items.variant_sku,shipping_address.*,shipping_methods.*';
+const ORDER_FIELDS = 'id,display_id,email,status,fulfillment_status,created_at,metadata,items.id,items.title,items.quantity,items.variant_id,items.product_id,items.variant_sku,shipping_address.*,shipping_methods.*';
 const orderSummary = (o: any): OrderSummary => ({
   display_id: o.display_id, order_id: o.id, created_at: o.created_at, email: o.email ?? null,
   items: (o.items ?? []).map((i: any) => i.variant_sku ?? null),
@@ -332,9 +332,10 @@ export async function handleOrderPlaced(order: any) {
         medusa_order_id, pick_list_number, status,
         customer_name, customer_email,
         shipping_method_name, shipping_method_code, shipping_address,
+        purchase_order_number,
         created_at, updated_at
       )
-      VALUES ($1, $2, 'PENDING', $3, $4, $5, $6, $7::jsonb, COALESCE($8::timestamptz AT TIME ZONE 'UTC', NOW()), NOW())
+      VALUES ($1, $2, 'PENDING', $3, $4, $5, $6, $7::jsonb, $9, COALESCE($8::timestamptz AT TIME ZONE 'UTC', NOW()), NOW())
       RETURNING id
     `, [
       medusaOrderId,
@@ -345,6 +346,7 @@ export async function handleOrderPlaced(order: any) {
       primaryShippingMethod?.id ?? primaryShippingMethod?.shipping_option_id ?? null,
       JSON.stringify(shippingSnapshot),
       order.created_at ?? null,
+      typeof order.metadata?.purchase_order_number === 'string' ? order.metadata.purchase_order_number.trim().slice(0, 80) || null : null,
     ]);
 
     pickListId = plResult.rows[0].id;
