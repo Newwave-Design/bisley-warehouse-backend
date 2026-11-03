@@ -356,6 +356,7 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.archived_at,
          pl.deferred_at,
          pl.payment_status,
+         pl.purchase_order_number,
          pl.last_event_at,
          pl.last_event_by,
          pl.last_event_summary,

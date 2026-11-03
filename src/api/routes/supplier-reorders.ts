@@ -127,7 +127,7 @@ export async function buildLines(): Promise<ReorderLine[]> {
       FROM wms_products WHERE variant_sku = pli.product_sku ORDER BY is_archived LIMIT 1
     ) wp ON true
     WHERE pl.status <> 'CANCELLED' AND NOT pl.is_sandbox AND NOT pl.is_archived
-      AND pl.payment_status IN ('captured', 'partially_refunded')
+      AND (pl.payment_status IN ('captured', 'partially_refunded') OR COALESCE(pl.purchase_order_number, '') <> '')
       AND NOT pli.is_sandbox AND NOT pli.is_archived
       AND pli.product_sku NOT LIKE 'FINSAMPLE-%'
     ORDER BY pl.created_at DESC, pli.line_number
