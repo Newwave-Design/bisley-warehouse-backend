@@ -6,10 +6,14 @@ const SHIPPING_OPTION: Record<string, string> = JSON.parse(
   readFileSync(new URL('../data/shipping-options.json', import.meta.url), 'utf8')
 );
 
-/** Assembled MultiDesks are APC consignments, whatever their parts are linked to. */
+/** MultiDesk desks, tops and legs go DX. */
+function isMultiDesk(sku: string): boolean {
+  return /^MD(?:M|P|HLEG|WLEG|TM|TP)/.test(sku.toUpperCase());
+}
+
 export function shippingOption(sku: string, productCode = ''): string | null {
   const upper = sku.toUpperCase();
-  if (/^MD[MP]/.test(upper)) return 'APC - Consignment';
+  if (isMultiDesk(upper) || isMultiDesk(productCode)) return 'DX';
   const normalised = upper.replace(/-(\dS)(?=-|$)/, '/$1');
   if (SHIPPING_OPTION[normalised]) return SHIPPING_OPTION[normalised];
   if (productCode && SHIPPING_OPTION[productCode]) return SHIPPING_OPTION[productCode];
@@ -196,7 +200,7 @@ export async function attachPackaging<T extends { sku: string; quantity_required
         type: PACKAGING_SHIP_TYPE[method] || null,
         note: lines.length ? null : (PACKAGING_METHOD_NOTE[method] || null),
         items: lines,
-        preferred_courier: spec?.courier || null,
+        preferred_courier: isMultiDesk(exact) || isMultiDesk(productCode) ? 'DX' : (spec?.courier || null),
         shipping_option: option,
         weight_grams: spec?.weight ?? null,
         length_packed_mm: spec?.length ?? null,
