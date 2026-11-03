@@ -171,7 +171,8 @@ export async function attachPackaging<T extends { sku: string; quantity_required
     return codes.find(code => upper.startsWith(`${code}-`)) || '';
   };
 
-  return groups.map(items => items.map(item => {
+  return groups.map(items => {
+    const packed = items.map(item => {
     if (!item.sku) return item;
     const exact = item.sku.toUpperCase();
     const bom = bomBySku.get(exact);
@@ -212,5 +213,19 @@ export async function attachPackaging<T extends { sku: string; quantity_required
         box_height_mm: box?.height ?? null,
       },
     };
-  }));
+    });
+    const desk = packed.some((item) => {
+      const row = item as { sku?: string; title?: string; item_title?: string; product_title?: string; packaging?: { product_code?: string | null } };
+      return isMultiDesk(row.sku || '') || isMultiDesk(row.packaging?.product_code || '') || /multidesk/i.test(`${row.title || ''} ${row.item_title || ''} ${row.product_title || ''}`);
+    });
+    if (!desk) return packed;
+    return packed.map((item) => ({
+      ...item,
+      packaging: {
+        ...(item.packaging || {}),
+        preferred_courier: 'DX',
+        shipping_option: 'DX',
+      },
+    }));
+  });
 }
