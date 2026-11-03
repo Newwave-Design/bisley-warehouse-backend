@@ -11,17 +11,17 @@ const router = express.Router();
 const QUOTE_URL = 'https://apc.hypaship.com/api/3.0/ServiceAvailability.json';
 const ORDER_URL = 'https://apc.hypaship.com/api/3.0/Orders.json';
 const COLLECTION = {
-  CompanyName: 'Ovara',
+  CompanyName: 'OVARA PRODUCTS LIMITED',
   AddressLine1: 'Unit B7A, Brecon House',
   AddressLine2: 'Mamhilad Park Estate',
   PostalCode: 'NP4 0HZ',
   City: 'Pontypool',
   County: 'Torfaen',
   CountryCode: 'GB',
-  // A collection away from the APC account address is a third-party pickup, so APC requires a contact.
   Contact: {
-    PersonName: 'Ovara Warehouse',
-    PhoneNumber: '01495830401',
+    PersonName: 'OVARA PRODUCTS LIMITED',
+    PhoneNumber: '01873900095',
+    Email: 'accounts@ovara.co.uk',
   },
 };
 
