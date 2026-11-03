@@ -12,8 +12,11 @@ function londonToday(): string {
 
 function collectionDay(raw: string | null): string {
   const value = String(raw || '').trim();
-  const slash = value.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-  if (slash) return `${slash[3]}-${slash[2].padStart(2, '0')}-${slash[1].padStart(2, '0')}`;
+  const slash = value.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (slash) {
+    const year = slash[3].length === 2 ? `20${slash[3]}` : slash[3];
+    return `${year}-${slash[2].padStart(2, '0')}-${slash[1].padStart(2, '0')}`;
+  }
   const iso = value.slice(0, 10);
   return /^\d{4}-\d{2}-\d{2}$/.test(iso) ? iso : '';
 }
