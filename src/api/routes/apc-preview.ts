@@ -7,7 +7,7 @@ import express, { Response } from 'express';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { getPool, query } from '../../db/index.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
-import { takeStockForBookedCollection } from '../../lib/collection-stock.js';
+import { returnStockForCancelledCollection, takeStockForBookedCollection } from '../../lib/collection-stock.js';
 
 const router = express.Router();
 const QUOTE_URL = 'https://apc.hypaship.com/api/3.0/ServiceAvailability.json';
@@ -518,6 +518,11 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
           WHERE id = $1 AND tracking_number = $2`,
         [booking.pick_list_id, waybill]
       );
+    }
+    if (booking.pick_list_id && waybill) {
+      await returnStockForCancelledCollection(booking.pick_list_id, waybill, text(req.user?.id)).catch((error) => {
+        console.warn('Returning cancelled collection stock failed', error instanceof Error ? error.message : 'failed');
+      });
     }
     return res.json({ cancelled: true });
   } catch (error) {

@@ -65,6 +65,73 @@ export async function takeStockForBookedCollection(pickListId: string, preferred
   scheduleAllocationRun(`collection booked for pick list ${pickListId}`);
 }
 
+/** Puts booked stock back when the collection is cancelled, so a rebook can take it off again. */
+export async function returnStockForCancelledCollection(pickListId: string, waybill: string, preferredActor?: string | null): Promise<void> {
+  const userId = await actorId(preferredActor);
+  if (!userId || !waybill) return;
+  const items = await query(
+    `SELECT pli.id
+     FROM pick_list_items pli
+     JOIN collection_bookings cb
+       ON cb.pick_list_id = pli.pick_list_id AND cb.sku = pli.product_sku
+     WHERE pli.pick_list_id = $1 AND cb.waybill = $2 AND cb.status = 'cancelled'`,
+    [pickListId, waybill],
+  );
+  const itemIds = items.rows.map((row) => row.id);
+  if (!itemIds.length) return;
+
+  const client = await getPool().connect();
+  const changed = new Set<string>();
+  try {
+    await client.query('BEGIN');
+    const nets = await client.query(
+      `SELECT pick_list_item_id, product_sku, location_id, SUM(quantity)::int AS qty
+       FROM warehouse_movements
+       WHERE pick_list_item_id = ANY($1::uuid[])
+       GROUP BY pick_list_item_id, product_sku, location_id
+       HAVING SUM(quantity) < 0`,
+      [itemIds],
+    );
+    for (const row of nets.rows) {
+      const putBack = -parseInt(row.qty, 10);
+      if (putBack <= 0) continue;
+      if (row.location_id) {
+        const updated = await client.query(
+          `UPDATE warehouse_inventory
+           SET quantity = quantity + $1,
+               quantity_reserved = quantity_reserved + $1,
+               updated_at = NOW()
+           WHERE location_id = $2 AND product_sku = $3`,
+          [putBack, row.location_id, row.product_sku],
+        );
+        if (!updated.rowCount) {
+          await client.query(
+            `INSERT INTO warehouse_inventory (location_id, product_sku, quantity, quantity_reserved)
+             VALUES ($1, $2, $3, $3)`,
+            [row.location_id, row.product_sku, putBack],
+          );
+        }
+      }
+      await client.query(
+        `INSERT INTO warehouse_movements
+           (movement_type, location_id, product_sku, quantity, notes, performed_by, pick_list_item_id)
+         VALUES ('RETURN', $1, $2, $3, 'Collection cancelled', $4, $5)`,
+        [row.location_id, row.product_sku, putBack, userId, row.pick_list_item_id],
+      );
+      changed.add(row.product_sku);
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+  if (!changed.size) return;
+  await pushStock([...changed]);
+  scheduleAllocationRun(`collection cancelled for pick list ${pickListId}`);
+}
+
 /** Removes stock for every open booked collection that has not already been taken. */
 export async function takeStockForOpenCollections(): Promise<void> {
   const found = await query(

@@ -44,7 +44,9 @@ export async function applyDispatchStock(
   const alreadyTaken = new Set(
     (await client.query(
       `SELECT pick_list_item_id FROM warehouse_movements
-       WHERE movement_type = 'DISPATCH' AND pick_list_item_id = ANY($1::uuid[])`,
+       WHERE pick_list_item_id = ANY($1::uuid[])
+       GROUP BY pick_list_item_id
+       HAVING SUM(quantity) < 0`,
       [items.map((item) => item.id)],
     )).rows.map((row) => row.pick_list_item_id),
   );
