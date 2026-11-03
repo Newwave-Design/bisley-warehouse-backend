@@ -19,10 +19,6 @@ const COLLECTION = {
   City: 'Pontypool',
   County: 'Torfaen',
   CountryCode: 'GB',
-  Contact: {
-    PhoneNumber: '01873900095',
-    Email: 'accounts@ovara.co.uk',
-  },
 };
 
 interface PieceInput {
