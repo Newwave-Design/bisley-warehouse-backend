@@ -43,6 +43,18 @@ export async function shipCollectionsDueToday(): Promise<string[]> {
         .map((row) => row.id),
     )];
     if (!ids.length) return [];
+    await query(
+      `UPDATE pick_lists pl
+       SET tracking_number = cb.waybill, carrier = 'APC', updated_at = NOW()
+       FROM (
+         SELECT DISTINCT ON (pick_list_id) pick_list_id, waybill
+         FROM collection_bookings
+         WHERE status <> 'cancelled' AND COALESCE(waybill, '') <> ''
+         ORDER BY pick_list_id, created_at DESC
+       ) cb
+       WHERE pl.id = cb.pick_list_id AND pl.id = ANY($1::uuid[])`,
+      [ids],
+    );
     await recordPickListEvents({
       ids,
       actor: 'system',
