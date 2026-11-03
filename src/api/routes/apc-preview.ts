@@ -19,7 +19,6 @@ const COLLECTION = {
   County: 'Torfaen',
   CountryCode: 'GB',
   Contact: {
-    PersonName: 'OVARA PRODUCTS LIMITED',
     PhoneNumber: '01873900095',
     Email: 'accounts@ovara.co.uk',
   },
