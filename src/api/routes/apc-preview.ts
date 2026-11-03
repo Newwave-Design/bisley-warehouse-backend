@@ -431,7 +431,8 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
       return res.status(409).json({ error: 'This booking has no tracking number yet.' });
     }
 
-    const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(waybill)}.json?labelformat=PDF&markprinted=False&searchtype=CarrierWaybill&labels=True`;
+    const format = text(req.query.format).toUpperCase() === 'ZPL' ? 'ZPL' : 'PDF';
+    const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(waybill)}.json?labelformat=${format}&markprinted=False&searchtype=CarrierWaybill&labels=True`;
     const response = await fetch(url, {
       headers: {
         'remote-user': remoteUser,
