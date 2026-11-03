@@ -1,4 +1,5 @@
 import { query } from '../db/index.js';
+import { takeStockForOpenCollections } from './collection-stock.js';
 import { fulfillPickListsInMedusa } from './medusa-fulfillment.js';
 import { recordPickListEvents } from './pick-list-events.js';
 
@@ -28,6 +29,9 @@ export async function shipCollectionsDueToday(): Promise<string[]> {
   if (running) return [];
   running = true;
   try {
+    await takeStockForOpenCollections().catch((error) => {
+      console.warn('Removing booked collection stock failed', error instanceof Error ? error.message : 'failed');
+    });
     const today = londonToday();
     const found = await query(
       `SELECT pl.id, cb.collection_date

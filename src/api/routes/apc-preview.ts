@@ -7,6 +7,7 @@ import express, { Response } from 'express';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { getPool, query } from '../../db/index.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
+import { takeStockForBookedCollection } from '../../lib/collection-stock.js';
 
 const router = express.Router();
 const QUOTE_URL = 'https://apc.hypaship.com/api/3.0/ServiceAvailability.json';
@@ -358,6 +359,9 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     }
 
     console.log(`APC collection booked ${waybill} for pick list ${pickListId}`);
+    await takeStockForBookedCollection(pickListId, text(req.user?.id)).catch((error) => {
+      console.warn('Removing booked collection stock failed', error instanceof Error ? error.message : 'failed');
+    });
     await shipCollectionsDueToday().catch((error) => {
       console.warn('Shipping today\'s collections failed', error instanceof Error ? error.message : 'failed');
     });

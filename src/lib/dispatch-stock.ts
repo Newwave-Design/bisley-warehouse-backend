@@ -20,6 +20,7 @@ export async function applyDispatchStock(
   client: PoolClient,
   pickList: { id: string; medusa_order_id: string | null },
   userId: string,
+  onlySkus?: string[],
 ): Promise<DispatchStockResult> {
   const items = (await client.query(
     `SELECT pli.id, pli.product_sku, pli.quantity_picked, pli.picked_from_location_id, pli.is_custom,
@@ -35,12 +36,24 @@ export async function applyDispatchStock(
     [pickList.id],
   )).rows;
 
+  if (!items.length) return { syncSkus: [], shortfalls: [] };
+
   const syncSkus = new Set<string>();
   const shortfalls: DispatchShortfall[] = [];
+  const wanted = onlySkus?.length ? new Set(onlySkus) : null;
+  const alreadyTaken = new Set(
+    (await client.query(
+      `SELECT pick_list_item_id FROM warehouse_movements
+       WHERE movement_type = 'DISPATCH' AND pick_list_item_id = ANY($1::uuid[])`,
+      [items.map((item) => item.id)],
+    )).rows.map((row) => row.pick_list_item_id),
+  );
 
   for (const item of items) {
     const picked = parseInt(item.quantity_picked, 10);
     if (!item.product_sku || !picked) continue;
+    if (wanted && !wanted.has(item.product_sku)) continue;
+    if (alreadyTaken.has(item.id)) continue;
 
     // Custom (no SKU) lines carry no stock: record the sale so Stock Sold can list it
     if (item.is_custom) {
