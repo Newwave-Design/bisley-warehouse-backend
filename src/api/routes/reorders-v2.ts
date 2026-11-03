@@ -4,8 +4,8 @@
  * Rows come from the same paid-order calculation as Supplier Re-orders. A row counts as already sent
  * when the current spreadsheet log has it, or when someone marks it sent to Chris here. Nothing is emailed.
  * Run rates are every SKU on those paid orders, plus any SKU with stock on hand that has never sold.
- * Already bought is the buy quantity of lines on the Supplier Re-orders Sent tab:
- * a send to Bisley that has a sent date. Not-sent rows and the separate supplier-orders list are not included.
+ * Already bought is every unit on a supplier re-order send for that SKU, plus any line marked sent to Chris
+ * that is not already on a send. Sold is every paid sale. Still to buy is the sold quantity not yet sent.
  * Do-not-reorder is stored against the buy SKU and hides later sales of that SKU from the buying list.
  * It can only be set when that SKU has stock on hand. Clearing the flag is always allowed.
  *
@@ -30,7 +30,7 @@ interface SentRow { pick_list_item_id: string; sku: string; sent_at: Date; sent_
 interface MarkRow { pick_list_item_id: string; sku: string; sent_to_chris_at: Date; sent_to_chris_by: string | null }
 
 async function loadState() {
-  const [lines, sent, marks, flags, stock, costs, bonded] = await Promise.all([
+  const [lines, sent, marks, reordered, flags, stock, costs, bonded] = await Promise.all([
     buildLines(),
     query(`
       SELECT DISTINCT ON (l.pick_list_item_id, l.sku)
@@ -41,6 +41,7 @@ async function loadState() {
       ORDER BY l.pick_list_item_id, l.sku, s.sent_at DESC
     `),
     query(`SELECT pick_list_item_id, sku, sent_to_chris_at, sent_to_chris_by FROM reorder_v2_line_marks WHERE sent_to_chris_at IS NOT NULL`),
+    query(`SELECT sku, SUM(quantity)::int AS qty FROM supplier_reorder_send_lines GROUP BY sku`),
     query(`SELECT sku, trigger_quantity FROM reorder_v2_sku_flags WHERE trigger_quantity IS NOT NULL`),
     query(`SELECT product_sku, COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory GROUP BY product_sku`),
     query(`SELECT variant_sku, MAX(unit_cost_gbp)::float AS unit_cost_gbp FROM wms_products WHERE unit_cost_gbp IS NOT NULL GROUP BY variant_sku`),
@@ -60,10 +61,11 @@ async function loadState() {
   const sentByKey = new Map<string, SentRow>(sent.rows.map((r: SentRow) => [`${r.pick_list_item_id}|${r.sku}`, r]));
   const markByKey = new Map<string, MarkRow>(marks.rows.map((r: MarkRow) => [`${r.pick_list_item_id}|${r.sku}`, r]));
   const triggers = new Map<string, number>(flags.rows.map((r: { sku: string; trigger_quantity: number }) => [r.sku, Number(r.trigger_quantity)]));
+  const reorderedBySku = new Map<string, number>(reordered.rows.map((r: { sku: string; qty: number }) => [r.sku, Number(r.qty)]));
   const onHand = new Map<string, number>(stock.rows.map((r: { product_sku: string; qty: number }) => [r.product_sku, r.qty]));
   const unitCost = new Map<string, number>(costs.rows.map((r: { variant_sku: string; unit_cost_gbp: number }) => [r.variant_sku, Number(r.unit_cost_gbp)]));
   const bondedSkus = new Set<string>(bonded.rows.map((r: { product_sku: string }) => r.product_sku));
-  return { lines, sentByKey, markByKey, triggers, onHand, unitCost, bondedSkus };
+  return { lines, sentByKey, markByKey, triggers, onHand, unitCost, bondedSkus, reorderedBySku };
 }
 
 function buySku(l: ReorderLine): string {
@@ -114,7 +116,7 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
   const groups = new Map<string, {
     sku: string; title: string; colour: string; sold_skus: Set<string>
     sold_units: number; buy_units: number; orders: Set<string>
-    first: number; last: number; sold_30d: number; sold_7d: number; unsent_buy_units: number; already_bought: number
+    first: number; last: number; sold_30d: number; sold_7d: number; unsent_buy_units: number; marked_units: number
   }>();
 
   for (const l of lines) {
@@ -123,7 +125,7 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
     const g = groups.get(sku) ?? {
       sku, title: l.title, colour: l.colour, sold_skus: new Set<string>(),
       sold_units: 0, buy_units: 0, orders: new Set<string>(),
-      first: Infinity, last: 0, sold_30d: 0, sold_7d: 0, unsent_buy_units: 0, already_bought: 0,
+      first: Infinity, last: 0, sold_30d: 0, sold_7d: 0, unsent_buy_units: 0, marked_units: 0,
     };
     g.sold_skus.add(l.sku);
     g.sold_units += l.sold_quantity;
@@ -135,9 +137,20 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
     if (at >= recent) g.sold_30d += l.sold_quantity;
     if (at >= week) g.sold_7d += l.sold_quantity;
     if (!row.previously_sent_at && !row.sent_to_chris_at) g.unsent_buy_units += l.quantity;
-    if (row.sent_to_bisley) g.already_bought += l.quantity;
+    if (row.sent_to_chris_at && !row.previously_sent_at) g.marked_units += l.quantity;
     if (l.title) g.title = l.title;
     groups.set(sku, g);
+  }
+
+  const claimed = new Set<string>();
+  function reorderedUnits(skus: string[]) {
+    let total = 0;
+    for (const sku of skus) {
+      if (claimed.has(sku)) continue;
+      claimed.add(sku);
+      total += state.reorderedBySku.get(sku) ?? 0;
+    }
+    return total;
   }
 
   const sold = [...groups.values()].map(g => {
@@ -161,7 +174,7 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
       unit_cost_gbp: state.unitCost.get(g.sku) ?? null,
       trigger_quantity: state.triggers.get(g.sku) ?? null,
       needs_reorder: needsReorder(onHand, state.triggers.get(g.sku) ?? null),
-      already_bought: g.already_bought,
+      already_bought: reorderedUnits([g.sku, ...g.sold_skus]) + g.marked_units,
       cover_weeks: recentWeekly > 0 ? Math.round((onHand / recentWeekly) * 10) / 10 : null,
       unsent_buy_units: g.unsent_buy_units,
       bonded: state.bondedSkus.has(g.sku) || [...g.sold_skus].some((sku) => state.bondedSkus.has(sku)),
@@ -207,11 +220,46 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
       unit_cost_gbp: state.unitCost.get(sku) ?? null,
       trigger_quantity: state.triggers.get(sku) ?? null,
       needs_reorder: needsReorder(onHand, state.triggers.get(sku) ?? null),
-      already_bought: 0,
+      already_bought: reorderedUnits([sku]),
       cover_weeks: null,
       unsent_buy_units: 0,
       bonded: state.bondedSkus.has(sku),
     });
+  }
+
+  const onlyReordered = [...state.reorderedBySku.keys()].filter((sku) => !claimed.has(sku));
+  if (onlyReordered.length) {
+    const found = await query(
+      `SELECT DISTINCT ON (variant_sku) variant_sku, product_title, colour_name, colour_code
+       FROM wms_products WHERE variant_sku = ANY($1)
+       ORDER BY variant_sku, is_archived`,
+      [onlyReordered]
+    );
+    const named = new Map(found.rows.map((row: { variant_sku: string; product_title: string; colour_name: string; colour_code: string }) => [row.variant_sku, row]));
+    for (const sku of onlyReordered) {
+      const meta = named.get(sku);
+      sold.push({
+        sku,
+        title: meta?.product_title || sku,
+        colour: meta?.colour_name || meta?.colour_code || '',
+        sold_units: 0,
+        buy_units: 0,
+        orders: 0,
+        first_sold: null,
+        last_sold: null,
+        per_week: 0,
+        sold_30d: 0,
+        sold_7d: 0,
+        on_hand: state.onHand.get(sku) ?? 0,
+        unit_cost_gbp: state.unitCost.get(sku) ?? null,
+        trigger_quantity: state.triggers.get(sku) ?? null,
+        needs_reorder: needsReorder(state.onHand.get(sku) ?? 0, state.triggers.get(sku) ?? null),
+        already_bought: reorderedUnits([sku]),
+        cover_weeks: null,
+        unsent_buy_units: 0,
+        bonded: state.bondedSkus.has(sku),
+      });
+    }
   }
 
   return sold.sort((a, b) => b.per_week - a.per_week || b.sold_units - a.sold_units || a.sku.localeCompare(b.sku));
