@@ -18,6 +18,7 @@ import { COLOUR_NAMES, enrichSampleItems, extractColourCode, sampleColourList } 
 import { formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
 import { attachPackaging, shippingOption } from '../../lib/pick-list-packaging.js';
+import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 
 const router = express.Router();
 
@@ -264,6 +265,9 @@ router.post('/undo', authMiddleware, async (req: AuthRequest, res: Response) => 
  */
 router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
+    await shipCollectionsDueToday().catch((error) => {
+      console.warn('Shipping today\'s collections failed', error instanceof Error ? error.message : 'failed');
+    });
     const statusParam = ((req.query.status as string) || 'PENDING,IN_PROGRESS').toUpperCase();
     const statuses = statusParam === 'ALL' ? null : statusParam.split(',').map(s => s.trim());
     const orderDir = String(req.query.sort).toLowerCase() === 'desc' ? 'DESC' : 'ASC';

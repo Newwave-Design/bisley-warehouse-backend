@@ -12,6 +12,7 @@ import { ensureFulfillmentSchema } from './db/ensure-fulfillment-schema.js';
 import { ensurePickListEvents } from './db/ensure-pick-list-events.js';
 import { ensureStockSoldAudit } from './db/ensure-stock-sold-audit.js';
 import { ensurePackagingSchema } from './db/ensure-packaging-schema.js';
+import { shipCollectionsDueToday } from './lib/ship-todays-collections.js';
 import packagingRoutes from './api/routes/packaging.js';
 import productMarginRoutes from './api/routes/product-margins.js';
 import scanningRoutes from './api/routes/scanning.js';
@@ -312,6 +313,13 @@ async function start() {
 
       // Stock Sold V2: allocation is also triggered by every change that affects it, this run catches anything missed
       setInterval(() => scheduleAllocationRun('scheduled safety run', 0), 5 * 60 * 1000);
+
+      const runTodaysCollections = () => {
+        void shipCollectionsDueToday().catch((err) => console.warn('[scheduler] Today\'s collections:', err));
+      };
+      setInterval(runTodaysCollections, 5 * 60 * 1000);
+      setTimeout(runTodaysCollections, 15 * 1000);
+      console.log('✓ Today\'s collections ship themselves (every 5 min)');
       setTimeout(() => scheduleAllocationRun('startup run', 0), 45 * 1000);
       console.log('✓ Stock Sold V2 allocation safety run scheduled (every 5 min)');
     }

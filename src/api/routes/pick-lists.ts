@@ -19,6 +19,7 @@ import { getDeliveryDues } from '../../lib/delivery-due.js';
 import { COLOUR_NAMES, enrichSampleItems, extractColourCode, isSampleSku, sampleColourList, sampleColourName } from '../../lib/colour-names.js';
 import { actorName, PICK_LIST_STATUSES, recordPickListEvents, type PickListStatus } from '../../lib/pick-list-events.js';
 import { fulfillPickListInMedusa, fulfillPickListsInMedusa } from '../../lib/medusa-fulfillment.js';
+import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { buildSampleAddressZpl, formatSampleAddressLabel, formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { attachPackaging } from '../../lib/pick-list-packaging.js';
 
@@ -281,6 +282,9 @@ async function getPickListStockStatus(pickListId: string) {
  */
 router.get('/', authMiddleware, async (req: Request, res: Response) => {
   try {
+    await shipCollectionsDueToday().catch((error) => {
+      console.warn('Shipping today\'s collections failed', error instanceof Error ? error.message : 'failed');
+    });
     const { status = 'UNFULFILLED', is_archived = 'false', limit = '50', offset = '0', search, sku, sort } = req.query;
 
     const statusParam = (status as string).toUpperCase();
