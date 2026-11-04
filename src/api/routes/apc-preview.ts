@@ -8,6 +8,7 @@ import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { getPool, query } from '../../db/index.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { returnStockForCancelledCollection, takeStockForBookedCollection } from '../../lib/collection-stock.js';
+import { fitZpl } from '../../lib/zpl-fit.js';
 
 const router = express.Router();
 const QUOTE_URL = 'https://apc.hypaship.com/api/3.0/ServiceAvailability.json';
@@ -557,6 +558,12 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
     const labels = payload ? collectLabels(payload) : [];
     if (!response.ok || !labels.length) {
       return res.status(502).json({ error: 'APC did not return the label. Print it again in a few seconds.' });
+    }
+    if (format === 'ZPL') {
+      for (const label of labels) {
+        const zpl = Buffer.from(label.content, 'base64').toString('latin1');
+        if (zpl.includes('^XA')) label.content = Buffer.from(fitZpl(zpl), 'latin1').toString('base64');
+      }
     }
     return res.json({ labels });
   } catch (error) {
