@@ -35,13 +35,72 @@ function asList<T>(value: T | T[] | null | undefined): T[] {
   return Array.isArray(value) ? value : [value];
 }
 
-function nextCollectionDate(): string {
-  const date = new Date();
-  date.setDate(date.getDate() + 1);
-  while (date.getDay() === 0 || date.getDay() === 6) date.setDate(date.getDate() + 1);
-  const day = String(date.getDate()).padStart(2, '0');
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  return `${day}/${month}/${date.getFullYear()}`;
+function londonParts(now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/London',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(now);
+  const read = (type: string) => parts.find((part) => part.type === type)?.value || '';
+  return {
+    year: Number(read('year')),
+    month: Number(read('month')),
+    day: Number(read('day')),
+    weekday: read('weekday'),
+    hour: Number(read('hour')),
+    minute: Number(read('minute')),
+  };
+}
+
+function apcDate(year: number, month: number, day: number): string {
+  return `${String(day).padStart(2, '0')}/${String(month).padStart(2, '0')}/${year}`;
+}
+
+function shiftLondonDate(days: number, now = new Date()) {
+  const parts = londonParts(now);
+  return londonParts(new Date(Date.UTC(parts.year, parts.month - 1, parts.day + days, 12)));
+}
+
+function weekend(weekday: string): boolean {
+  return weekday === 'Sat' || weekday === 'Sun';
+}
+
+function nextCollectionDate(now = new Date()): string {
+  for (let days = 1; days < 8; days += 1) {
+    const shifted = shiftLondonDate(days, now);
+    if (!weekend(shifted.weekday)) return apcDate(shifted.year, shifted.month, shifted.day);
+  }
+  const fallback = shiftLondonDate(1, now);
+  return apcDate(fallback.year, fallback.month, fallback.day);
+}
+
+function todayCollectionDate(now = new Date()): string | null {
+  const parts = londonParts(now);
+  if (weekend(parts.weekday)) return null;
+  return apcDate(parts.year, parts.month, parts.day);
+}
+
+function londonStamp(now = new Date()): string {
+  const parts = londonParts(now);
+  const hour = String(parts.hour).padStart(2, '0');
+  const minute = String(parts.minute).padStart(2, '0');
+  return `${parts.year}${String(parts.month).padStart(2, '0')}${String(parts.day).padStart(2, '0')}${hour}${minute}`;
+}
+
+function bookingStamp(value: string): string {
+  const match = value.match(/^(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}))?/);
+  if (!match) return '';
+  return `${match[3]}${match[2]}${match[1]}${match[4] || '23'}${match[5] || '59'}`;
+}
+
+function dateSortKey(value: string): number {
+  const match = value.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+  return match ? Number(`${match[3]}${match[2]}${match[1]}`) : 0;
 }
 
 function authHeader(): string | null {
@@ -70,7 +129,7 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
     return res.status(400).json({ error: 'Collection and delivery postcodes are required' });
   }
 
-  const collectionDate = text(req.body?.collectionDate).trim() || nextCollectionDate();
+  const requestedDate = text(req.body?.collectionDate).trim();
   const items = pieces.map((piece) => ({
     Type: 'ALL',
     Weight: text(piece.weightKg, '1'),
@@ -79,69 +138,39 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
     Height: text(piece.heightCm, '1'),
     Reference: text(piece.reference),
   }));
-
-  const body = {
-    Orders: {
-      Order: {
-        CollectionDate: collectionDate,
-        ReadyAt: '09:00',
-        ClosedAt: '17:00',
-        Collection: { PostalCode: collectionPostcode, CountryCode: 'GB' },
-        Delivery: { PostalCode: deliveryPostcode, CountryCode: 'GB' },
-        GoodsInfo: { GoodsValue: '50', Fragile: 'false' },
-        ShipmentDetails: {
-          NumberOfPieces: String(items.length),
-          Items: { Item: items.length === 1 ? items[0] : items },
-        },
-      },
-    },
-  };
+  const today = todayCollectionDate();
+  const dates = requestedDate
+    ? [requestedDate]
+    : [today, nextCollectionDate()].filter((date, index, list): date is string => Boolean(date) && list.indexOf(date) === index);
 
   try {
-    const response = await fetch(QUOTE_URL, {
-      method: 'POST',
-      headers: {
-        'remote-user': remoteUser,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
-    const raw = await response.text();
-    let payload: any = null;
-    try { payload = JSON.parse(raw); } catch { payload = null; }
-    if (!response.ok || !payload) {
-      return res.status(502).json({ error: 'APC did not return a service list' });
-    }
+    const quoted = await Promise.all(dates.map((collectionDate) => quoteCollectionDate(remoteUser, collectionDate, collectionPostcode, deliveryPostcode, items)));
+    const failed = quoted.find((entry) => !entry.ok);
+    if (failed) return res.status(502).json({ error: 'APC did not return a service list' });
 
-    const availability = payload.ServiceAvailability || payload;
-    const message = availability.Messages || null;
-    const services = asList<any>(availability.Services?.Service).map((service) => {
-      const total = service.TotalCost ?? service.Rate ?? null;
-      return {
-        code: text(service.ProductCode),
-        name: text(service.ServiceName),
-        carrier: text(service.Carrier),
-        ruleMatch: String(service['@RuleMatch'] || service.RuleMatch || '').toLowerCase() === 'true',
-        ruleName: text(service['@RuleMatchName'] || service.RuleMatchName),
-        itemType: text(service.ItemType),
-        tracked: String(service.Tracked).toLowerCase() === 'true',
-        signed: String(service.Signed).toLowerCase() === 'true',
-        collectionDate: text(service.CollectionDate),
-        estimatedDeliveryDate: text(service.EstimatedDeliveryDate),
-        latestBooking: text(service.LatestBookingDateTime),
-        totalCost: total == null || total === '' ? null : text(total),
-        currency: text(service.Currency),
-      };
-    }).filter((service) => service.code);
+    const byDate = new Map<string, QuotedService[]>();
+    for (const entry of quoted) {
+      for (const service of entry.services) {
+        if (!requestedDate && !openForBooking(service.latestBooking)) continue;
+        const date = service.collectionDate || entry.collectionDate;
+        const list = byDate.get(date) || [];
+        if (!list.some((existing) => existing.code === service.code)) list.push(service);
+        byDate.set(date, list);
+      }
+    }
+    const collectionDates = [...byDate.entries()]
+      .sort((left, right) => dateSortKey(left[0]) - dateSortKey(right[0]))
+      .map(([date, services]) => ({ date, services }));
+    const services = collectionDates[0]?.services || [];
 
     return res.json({
       booked: false,
       pieces: items.length,
       collectionPostcode,
       deliveryPostcode,
-      collectionDate,
-      message,
+      collectionDate: collectionDates[0]?.date || dates[0] || nextCollectionDate(),
+      collectionDates,
+      message: quoted.find((entry) => entry.message)?.message || null,
       services,
     });
   } catch (error) {
@@ -149,6 +178,86 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
     return res.status(502).json({ error: 'Could not reach APC' });
   }
 });
+
+interface QuotedService {
+  code: string;
+  name: string;
+  carrier: string;
+  ruleMatch: boolean;
+  ruleName: string;
+  itemType: string;
+  tracked: boolean;
+  signed: boolean;
+  collectionDate: string;
+  estimatedDeliveryDate: string;
+  latestBooking: string;
+  totalCost: string | null;
+  currency: string;
+}
+
+function openForBooking(latestBooking: string, now = new Date()): boolean {
+  const latest = bookingStamp(latestBooking);
+  if (!latest) return true;
+  return latest >= londonStamp(now);
+}
+
+async function quoteCollectionDate(
+  remoteUser: string,
+  collectionDate: string,
+  collectionPostcode: string,
+  deliveryPostcode: string,
+  items: { Type: string; Weight: string; Length: string; Width: string; Height: string; Reference: string }[],
+): Promise<{ ok: boolean; collectionDate: string; message: unknown; services: QuotedService[] }> {
+  const response = await fetch(QUOTE_URL, {
+    method: 'POST',
+    headers: {
+      'remote-user': remoteUser,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      Orders: {
+        Order: {
+          CollectionDate: collectionDate,
+          ReadyAt: '09:00',
+          ClosedAt: '17:00',
+          Collection: { PostalCode: collectionPostcode, CountryCode: 'GB' },
+          Delivery: { PostalCode: deliveryPostcode, CountryCode: 'GB' },
+          GoodsInfo: { GoodsValue: '50', Fragile: 'false' },
+          ShipmentDetails: {
+            NumberOfPieces: String(items.length),
+            Items: { Item: items.length === 1 ? items[0] : items },
+          },
+        },
+      },
+    }),
+  });
+  const raw = await response.text();
+  let payload: any = null;
+  try { payload = JSON.parse(raw); } catch { payload = null; }
+  if (!response.ok || !payload) return { ok: false, collectionDate, message: null, services: [] };
+
+  const availability = payload.ServiceAvailability || payload;
+  const services = asList<any>(availability.Services?.Service).map((service) => {
+    const total = service.TotalCost ?? service.Rate ?? null;
+    return {
+      code: text(service.ProductCode),
+      name: text(service.ServiceName),
+      carrier: text(service.Carrier),
+      ruleMatch: String(service['@RuleMatch'] || service.RuleMatch || '').toLowerCase() === 'true',
+      ruleName: text(service['@RuleMatchName'] || service.RuleMatchName),
+      itemType: text(service.ItemType),
+      tracked: String(service.Tracked).toLowerCase() === 'true',
+      signed: String(service.Signed).toLowerCase() === 'true',
+      collectionDate: text(service.CollectionDate),
+      estimatedDeliveryDate: text(service.EstimatedDeliveryDate),
+      latestBooking: text(service.LatestBookingDateTime),
+      totalCost: total == null || total === '' ? null : text(total),
+      currency: text(service.Currency),
+    };
+  }).filter((service) => service.code);
+  return { ok: true, collectionDate, message: availability.Messages || null, services };
+}
 
 function collectionDateOf(value: unknown): string {
   const raw = text(value).trim();
