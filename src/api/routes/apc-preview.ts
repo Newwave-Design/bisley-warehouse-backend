@@ -9,6 +9,7 @@ import { getPool, query } from '../../db/index.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { returnStockForCancelledCollection, takeStockForBookedCollection } from '../../lib/collection-stock.js';
 import { fitZpl } from '../../lib/zpl-fit.js';
+import { addDxConsignment, deleteDxConsignment, dxConfigured, DxError, fetchDxLabels, quoteDxCollection } from '../../lib/dx-freight.js';
 
 const router = express.Router();
 const QUOTE_URL = 'https://apc.hypaship.com/api/3.0/ServiceAvailability.json';
@@ -117,17 +118,31 @@ function text(value: unknown, fallback = ''): string {
 }
 
 router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) => {
-  const remoteUser = authHeader();
-  if (!remoteUser) {
-    return res.status(500).json({ error: 'APC login is not configured on this computer' });
-  }
-
   const pieces = asList<PieceInput>(req.body?.pieces).slice(0, 20);
   const collectionPostcode = text(req.body?.collectionPostcode).trim();
   const deliveryPostcode = text(req.body?.deliveryPostcode).trim();
   if (!pieces.length) return res.status(400).json({ error: 'Add at least one box' });
   if (!collectionPostcode || !deliveryPostcode) {
     return res.status(400).json({ error: 'Collection and delivery postcodes are required' });
+  }
+  if (text(req.body?.courier).trim().toUpperCase() === 'DX') {
+    if (!dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
+    try {
+      return res.json(quoteDxCollection({
+        pieces: pieces.length,
+        collectionPostcode,
+        deliveryPostcode,
+        collectionDate: text(req.body?.collectionDate).trim(),
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not build DX collection dates';
+      return res.status(400).json({ error: message });
+    }
+  }
+
+  const remoteUser = authHeader();
+  if (!remoteUser) {
+    return res.status(500).json({ error: 'APC login is not configured on this computer' });
   }
 
   const requestedDate = text(req.body?.collectionDate).trim();
@@ -317,14 +332,16 @@ function deliveryFrom(row: { customer_name?: string; customer_email?: string; sh
 }
 
 router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => {
-  const remoteUser = authHeader();
-  if (!remoteUser) return res.status(500).json({ error: 'APC login is not configured' });
+  const courier = text(req.body?.courier).trim().toUpperCase() === 'DX' ? 'DX' : 'APC';
+  const remoteUser = courier === 'APC' ? authHeader() : null;
+  if (courier === 'APC' && !remoteUser) return res.status(500).json({ error: 'APC login is not configured' });
+  if (courier === 'DX' && !dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
 
   const pickListId = text(req.body?.pickListId).trim();
   if (!/^[0-9a-f-]{36}$/i.test(pickListId)) return res.status(400).json({ error: 'Choose an order to book' });
   const serviceCode = text(req.body?.serviceCode).trim();
   const serviceName = text(req.body?.serviceName).trim().slice(0, 120);
-  if (!serviceCode) return res.status(400).json({ error: 'Choose an APC service' });
+  if (!serviceCode) return res.status(400).json({ error: 'Choose a service' });
 
   const pieces = asList<any>(req.body?.pieces).slice(0, 20).map((piece) => ({
     sku: text(piece?.sku).trim(),
@@ -358,7 +375,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
 
     const delivery = deliveryFrom(list);
     if (!['GB', 'UK'].includes(delivery.country)) {
-      return res.status(400).json({ error: 'APC collections are only booked to a UK address' });
+      return res.status(400).json({ error: `${courier} collections are only booked to a UK address` });
     }
     if (!delivery.line1 || !delivery.city || !delivery.postcode || !delivery.company) {
       return res.status(400).json({ error: 'This order needs a name, street, city and postcode before it can be booked' });
@@ -373,6 +390,59 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       Reference: (piece.sku || piece.title || 'Box').slice(0, 30),
     }));
     const reference = text(list.pick_list_number).trim().slice(0, 20);
+    let waybill = '';
+    let orderNumber = '';
+    let bookedService = serviceCode;
+    let bookedName = serviceName;
+    let collectionDate = text(req.body?.collectionDate).trim().slice(0, 40) || null;
+    let savedPieces: { reference: string; trackingNumber: string; title: string; weightKg: string; lengthCm: string; widthCm: string; heightCm: string }[] = [];
+
+    if (courier === 'DX') {
+      try {
+        const booked = await addDxConsignment({
+          reference,
+          serviceCode,
+          collectionDate: text(req.body?.collectionDate).trim(),
+          delivery: {
+            name: delivery.person,
+            company: text(list.shipping_address?.company).trim(),
+            email: delivery.email,
+            phone: delivery.phone,
+            line1: delivery.line1,
+            line2: delivery.line2,
+            city: delivery.city,
+            county: delivery.county,
+            postcode: delivery.postcode,
+          },
+          pieces: pieces.map((piece) => ({
+            title: piece.title,
+            weightKg: Number(piece.weightKg),
+            lengthCm: Number(piece.lengthCm),
+            widthCm: Number(piece.widthCm),
+            heightCm: Number(piece.heightCm),
+          })),
+        });
+        waybill = booked.consignmentNumber;
+        orderNumber = booked.routingStream;
+        bookedService = booked.serviceCode;
+        bookedName = booked.serviceDescription || serviceName;
+        collectionDate = booked.collectionDate;
+        savedPieces = pieces.map((piece, index) => ({
+          reference: (piece.sku || piece.title || 'Box').slice(0, 30),
+          trackingNumber: booked.trackingNumbers[index] || '',
+          title: piece.title,
+          weightKg: piece.weightKg,
+          lengthCm: piece.lengthCm,
+          widthCm: piece.widthCm,
+          heightCm: piece.heightCm,
+        }));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Could not reach DX. Nothing was saved.';
+        const status = error instanceof DxError ? error.status : 502;
+        console.error('DX rejected the collection', message);
+        return res.status(status).json({ error: message });
+      }
+    } else {
     const contact: Record<string, string> = {};
     if (delivery.person) contact.PersonName = delivery.person;
     const deliveryPhone = delivery.phone.replace(/[^\d+]/g, '').replace(/^\+44/, '0').replace(/^44(?=\d{10}$)/, '0');
@@ -382,7 +452,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     const response = await fetch(ORDER_URL, {
       method: 'POST',
       headers: {
-        'remote-user': remoteUser,
+        'remote-user': remoteUser || '',
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
@@ -419,7 +489,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     try { payload = JSON.parse(raw); } catch { payload = null; }
     const order = asList<any>(payload?.Orders?.Order || payload?.Order)[0] || payload;
     const message = order ? apcMessages(order) : { ok: false, detail: '' };
-    const waybill = order ? findWaybill(order) : '';
+    waybill = order ? findWaybill(order) : '';
     if (!response.ok || !payload || !message.ok) {
       console.error('APC rejected the collection', message.detail || response.status);
       return res.status(502).json({ error: message.detail || 'APC did not accept the collection. Nothing was saved.' });
@@ -429,7 +499,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     }
 
     const tracked = asList<any>(order?.ShipmentDetails?.Items?.Item);
-    const savedPieces = pieces.map((piece, index) => ({
+    savedPieces = pieces.map((piece, index) => ({
       reference: items[index].Reference,
       trackingNumber: text(tracked[index]?.TrackingNumber || tracked.find((item) => text(item?.Reference) === items[index].Reference)?.TrackingNumber),
       title: piece.title,
@@ -438,8 +508,9 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       widthCm: piece.widthCm,
       heightCm: piece.heightCm,
     }));
-    const orderNumber = text(order?.OrderNumber).trim();
-    const collectionDate = (text(order?.CollectionDate).trim() || text(req.body?.collectionDate).trim()).slice(0, 40) || null;
+    orderNumber = text(order?.OrderNumber).trim();
+    collectionDate = (text(order?.CollectionDate).trim() || text(req.body?.collectionDate).trim()).slice(0, 40) || null;
+    }
     const summary = [delivery.company, delivery.line1, delivery.city, delivery.postcode].filter(Boolean).join(', ');
     const rowSkus = skus.length ? skus : [`extra-${Date.now().toString(36)}`];
 
@@ -452,23 +523,23 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
           `INSERT INTO collection_bookings
              (pick_list_id, sku, courier, service_code, service_name, waybill, apc_order_number,
               collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date)
-           VALUES ($1, $2, 'APC', $3, $4, $5, $6, $7, $8, $9, $10::jsonb, 'booked', $11)
+           VALUES ($1, $2, $12, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, 'booked', $11)
            RETURNING id, pick_list_id, sku, courier, service_code, service_name, waybill,
                      collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date`,
-          [pickListId, sku, serviceCode, serviceName || null, waybill, orderNumber || null, COLLECTION.PostalCode, delivery.postcode, summary, JSON.stringify(savedPieces), collectionDate]
+          [pickListId, sku, bookedService, bookedName || null, waybill, orderNumber || null, COLLECTION.PostalCode, delivery.postcode, summary, JSON.stringify(savedPieces), collectionDate, courier]
         );
         saved.push(inserted.rows[0]);
       }
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
-      console.error('Saving APC collection failed', error instanceof Error ? error.message : 'query failed');
-      return res.status(500).json({ error: `APC created tracking ${waybill}, but it could not be saved here. Do not book it again.` });
+      console.error('Saving collection failed', error instanceof Error ? error.message : 'query failed');
+      return res.status(500).json({ error: `${courier} created tracking ${waybill}, but it could not be saved here. Do not book it again.` });
     } finally {
       client.release();
     }
 
-    console.log(`APC collection booked ${waybill} for pick list ${pickListId}`);
+    console.log(`${courier} collection booked ${waybill} for pick list ${pickListId}`);
     await takeStockForBookedCollection(pickListId, text(req.user?.id)).catch((error) => {
       console.warn('Removing booked collection stock failed', error instanceof Error ? error.message : 'failed');
     });
@@ -477,8 +548,8 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     });
     return res.status(201).json({ booked: true, waybill, bookings: saved });
   } catch (error) {
-    console.error('APC booking failed', error instanceof Error ? error.message : 'request failed');
-    return res.status(502).json({ error: 'Could not reach APC. Nothing was saved.' });
+    console.error('Collection booking failed', error instanceof Error ? error.message : 'request failed');
+    return res.status(502).json({ error: `Could not reach ${courier}. Nothing was saved.` });
   }
 });
 
@@ -517,11 +588,6 @@ router.get('/bookings', authMiddleware, async (_req: AuthRequest, res: Response)
 });
 
 router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res: Response) => {
-  const remoteUser = authHeader();
-  if (!remoteUser) {
-    return res.status(500).json({ error: 'APC login is not configured on this computer' });
-  }
-
   const id = text(req.params.id);
   if (!/^[0-9a-f-]{36}$/i.test(id)) {
     return res.status(400).json({ error: 'Unknown booking' });
@@ -529,15 +595,12 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
 
   try {
     const found = await query(
-      `SELECT id, waybill, courier, status FROM collection_bookings WHERE id = $1`,
+      `SELECT id, waybill, apc_order_number, pieces, courier, status FROM collection_bookings WHERE id = $1`,
       [id]
     );
-    const booking = found.rows[0] as { waybill?: string; courier?: string; status?: string } | undefined;
+    const booking = found.rows[0] as { waybill?: string; apc_order_number?: string; pieces?: { trackingNumber?: string }[]; courier?: string; status?: string } | undefined;
     if (!booking || booking.status === 'cancelled') {
       return res.status(404).json({ error: 'Unknown booking' });
-    }
-    if (booking.courier !== 'APC') {
-      return res.status(409).json({ error: 'DX labels are not connected yet.' });
     }
     const waybill = text(booking.waybill).trim();
     if (!waybill) {
@@ -545,6 +608,25 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
     }
 
     const format = text(req.query.format).toUpperCase() === 'ZPL' ? 'ZPL' : 'PDF';
+    if (booking.courier === 'DX') {
+      if (!dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
+      const tracking = (Array.isArray(booking.pieces) ? booking.pieces : []).map((piece) => text(piece?.trackingNumber)).filter(Boolean);
+      const labels = await fetchDxLabels(waybill, text(booking.apc_order_number) || 'F', format, tracking);
+      if (format === 'ZPL') {
+        for (const label of labels) {
+          const zpl = Buffer.from(label.content, 'base64').toString('latin1');
+          if (zpl.includes('^XA')) label.content = Buffer.from(fitZpl(zpl), 'latin1').toString('base64');
+        }
+      }
+      return res.json({ labels });
+    }
+    if (booking.courier !== 'APC') {
+      return res.status(409).json({ error: 'This courier cannot print a label here.' });
+    }
+    const remoteUser = authHeader();
+    if (!remoteUser) {
+      return res.status(500).json({ error: 'APC login is not configured on this computer' });
+    }
     const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(waybill)}.json?labelformat=${format}&markprinted=False&searchtype=CarrierWaybill&labels=True`;
     const response = await fetch(url, {
       headers: {
@@ -567,16 +649,13 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
     }
     return res.json({ labels });
   } catch (error) {
-    console.error('APC label reprint failed', error instanceof Error ? error.message : 'request failed');
-    return res.status(502).json({ error: 'Could not reach APC' });
+    const message = error instanceof Error ? error.message : 'Could not reach the courier';
+    console.error('Label reprint failed', message);
+    return res.status(error instanceof DxError ? error.status : 502).json({ error: message });
   }
 });
 
 router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res: Response) => {
-  const remoteUser = authHeader();
-  if (!remoteUser) {
-    return res.status(500).json({ error: 'APC login is not configured on this computer' });
-  }
   const id = text(req.params.id);
   if (!/^[0-9a-f-]{36}$/i.test(id)) {
     return res.status(400).json({ error: 'Unknown booking' });
@@ -593,10 +672,41 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
     } | undefined;
     if (!booking) return res.status(404).json({ error: 'Unknown booking' });
     if (booking.status === 'cancelled') return res.json({ cancelled: true });
-    if (booking.courier !== 'APC') return res.status(409).json({ error: 'Only an APC collection can be cancelled here.' });
+    const waybill = text(booking.waybill).trim();
+    if (booking.courier === 'DX') {
+      if (!dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
+      try {
+        await deleteDxConsignment(waybill, text(booking.apc_order_number) || 'F');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'DX did not cancel the collection. It is still booked here.';
+        return res.status(502).json({ error: message });
+      }
+      await query(
+        `UPDATE collection_bookings
+            SET status = 'cancelled', updated_at = NOW()
+          WHERE pick_list_id = $1 AND waybill = $2 AND status <> 'cancelled'`,
+        [booking.pick_list_id, waybill]
+      );
+      if (waybill) {
+        await query(
+          `UPDATE pick_lists
+              SET tracking_number = NULL, carrier = NULL, updated_at = NOW()
+            WHERE id = $1 AND tracking_number = $2`,
+          [booking.pick_list_id, waybill]
+        );
+      }
+      if (booking.pick_list_id && waybill) {
+        await returnStockForCancelledCollection(booking.pick_list_id, waybill, text(req.user?.id)).catch((error) => {
+          console.warn('Returning cancelled collection stock failed', error instanceof Error ? error.message : 'failed');
+        });
+      }
+      return res.json({ cancelled: true });
+    }
+    if (booking.courier !== 'APC') return res.status(409).json({ error: 'Only an APC or DX collection can be cancelled here.' });
+    const remoteUser = authHeader();
+    if (!remoteUser) return res.status(500).json({ error: 'APC login is not configured on this computer' });
 
     const orderNumber = text(booking.apc_order_number).trim();
-    const waybill = text(booking.waybill).trim();
     const lookup = orderNumber || waybill;
     if (!lookup) return res.status(409).json({ error: 'This booking has no APC order to cancel.' });
 
