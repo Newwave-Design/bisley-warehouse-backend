@@ -313,6 +313,43 @@ function findWaybill(order: any): string {
   return '';
 }
 
+function clipApc(value: string, max: number): string {
+  const clean = value.replace(/\s+/g, ' ').trim();
+  if (clean.length <= max) return clean;
+  const cut = clean.slice(0, max + 1);
+  const space = cut.lastIndexOf(' ');
+  const clipped = (space > Math.floor(max / 2) ? cut.slice(0, space) : clean.slice(0, max)).trim();
+  return clipped || clean.slice(0, max);
+}
+
+/** APC rejects Address Line 1 and 2 at 64 characters. Keep both lines, breaking on a comma where that still fits. */
+function apcStreet(line1: string, line2: string): [string, string] {
+  const source = [line1, line2].map((part) => part.replace(/\s+/g, ' ').trim()).filter(Boolean).join(', ');
+  const max = 63;
+  if (source.length <= max) return [source, ''];
+  const comma = source.lastIndexOf(',');
+  if (comma > 0) {
+    const head = source.slice(0, comma).trim();
+    const tail = source.slice(comma + 1).trim();
+    if (head && tail && head.length <= max && tail.length <= max) return [head, tail];
+  }
+  const words = source.split(' ').filter(Boolean);
+  const lines: string[] = [];
+  let current = '';
+  for (const word of words) {
+    const piece = word.length > max ? word.slice(0, max) : word;
+    if (!current) current = piece;
+    else if (`${current} ${piece}`.length <= max) current = `${current} ${piece}`;
+    else {
+      lines.push(current);
+      if (lines.length >= 2) return [lines[0], lines[1] || ''];
+      current = piece;
+    }
+  }
+  if (current && lines.length < 2) lines.push(current);
+  return [lines[0] || source.slice(0, max), lines[1] || ''];
+}
+
 function deliveryFrom(row: { customer_name?: string; customer_email?: string; shipping_address?: any }) {
   const address = row.shipping_address || {};
   const person = text(`${address.first_name || ''} ${address.last_name || ''}`).trim() || text(row.customer_name).trim();
@@ -444,10 +481,11 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       }
     } else {
     const contact: Record<string, string> = {};
-    if (delivery.person) contact.PersonName = delivery.person;
+    if (delivery.person) contact.PersonName = clipApc(delivery.person, 63);
     const deliveryPhone = delivery.phone.replace(/[^\d+]/g, '').replace(/^\+44/, '0').replace(/^44(?=\d{10}$)/, '0');
-    if (deliveryPhone) contact.PhoneNumber = deliveryPhone;
+    if (deliveryPhone) contact.PhoneNumber = deliveryPhone.slice(0, 15);
     if (delivery.email) contact.Email = delivery.email;
+    const [addressLine1, addressLine2] = apcStreet(delivery.line1, delivery.line2);
 
     const response = await fetch(ORDER_URL, {
       method: 'POST',
@@ -466,12 +504,12 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
             Reference: reference,
             Collection: COLLECTION,
             Delivery: {
-              CompanyName: delivery.company,
-              AddressLine1: delivery.line1,
-              AddressLine2: delivery.line2,
+              CompanyName: clipApc(delivery.company, 34),
+              AddressLine1: addressLine1,
+              AddressLine2: addressLine2,
               PostalCode: delivery.postcode,
-              City: delivery.city,
-              County: delivery.county,
+              City: clipApc(delivery.city, 31),
+              County: clipApc(delivery.county, 31),
               CountryCode: 'GB',
               ...(Object.keys(contact).length ? { Contact: contact } : {}),
             },
