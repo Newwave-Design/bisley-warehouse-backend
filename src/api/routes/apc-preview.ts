@@ -368,6 +368,18 @@ function deliveryFrom(row: { customer_name?: string; customer_email?: string; sh
   };
 }
 
+/** APC rejects a mobile in PhoneNumber. A number starting 07 goes in MobileNumber; a landline stays on PhoneNumber. */
+function apcContactNumbers(value: string): { PhoneNumber?: string; MobileNumber?: string } {
+  let digits = value.replace(/[^\d+]/g, '');
+  if (digits.startsWith('+44')) digits = `0${digits.slice(3)}`;
+  else if (digits.startsWith('0044')) digits = `0${digits.slice(4)}`;
+  else if (/^44\d{10}$/.test(digits)) digits = `0${digits.slice(2)}`;
+  digits = digits.replace(/\D/g, '').slice(0, 15);
+  if (!digits) return {};
+  if (digits.startsWith('07')) return { MobileNumber: digits };
+  return { PhoneNumber: digits };
+}
+
 router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => {
   const courier = text(req.body?.courier).trim().toUpperCase() === 'DX' ? 'DX' : 'APC';
   const remoteUser = courier === 'APC' ? authHeader() : null;
@@ -482,8 +494,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     } else {
     const contact: Record<string, string> = {};
     if (delivery.person) contact.PersonName = clipApc(delivery.person, 63);
-    const deliveryPhone = delivery.phone.replace(/[^\d+]/g, '').replace(/^\+44/, '0').replace(/^44(?=\d{10}$)/, '0');
-    if (deliveryPhone) contact.PhoneNumber = deliveryPhone.slice(0, 15);
+    Object.assign(contact, apcContactNumbers(delivery.phone));
     if (delivery.email) contact.Email = delivery.email;
     const [addressLine1, addressLine2] = apcStreet(delivery.line1, delivery.line2);
 
