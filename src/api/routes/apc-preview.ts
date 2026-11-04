@@ -624,7 +624,7 @@ router.get('/bookings', authMiddleware, async (_req: AuthRequest, res: Response)
   try {
     const result = await query(
       `SELECT id, pick_list_id, sku, courier, service_code, service_name, waybill,
-              collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date
+              collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date, created_at
        FROM collection_bookings
        WHERE status <> 'cancelled'
        ORDER BY created_at DESC`
