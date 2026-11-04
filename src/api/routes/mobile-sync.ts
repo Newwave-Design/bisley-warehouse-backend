@@ -10,11 +10,27 @@ import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 
+/** Newest change across barcodes, products, bays and stock. The scanner skips the catalogue download when this matches. */
+export async function catalogueRevisedAt(): Promise<string | null> {
+  const result = await query(`
+    SELECT GREATEST(
+      (SELECT MAX(updated_at) FROM barcode_mappings),
+      (SELECT MAX(updated_at) FROM wms_products),
+      (SELECT MAX(updated_at) FROM warehouse_inventory),
+      (SELECT MAX(updated_at) FROM warehouse_locations)
+    ) AS revised_at
+  `);
+  const value = result.rows[0]?.revised_at;
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
 const router = express.Router();
 
 router.get('/reference', authMiddleware, async (_req: AuthRequest, res: Response) => {
   try {
-    const [barcodes, products, locations, stock] = await Promise.all([
+    const [barcodes, products, locations, stock, revisedAt] = await Promise.all([
       query(
         `SELECT barcode, product_sku AS sku, product_name, colour_code, colour_name, thumbnail_url AS thumbnail
            FROM barcode_mappings WHERE is_active = true`
@@ -32,9 +48,11 @@ router.get('/reference', authMiddleware, async (_req: AuthRequest, res: Response
            FROM warehouse_inventory wi JOIN warehouse_locations wl ON wl.id = wi.location_id
           WHERE wi.quantity > 0`
       ),
+      catalogueRevisedAt(),
     ]);
     res.json({
       generated_at: new Date().toISOString(),
+      revised_at: revisedAt || '',
       barcodes: barcodes.rows,
       products: products.rows,
       locations: locations.rows,

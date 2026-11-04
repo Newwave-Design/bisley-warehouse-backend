@@ -14,14 +14,24 @@ import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { moveStockBetweenBays, MoveError } from '../../lib/stock-move.js';
 import { paidSql } from '../../lib/payment-status.js';
-import { COLOUR_NAMES, enrichSampleItems, extractColourCode, sampleColourList } from '../../lib/colour-names.js';
+import { COLOUR_NAMES, componentDisplaySku, enrichSampleItems, extractColourCode, sampleColourList } from '../../lib/colour-names.js';
 import { formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
-import { attachPackaging } from '../../lib/pick-list-packaging.js';
-import { expandKitPicksByList } from '../../lib/pick-list-kits.js';
+import { attachPackaging, shippingTypeForLines } from '../../lib/pick-list-packaging.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
+import { catalogueRevisedAt } from './mobile-sync.js';
 
 const router = express.Router();
+
+function latestTime(a: unknown, b: unknown): string {
+  const times = [a, b].map((value) => {
+    if (!value) return 0;
+    const date = value instanceof Date ? value : new Date(String(value));
+    return date.getTime();
+  }).filter((time) => Number.isFinite(time) && time > 0);
+  if (!times.length) return '';
+  return new Date(Math.max(...times)).toISOString();
+}
 
 // performed_by columns are UUID - the demo token's user id ('1') is not a valid UUID, so guard it.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -297,14 +307,15 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
           'product_sku', pli.product_sku, 'colour_code', pli.colour_code, 'item_title', pli.item_title
         ) ORDER BY pli.line_number) FILTER (WHERE pli.product_sku ILIKE '%SAMPLE%') AS sample_lines,
         json_agg(json_build_object(
-          'product_sku', pli.product_sku,
-          'item_title', COALESCE(
-            (SELECT wp.product_title FROM wms_products wp WHERE wp.variant_sku = pli.product_sku ORDER BY wp.is_archived ASC LIMIT 1),
-            pli.item_title
-          ),
-          'quantity_required', pli.quantity_required,
-          'quantity_picked', pli.quantity_picked
-        ) ORDER BY pli.line_number) FILTER (WHERE pli.id IS NOT NULL) AS item_lines
+          'sku', pli.product_sku, 'item_title', pli.item_title
+        ) ORDER BY pli.line_number) FILTER (WHERE pli.id IS NOT NULL) AS sku_lines,
+        GREATEST(
+          pl.updated_at,
+          pl.deferred_at,
+          MAX(pli.updated_at),
+          (SELECT MAX(ps.updated_at) FROM pick_scans ps WHERE ps.pick_list_id = pl.id),
+          (SELECT MAX(GREATEST(n.created_at, n.resolved_at)) FROM pick_list_notes n WHERE n.pick_list_id = pl.id)
+        ) AS updated_at
       FROM pick_lists pl
       LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id AND COALESCE(pli.is_archived, false) = false
       WHERE pl.is_archived = false AND ${paidSql('pl')} AND ($1::text[] IS NULL OR pl.status = ANY($1::text[]))
@@ -312,28 +323,44 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
       GROUP BY pl.id
       ORDER BY order_date ${orderDir}
     `, [statuses]);
-    const dues = await getDeliveryDues(result.rows.map((r: any) => r.id));
-    const packed = await attachPackaging(await expandKitPicksByList(result.rows.map((r: any) =>
-      (Array.isArray(r.item_lines) ? r.item_lines : []).filter((line: any) => line?.product_sku).map((line: any) => ({
-        sku: line.product_sku,
-        title: line.item_title || line.product_sku,
-        item_title: line.item_title || '',
-        quantity_required: Number(line.quantity_required) || 0,
-        quantity_picked: Number(line.quantity_picked) || 0,
-      }))
-    )));
+    const ids = result.rows.map((r: any) => r.id);
+    const [dues, revisedAt, kits] = await Promise.all([
+      getDeliveryDues(ids),
+      catalogueRevisedAt(),
+      query(
+        `SELECT pli.pick_list_id, MAX(wp.updated_at) AS kit_at
+           FROM pick_list_items pli
+           JOIN wms_products wp ON wp.variant_sku = pli.product_sku
+          WHERE pli.pick_list_id = ANY($1::uuid[])
+            AND COALESCE(pli.is_archived, false) = false
+            AND wp.last_synced_at IS NOT NULL
+            AND wp.updated_at > wp.last_synced_at
+            AND wp.kit_components IS NOT NULL
+            AND jsonb_typeof(wp.kit_components) = 'array'
+            AND jsonb_array_length(wp.kit_components) > 0
+          GROUP BY pli.pick_list_id`,
+        [ids]
+      ),
+    ]);
+    const kitAt = new Map(kits.rows.map((row: any) => [row.pick_list_id, row.kit_at]));
     res.json({
-      pick_lists: result.rows.map((r: any, index: number) => ({
-        ...r,
-        due: dues[r.id] ?? null,
-        address_text: formatShippingAddressText(r.shipping_address, r.customer_name),
-        sample_colours: sampleColourList(r.sample_lines),
-        sample_lines: undefined,
-        item_lines: undefined,
-        shipping_type: [...new Set((packed[index] || []).map((item: any) => item.packaging?.shipping_option).filter(Boolean))].join(' · '),
-      })),
+      catalogue_revised_at: revisedAt || '',
+      pick_lists: result.rows.map((r: any) => {
+        const lines = Array.isArray(r.sku_lines) ? r.sku_lines : [];
+        return {
+          ...r,
+          due: dues[r.id] ?? null,
+          address_text: formatShippingAddressText(r.shipping_address, r.customer_name),
+          sample_colours: sampleColourList(r.sample_lines),
+          sample_lines: undefined,
+          sku_lines: undefined,
+          shipping_type: shippingTypeForLines(lines) || null,
+          updated_at: latestTime(r.updated_at, kitAt.get(r.id)),
+        };
+      }),
     });
   } catch (err) {
+    console.error('Mobile pick lists failed', err);
     res.status(500).json({ error: 'Failed to load pick lists' });
   }
 });
@@ -415,9 +442,10 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
       Array.isArray(r.kit_components) ? r.kit_components.map((c: any) => c.sku) : []))];
     if (componentSkus.length) {
       const families = [...new Set(componentSkus.map((s: string) => s.split('-')[0]))];
+      const lookupSkus = [...new Set(componentSkus.flatMap((sku: string) => [sku, componentDisplaySku(sku)]))];
       const [info, family, bays] = await Promise.all([
         query(`SELECT variant_sku, product_title, colour_name, colour_code, variant_thumbnail
-               FROM wms_products WHERE variant_sku = ANY($1::text[])`, [componentSkus]),
+               FROM wms_products WHERE variant_sku = ANY($1::text[])`, [lookupSkus]),
         query(`SELECT DISTINCT ON (split_part(variant_sku, '-', 1)) split_part(variant_sku, '-', 1) AS family, product_title
                FROM wms_products
                WHERE split_part(variant_sku, '-', 1) = ANY($1::text[]) AND is_archived = false
@@ -440,7 +468,7 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
       item.kit_components = item.kit_components
         .filter((c: any) => c?.sku && c.sku !== item.product_sku)
         .map((c: any) => {
-          const p: any = infoBySku.get(c.sku);
+          const p: any = infoBySku.get(c.sku) || infoBySku.get(componentDisplaySku(c.sku));
           const code = extractColourCode(c.sku);
           return {
             ...c,

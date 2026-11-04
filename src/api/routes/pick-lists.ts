@@ -500,7 +500,7 @@ router.patch('/:pickListId/defer', authMiddleware, async (req: AuthRequest, res:
   try {
     const deferred = req.body?.deferred !== false
     const result = await query(
-      `UPDATE pick_lists SET deferred_at = ${deferred ? 'NOW()' : 'NULL'}
+      `UPDATE pick_lists SET deferred_at = ${deferred ? 'NOW()' : 'NULL'}, updated_at = NOW()
        WHERE id = $1 RETURNING id, deferred_at`,
       [req.params.pickListId]
     )

@@ -11,6 +11,13 @@ function isMultiDesk(sku: string): boolean {
   return /^MD(?:M|P|HLEG|WLEG|TM|TP)/.test(sku.toUpperCase());
 }
 
+/** Courier label for a pick list, from the sold lines. A MultiDesk on the order sends the whole order DX. */
+export function shippingTypeForLines(lines: { sku?: string; title?: string; item_title?: string }[]): string {
+  const desk = lines.some((line) => isMultiDesk(line.sku || '') || /multidesk/i.test(`${line.title || ''} ${line.item_title || ''}`));
+  if (desk) return 'DX';
+  return [...new Set(lines.map((line) => shippingOption(line.sku || '')).filter(Boolean))].join(' · ');
+}
+
 export function shippingOption(sku: string, productCode = ''): string | null {
   const upper = sku.toUpperCase();
   if (isMultiDesk(upper) || isMultiDesk(productCode)) return 'DX';
