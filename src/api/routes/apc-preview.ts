@@ -10,7 +10,6 @@ import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { returnStockForCancelledCollection, takeStockForBookedCollection } from '../../lib/collection-stock.js';
 import { fitZpl } from '../../lib/zpl-fit.js';
 import { addDxConsignment, deleteDxConsignment, dxConfigured, DxError, fetchDxLabels, quoteDxCollection } from '../../lib/dx-freight.js';
-import { actorName, recordPickListEvents } from '../../lib/pick-list-events.js';
 
 const router = express.Router();
 const QUOTE_URL = 'https://apc.hypaship.com/api/3.0/ServiceAvailability.json';
@@ -603,26 +602,6 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   }
 });
 
-/** A successful label fetch is a print. The scanner does not send a separate status update. */
-async function markCollectionLabelsPrinted(pickListId: unknown, actor: string) {
-  const id = text(pickListId).trim();
-  if (!/^[0-9a-f-]{36}$/i.test(id)) return;
-  try {
-    const found = await query(`SELECT status FROM pick_lists WHERE id = $1`, [id]);
-    const status = text(found.rows[0]?.status);
-    if (!status || status === 'LABEL_PRINTED' || status === 'DISPATCHED' || status === 'CANCELLED') return;
-    await recordPickListEvents({
-      ids: [id],
-      actor,
-      action: 'print',
-      summary: 'Printed collection labels',
-      status: 'LABEL_PRINTED',
-    });
-  } catch (error) {
-    console.error('Could not move the order to labels printed', error instanceof Error ? error.message : 'failed');
-  }
-}
-
 function collectLabels(payload: any): { trackingNumber: string; format: string; content: string }[] {
   const orders = asList<any>(payload?.Orders?.Order || payload?.Order);
   const labels: { trackingNumber: string; format: string; content: string }[] = [];
@@ -665,10 +644,10 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
 
   try {
     const found = await query(
-      `SELECT id, pick_list_id, waybill, apc_order_number, pieces, courier, status FROM collection_bookings WHERE id = $1`,
+      `SELECT id, waybill, apc_order_number, pieces, courier, status FROM collection_bookings WHERE id = $1`,
       [id]
     );
-    const booking = found.rows[0] as { pick_list_id?: string; waybill?: string; apc_order_number?: string; pieces?: { trackingNumber?: string }[]; courier?: string; status?: string } | undefined;
+    const booking = found.rows[0] as { waybill?: string; apc_order_number?: string; pieces?: { trackingNumber?: string }[]; courier?: string; status?: string } | undefined;
     if (!booking || booking.status === 'cancelled') {
       return res.status(404).json({ error: 'Unknown booking' });
     }
@@ -688,7 +667,6 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
           if (zpl.includes('^XA')) label.content = Buffer.from(fitZpl(zpl), 'latin1').toString('base64');
         }
       }
-      if (labels.length) await markCollectionLabelsPrinted(booking.pick_list_id, actorName(req.user));
       return res.json({ labels });
     }
     if (booking.courier !== 'APC') {
@@ -718,7 +696,6 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
         if (zpl.includes('^XA')) label.content = Buffer.from(fitZpl(zpl), 'latin1').toString('base64');
       }
     }
-    await markCollectionLabelsPrinted(booking.pick_list_id, actorName(req.user));
     return res.json({ labels });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Could not reach the courier';
