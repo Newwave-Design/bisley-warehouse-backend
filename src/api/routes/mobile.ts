@@ -17,7 +17,8 @@ import { paidSql } from '../../lib/payment-status.js';
 import { COLOUR_NAMES, enrichSampleItems, extractColourCode, sampleColourList } from '../../lib/colour-names.js';
 import { formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
-import { attachPackaging, shippingOption } from '../../lib/pick-list-packaging.js';
+import { attachPackaging } from '../../lib/pick-list-packaging.js';
+import { expandKitPicksByList } from '../../lib/pick-list-kits.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 
 const router = express.Router();
@@ -295,7 +296,15 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
         json_agg(json_build_object(
           'product_sku', pli.product_sku, 'colour_code', pli.colour_code, 'item_title', pli.item_title
         ) ORDER BY pli.line_number) FILTER (WHERE pli.product_sku ILIKE '%SAMPLE%') AS sample_lines,
-        json_agg(pli.product_sku) FILTER (WHERE pli.product_sku IS NOT NULL AND pli.product_sku NOT ILIKE '%SAMPLE%') AS item_skus
+        json_agg(json_build_object(
+          'product_sku', pli.product_sku,
+          'item_title', COALESCE(
+            (SELECT wp.product_title FROM wms_products wp WHERE wp.variant_sku = pli.product_sku ORDER BY wp.is_archived ASC LIMIT 1),
+            pli.item_title
+          ),
+          'quantity_required', pli.quantity_required,
+          'quantity_picked', pli.quantity_picked
+        ) ORDER BY pli.line_number) FILTER (WHERE pli.id IS NOT NULL) AS item_lines
       FROM pick_lists pl
       LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id AND COALESCE(pli.is_archived, false) = false
       WHERE pl.is_archived = false AND ${paidSql('pl')} AND ($1::text[] IS NULL OR pl.status = ANY($1::text[]))
@@ -304,15 +313,24 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
       ORDER BY order_date ${orderDir}
     `, [statuses]);
     const dues = await getDeliveryDues(result.rows.map((r: any) => r.id));
+    const packed = await attachPackaging(await expandKitPicksByList(result.rows.map((r: any) =>
+      (Array.isArray(r.item_lines) ? r.item_lines : []).filter((line: any) => line?.product_sku).map((line: any) => ({
+        sku: line.product_sku,
+        title: line.item_title || line.product_sku,
+        item_title: line.item_title || '',
+        quantity_required: Number(line.quantity_required) || 0,
+        quantity_picked: Number(line.quantity_picked) || 0,
+      }))
+    )));
     res.json({
-      pick_lists: result.rows.map((r: any) => ({
+      pick_lists: result.rows.map((r: any, index: number) => ({
         ...r,
         due: dues[r.id] ?? null,
         address_text: formatShippingAddressText(r.shipping_address, r.customer_name),
         sample_colours: sampleColourList(r.sample_lines),
         sample_lines: undefined,
-        shipping_type: [...new Set((Array.isArray(r.item_skus) ? r.item_skus : []).map((sku: string) => shippingOption(sku)).filter(Boolean))].join(' · '),
-        item_skus: undefined,
+        item_lines: undefined,
+        shipping_type: [...new Set((packed[index] || []).map((item: any) => item.packaging?.shipping_option).filter(Boolean))].join(' · '),
       })),
     });
   } catch (err) {
@@ -366,8 +384,8 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
         COALESCE(wp.variant_width_mm, wp.width_mm) AS width_mm,
         COALESCE(wp.variant_height_mm, wp.height_mm) AS height_mm,
         COALESCE(wp.variant_depth_mm, wp.depth_mm) AS depth_mm,
-        -- Kit detection and components
-        CASE WHEN wp.kit_components IS NOT NULL AND jsonb_array_length(wp.kit_components) > 0 
+        -- Kit detection and components. Prefer the live catalogue row, and a row that actually has a kit.
+        CASE WHEN wp.kit_components IS NOT NULL AND jsonb_array_length(wp.kit_components) > 0
           THEN true ELSE false END AS is_kit,
         wp.kit_components,
         -- Show where this SKU is in the warehouse
@@ -379,7 +397,13 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
            AND wi.quantity > 0) AS stock_locations
       FROM pick_list_items pli
       LEFT JOIN warehouse_locations l ON l.id = pli.picked_from_location_id
-      LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
+      LEFT JOIN LATERAL (
+        SELECT * FROM wms_products
+        WHERE variant_sku = pli.product_sku
+        ORDER BY is_archived ASC,
+                 CASE WHEN kit_components IS NOT NULL AND jsonb_array_length(kit_components) > 0 THEN 0 ELSE 1 END
+        LIMIT 1
+      ) wp ON true
       WHERE pli.pick_list_id = $1 AND COALESCE(pli.is_archived, false) = false
       ORDER BY pli.line_number
     `, [req.params.id]);
@@ -491,8 +515,9 @@ async function recomputePickItem(pickListId: string, itemId: string) {
     `SELECT quantity, scanned_barcode, component_sku FROM pick_scans WHERE pick_list_item_id = $1`,
     [itemId]
   );
-  const item = await query(`SELECT quantity_required FROM pick_list_items WHERE id = $1`, [itemId]);
+  const item = await query(`SELECT quantity_required, product_sku FROM pick_list_items WHERE id = $1`, [itemId]);
   const required = item.rows[0]?.quantity_required ?? 0;
+  const parentSku = item.rows[0]?.product_sku as string | undefined;
   const parts = await kitPartsOf(itemId);
 
   let picked: number;
@@ -504,8 +529,14 @@ async function recomputePickItem(pickListId: string, itemId: string) {
       if (!sku) continue;
       got.set(sku, (got.get(sku) ?? 0) + Number(scan.quantity));
     }
-    const complete = parts.reduce((min, part) => Math.min(min, Math.floor((got.get(part.sku) ?? 0) / part.required_quantity)), required);
-    const done = required > 0 && parts.every((part) => (got.get(part.sku) ?? 0) >= part.required_quantity * required);
+    const parentGot = parentSku ? (got.get(parentSku) ?? 0) : 0;
+    const complete = Math.min(
+      parentGot,
+      parts.reduce((min, part) => Math.min(min, Math.floor((got.get(part.sku) ?? 0) / part.required_quantity)), required),
+    );
+    const done = required > 0
+      && parentGot >= required
+      && parts.every((part) => (got.get(part.sku) ?? 0) >= part.required_quantity * required);
     picked = Math.max(0, Math.min(complete, required));
     status = done ? 'PICKED' : scans.rows.length ? 'PICKING' : 'PENDING';
   } else {
@@ -560,10 +591,16 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
     const allItems = await query(
       `SELECT pli.id, pli.product_sku, pli.quantity_required, pli.quantity_picked, pli.status,
               wp.kit_components,
-              CASE WHEN wp.kit_components IS NOT NULL AND jsonb_array_length(wp.kit_components) > 0 
+              CASE WHEN wp.kit_components IS NOT NULL AND jsonb_array_length(wp.kit_components) > 0
                 THEN true ELSE false END AS is_kit
        FROM pick_list_items pli
-       LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
+       LEFT JOIN LATERAL (
+         SELECT kit_components FROM wms_products
+         WHERE variant_sku = pli.product_sku
+         ORDER BY is_archived ASC,
+                  CASE WHEN kit_components IS NOT NULL AND jsonb_array_length(kit_components) > 0 THEN 0 ELSE 1 END
+         LIMIT 1
+       ) wp ON true
        WHERE pli.pick_list_id = $1 AND pli.status != 'PICKED'
        ORDER BY pli.line_number ASC`,
       [pickListId]
@@ -650,10 +687,46 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
         item: updatedItem,
         note: `Kit component ${scannedSku} scanned. Scan remaining components to complete this kit.`
       });
+    } else if ((await kitPartsOf(item.id)).length && scannedSku === item.product_sku) {
+      const required = Number(item.quantity_required);
+      const already = await query(
+        `SELECT quantity, scanned_barcode, component_sku FROM pick_scans WHERE pick_list_item_id = $1`,
+        [item.id]
+      );
+      let got = 0;
+      for (const scan of already.rows) {
+        const sku = await resolveScanSku(scan.scanned_barcode, scan.component_sku);
+        if (sku === scannedSku) got += Number(scan.quantity);
+      }
+      const left = required - got;
+      if (left <= 0) return res.status(400).json({ error: `${scannedSku} is already scanned` });
+      const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
+      if (qty > left) return res.status(400).json({ error: `Only ${left} remaining — reduce the quantity` });
+
+      let locationId: string | null = null;
+      if (location_code) {
+        const loc = await query(`SELECT id FROM warehouse_locations WHERE location_code = $1`, [location_code.toUpperCase()]);
+        locationId = loc.rows[0]?.id ?? null;
+      }
+      await query(
+        `INSERT INTO pick_scans (pick_list_id, pick_list_item_id, quantity, location_id, scanned_barcode, performed_by, component_sku)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [pickListId, item.id, qty, locationId, scanned_barcode, toUuidOrNull(req.user?.id), scannedSku]
+      );
+      if (locationId) {
+        await query(`UPDATE pick_list_items SET picked_from_location_id = $1 WHERE id = $2`, [locationId, item.id]);
+      }
+      const { item: updatedItem, allPicked } = await recomputePickItem(pickListId, item.id);
+      res.json({
+        success: true,
+        all_picked: allPicked,
+        item: updatedItem,
+        note: `Parent ${scannedSku} scanned. Pick any inventory kit parts still outstanding.`,
+      });
     } else if ((await kitPartsOf(item.id)).length) {
       return res.status(400).json({
-        error: 'This is a kit product. You must scan its individual components instead.',
-        instruction: 'Scan each component SKU separately to complete this pick.',
+        error: 'This is a kit product. Scan the parent and each inventory kit part.',
+        instruction: 'Scan the parent SKU and each component SKU separately.',
       });
     } else {
       // Regular non-kit item
