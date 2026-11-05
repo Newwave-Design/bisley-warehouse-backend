@@ -7,6 +7,7 @@ import express, { Response } from 'express';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { getPool, query } from '../../db/index.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
+import { rememberShipmentTracking } from '../../lib/shipment-tracking.js';
 import { returnStockForCancelledCollection, takeStockForBookedCollection } from '../../lib/collection-stock.js';
 import { fitZpl } from '../../lib/zpl-fit.js';
 import { addDxConsignment, deleteDxConsignment, dxConfigured, DxError, fetchDxLabels, quoteDxCollection } from '../../lib/dx-freight.js';
@@ -589,6 +590,9 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     }
 
     console.log(`${courier} collection booked ${waybill} for pick list ${pickListId}`);
+    await rememberShipmentTracking(pickListId).catch((error) => {
+      console.warn('Saving shipment tracking failed', error instanceof Error ? error.message : 'failed');
+    });
     await takeStockForBookedCollection(pickListId, text(req.user?.id)).catch((error) => {
       console.warn('Removing booked collection stock failed', error instanceof Error ? error.message : 'failed');
     });

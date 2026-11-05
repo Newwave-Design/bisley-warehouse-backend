@@ -424,6 +424,18 @@ export async function addDxConsignment(input: {
   };
 }
 
+export async function fetchDxTrackingNumbers(consignmentNumber: string, routingStream: string): Promise<string[]> {
+  const json = await authed('GetConsignmentTrackingInfo', {
+    ConsignmentNumber: consignmentNumber,
+    RoutingStream: routingStream || 'F',
+  });
+  assertOk(json, 'DX did not return a tracking number.');
+  const numbers = (Array.isArray(json?.TrackingNumbers) ? json.TrackingNumbers : [])
+    .map((entry: { TrackingNumber?: string }) => text(entry?.TrackingNumber))
+    .filter(Boolean);
+  return numbers;
+}
+
 export async function deleteDxConsignment(consignmentNumber: string, routingStream: string) {
   const json = await authed('DeleteConsignment', {
     ConsignmentNumber: consignmentNumber,

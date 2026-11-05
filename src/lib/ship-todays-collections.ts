@@ -2,6 +2,7 @@ import { query } from '../db/index.js';
 import { takeStockForOpenCollections } from './collection-stock.js';
 import { fulfillPickListsInMedusa } from './medusa-fulfillment.js';
 import { recordPickListEvents } from './pick-list-events.js';
+import { rememberShipmentTracking } from './shipment-tracking.js';
 
 const PICKED = ['PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED'];
 
@@ -49,19 +50,30 @@ export async function shipCollectionsDueToday(): Promise<string[]> {
         })
         .map((row) => row.id),
     )];
+    if (ids.length) {
+      await query(
+        `UPDATE pick_lists pl
+         SET tracking_number = COALESCE(NULLIF(btrim(pl.tracking_number), ''), cb.waybill),
+             carrier = cb.courier,
+             updated_at = NOW()
+         FROM (
+           SELECT DISTINCT ON (pick_list_id) pick_list_id, waybill, courier
+           FROM collection_bookings
+           WHERE status <> 'cancelled' AND COALESCE(waybill, '') <> ''
+           ORDER BY pick_list_id, created_at DESC
+         ) cb
+         WHERE pl.id = cb.pick_list_id AND pl.id = ANY($1::uuid[])`,
+        [ids],
+      );
+    }
+    const tracking = await rememberShipmentTracking().catch((error) => {
+      console.warn('[tracking] Saving shipment tracking failed', error instanceof Error ? error.message : 'failed');
+      return { filled: 0, waiting: 0 };
+    });
+    if (tracking.filled || tracking.waiting) {
+      console.log(`[tracking] Saved ${tracking.filled} shipment link(s), ${tracking.waiting} still waiting`);
+    }
     if (!ids.length) return [];
-    await query(
-      `UPDATE pick_lists pl
-       SET tracking_number = cb.waybill, carrier = cb.courier, updated_at = NOW()
-       FROM (
-         SELECT DISTINCT ON (pick_list_id) pick_list_id, waybill, courier
-         FROM collection_bookings
-         WHERE status <> 'cancelled' AND COALESCE(waybill, '') <> ''
-         ORDER BY pick_list_id, created_at DESC
-       ) cb
-       WHERE pl.id = cb.pick_list_id AND pl.id = ANY($1::uuid[])`,
-      [ids],
-    );
     await recordPickListEvents({
       ids,
       actor: 'system',
