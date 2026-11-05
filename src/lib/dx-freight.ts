@@ -236,7 +236,12 @@ export function dxReference(value: string): string {
   return clean || 'ORDER';
 }
 
-/** Printed as ITEM REF on the Zebra label. The PDF line stays "Carton (KG)", which is the package type. */
+/**
+ * Printed as ITEM REF on the Zebra label. The strip holds 32 characters
+ * between the barcode and the top rule. A longer desk title drops the
+ * "MultiDesk" word so the SKU and finish stay on the label.
+ * The PDF line stays "Carton (KG)", which is the package type.
+ */
 export function dxContentDescription(title: string): string {
   const clean = title
     .replace(/\u00b7/g, ' ')
@@ -244,7 +249,10 @@ export function dxContentDescription(title: string): string {
     .replace(/[\^~]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
-  return (clean || 'Carton').slice(0, 40)
+  if (!clean) return 'Carton'
+  if (clean.length <= 32) return clean
+  const withoutDesk = clean.replace(/^MultiDesk(?: \d+)? /, '')
+  return (withoutDesk || clean).slice(0, 32)
 }
 
 export function dxPhone(value: string): string {
