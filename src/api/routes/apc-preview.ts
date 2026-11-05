@@ -676,7 +676,7 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
     if (!remoteUser) {
       return res.status(500).json({ error: 'APC login is not configured on this computer' });
     }
-    const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(waybill)}.json?labelformat=${format}&markprinted=False&searchtype=CarrierWaybill&labels=True`;
+    const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(waybill)}.json?labelformat=${format}&markprinted=True&searchtype=CarrierWaybill&labels=True`;
     const response = await fetch(url, {
       headers: {
         'remote-user': remoteUser,
