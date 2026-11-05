@@ -236,6 +236,17 @@ export function dxReference(value: string): string {
   return clean || 'ORDER';
 }
 
+/** Printed as ITEM REF on the Zebra label. The PDF line stays "Carton (KG)", which is the package type. */
+export function dxContentDescription(title: string): string {
+  const clean = title
+    .replace(/\u00b7/g, ' ')
+    .replace(/[^\x20-\x7E]/g, ' ')
+    .replace(/[\^~]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return (clean || 'Carton').slice(0, 40)
+}
+
 export function dxPhone(value: string): string {
   let digits = value.replace(/[^\d+]/g, '');
   if (digits.startsWith('+44')) digits = `0${digits.slice(3)}`;
@@ -369,7 +380,7 @@ export async function addDxConsignment(input: {
 
   const { accountNumber, depot } = account();
   const contents = input.pieces.map((piece) => ({
-    ContentDescription: 'CartonKG',
+    ContentDescription: dxContentDescription(piece.title),
     ContentDescriptionID: 1,
     ContentDimension1: cm(piece.heightCm),
     ContentDimension2: cm(piece.widthCm),
