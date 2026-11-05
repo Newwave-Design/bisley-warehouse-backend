@@ -2,7 +2,8 @@
  * Delivery due window per pick list, counted from the order date.
  *   Standard      2-4 weeks: every coloured line (and kit part) is an approved colour AND in stock.
  *   Non-standard  4-8 weeks: any line in a non-approved colour, or short of stock.
- * Traffic light: green = before the window, amber = inside it, red = after it. Finished lists get no light.
+ * Traffic light: green = more than 3 days before the last date, amber = within 3 days of it, red = after it (late).
+ * Finished lists get no light.
  * Stock is read live from warehouse_inventory, so a list moves bracket as stock arrives or runs out.
  */
 import { query } from '../db/index.js';
@@ -43,6 +44,14 @@ function colourOf(sku: string): string | null {
 
 const utcDay = (d: Date) => Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
 const iso = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+
+/** Orange on the last date and the 3 days before it. Red once that date has passed. */
+export function dueLight(today: number, latest: number): 'green' | 'amber' | 'red' {
+  const daysToLatest = Math.round((latest - today) / DAY_MS);
+  if (daysToLatest < 0) return 'red';
+  if (daysToLatest <= 3) return 'amber';
+  return 'green';
+}
 
 export async function getDeliveryDues(pickListIds: string[]): Promise<Record<string, DeliveryDue>> {
   const out: Record<string, DeliveryDue> = {};
@@ -117,7 +126,7 @@ export async function getDeliveryDues(pickListIds: string[]): Promise<Record<str
     const orderDay = utcDay(new Date(pl.order_date));
     const start = orderDay + weeks.min * 7 * DAY_MS;
     const end = orderDay + weeks.max * 7 * DAY_MS;
-    const light = FINISHED_STATUSES.has(pl.status) ? null : today < start ? 'green' : today <= end ? 'amber' : 'red';
+    const light = FINISHED_STATUSES.has(pl.status) ? null : dueLight(today, end);
 
     out[pl.id] = {
       basis: standard ? 'standard' : 'non_standard',
