@@ -111,7 +111,12 @@ export async function getStock(sku: string, colourCode: string | null) {
     `SELECT l.location_code, wi.quantity, wi.quantity_reserved, wi.quantity_available
      FROM warehouse_inventory wi
      JOIN warehouse_locations l ON l.id = wi.location_id
-     WHERE wi.product_sku = $1 AND (wi.colour_code = $2 OR $2 IS NULL)
+     WHERE wi.product_sku = $1 AND wi.quantity > 0
+       AND (
+         $2 IS NULL OR btrim(COALESCE(wi.colour_code, '')) = ''
+         OR lower(wi.colour_code) = lower($2)
+         OR wi.colour_code !~ '^[a-z0-9]{2,4}$'
+       )
      ORDER BY wi.quantity DESC`,
     [sku, colourCode]
   );
@@ -415,13 +420,19 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
         CASE WHEN wp.kit_components IS NOT NULL AND jsonb_array_length(wp.kit_components) > 0
           THEN true ELSE false END AS is_kit,
         wp.kit_components,
-        -- Show where this SKU is in the warehouse
+        -- Show where this SKU is in the warehouse. Stock rows often store the colour
+        -- name ("Bisley Orange") while the order line stores the code ("bn6").
         (SELECT json_agg(json_build_object('location_code', wl.location_code, 'qty', wi.quantity) ORDER BY wi.quantity DESC)
          FROM warehouse_inventory wi
          JOIN warehouse_locations wl ON wl.id = wi.location_id
          WHERE wi.product_sku = pli.product_sku
-           AND (wi.colour_code = pli.colour_code OR pli.colour_code IS NULL)
-           AND wi.quantity > 0) AS stock_locations
+           AND wi.quantity > 0
+           AND (
+             pli.colour_code IS NULL OR btrim(COALESCE(wi.colour_code, '')) = ''
+             OR lower(wi.colour_code) = lower(pli.colour_code)
+             OR lower(wi.colour_code) = lower(COALESCE(wp.colour_name, ''))
+             OR wi.colour_code !~ '^[a-z0-9]{2,4}$'
+           )) AS stock_locations
       FROM pick_list_items pli
       LEFT JOIN warehouse_locations l ON l.id = pli.picked_from_location_id
       LEFT JOIN LATERAL (
