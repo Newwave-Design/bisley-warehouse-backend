@@ -4,8 +4,8 @@
  * Rows come from the same paid-order calculation as Supplier Re-orders. A row counts as already sent
  * when the current spreadsheet log has it, or when someone marks it sent to Chris here. Nothing is emailed.
  * Run rates are every SKU on those paid orders, plus any SKU with stock on hand that has never sold.
- * Already bought is every unit on a supplier re-order send for that SKU, plus any line marked sent to Chris
- * that is not already on a send. Sold is every paid sale. Still to buy is the sold quantity not yet sent.
+ * Sold is every paid sale. Sent to Chris is the sold quantity of lines marked sent to Chris.
+ * Still to buy is sold minus sent to Chris.
  * Do-not-reorder is stored against the buy SKU and hides later sales of that SKU from the buying list.
  * It can only be set when that SKU has stock on hand. Clearing the flag is always allowed.
  *
@@ -136,21 +136,10 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
     if (at > g.last) g.last = at;
     if (at >= recent) g.sold_30d += l.sold_quantity;
     if (at >= week) g.sold_7d += l.sold_quantity;
-    if (!row.previously_sent_at && !row.sent_to_chris_at) g.unsent_buy_units += l.quantity;
-    if (row.sent_to_chris_at && !row.previously_sent_at) g.marked_units += l.quantity;
+    if (row.sent_to_chris_at) g.marked_units += l.sold_quantity;
+    else g.unsent_buy_units += l.sold_quantity;
     if (l.title) g.title = l.title;
     groups.set(sku, g);
-  }
-
-  const claimed = new Set<string>();
-  function reorderedUnits(skus: string[]) {
-    let total = 0;
-    for (const sku of skus) {
-      if (claimed.has(sku)) continue;
-      claimed.add(sku);
-      total += state.reorderedBySku.get(sku) ?? 0;
-    }
-    return total;
   }
 
   const sold = [...groups.values()].map(g => {
@@ -174,7 +163,7 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
       unit_cost_gbp: state.unitCost.get(g.sku) ?? null,
       trigger_quantity: state.triggers.get(g.sku) ?? null,
       needs_reorder: needsReorder(onHand, state.triggers.get(g.sku) ?? null),
-      already_bought: reorderedUnits([g.sku, ...g.sold_skus]) + g.marked_units,
+      already_bought: g.marked_units,
       cover_weeks: recentWeekly > 0 ? Math.round((onHand / recentWeekly) * 10) / 10 : null,
       unsent_buy_units: g.unsent_buy_units,
       bonded: state.bondedSkus.has(g.sku) || [...g.sold_skus].some((sku) => state.bondedSkus.has(sku)),
@@ -220,14 +209,14 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
       unit_cost_gbp: state.unitCost.get(sku) ?? null,
       trigger_quantity: state.triggers.get(sku) ?? null,
       needs_reorder: needsReorder(onHand, state.triggers.get(sku) ?? null),
-      already_bought: reorderedUnits([sku]),
+      already_bought: 0,
       cover_weeks: null,
       unsent_buy_units: 0,
       bonded: state.bondedSkus.has(sku),
     });
   }
 
-  const onlyReordered = [...state.reorderedBySku.keys()].filter((sku) => !claimed.has(sku));
+  const onlyReordered = [...state.reorderedBySku.keys()].filter((sku) => !seen.has(sku));
   if (onlyReordered.length) {
     const found = await query(
       `SELECT DISTINCT ON (variant_sku) variant_sku, product_title, colour_name, colour_code
@@ -254,7 +243,7 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
         unit_cost_gbp: state.unitCost.get(sku) ?? null,
         trigger_quantity: state.triggers.get(sku) ?? null,
         needs_reorder: needsReorder(state.onHand.get(sku) ?? 0, state.triggers.get(sku) ?? null),
-        already_bought: reorderedUnits([sku]),
+        already_bought: 0,
         cover_weeks: null,
         unsent_buy_units: 0,
         bonded: state.bondedSkus.has(sku),
@@ -268,7 +257,7 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
 async function payload() {
   const state = await loadState();
   const lines = state.lines.map(l => presentLine(l, state));
-  const toBuy = lines.filter(l => !l.previously_sent_at && !l.sent_to_chris_at);
+  const toBuy = lines.filter(l => !l.sent_to_chris_at);
   const runRatesRows = await runRates(state.lines, state);
   return {
     generated_at: new Date().toISOString(),
