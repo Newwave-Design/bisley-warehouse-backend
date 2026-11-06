@@ -6,6 +6,7 @@ import express, { Request, Response } from 'express';
 import { v4 as uuid } from 'uuid';
 import { query } from '../../db/index.js';
 import { authMiddleware, requirePermission } from '../../middleware/auth.js';
+import { toUuidOrNull } from './mobile.js';
 import { importPackagingSnapshot } from '../../lib/packaging-import.js';
 import { seedDpdRateCards } from '../../lib/shipping-rate-seed.js';
 
@@ -540,7 +541,7 @@ router.post('/movements', requirePermission('manage_settings'), async (req: Requ
     }
     if (!MOVE_TYPES.includes(movement_type)) return res.status(400).json({ error: `movement_type must be one of ${MOVE_TYPES.join(', ')}` });
     const signed = movement_type === 'pack_usage' || movement_type === 'write_off' ? -Math.abs(Number(qty)) : Number(qty);
-    const userId = (req as any).user?.id || null;
+    const userId = toUuidOrNull((req as any).user?.id);
     const move = await query(
       `INSERT INTO packaging_stock_movements (id, packaging_item_id, movement_type, qty, unit_cost_gbp, supplier_order_ref, reason, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
@@ -553,6 +554,181 @@ router.post('/movements', requirePermission('manage_settings'), async (req: Requ
     res.status(201).json(move.rows[0]);
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to record movement', details: err.message });
+  }
+});
+
+/** Products on open orders with no packaging box. A box is a BOM box, or a product packed in its own box. */
+router.get('/unboxed', async (req: Request, res: Response) => {
+  try {
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const [lines, products, specs, boxes] = await Promise.all([
+      query(
+        `SELECT upper(pli.product_sku) AS sku,
+                SUM(pli.quantity_required)::int AS qty,
+                COUNT(DISTINCT pl.id)::int AS orders,
+                MAX(NULLIF(pli.item_title, '')) AS item_title
+           FROM pick_list_items pli
+           JOIN pick_lists pl ON pl.id = pli.pick_list_id
+          WHERE COALESCE(pl.is_archived, false) = false
+            AND COALESCE(pl.is_sandbox, false) = false
+            AND pl.status NOT IN ('DISPATCHED', 'CANCELLED')
+            AND COALESCE(pli.is_archived, false) = false
+            AND COALESCE(pli.product_sku, '') <> ''
+            AND upper(pli.product_sku) NOT LIKE '%SAMPLE%'
+          GROUP BY upper(pli.product_sku)`
+      ),
+      query(
+        `SELECT DISTINCT ON (upper(variant_sku))
+                upper(variant_sku) AS sku, product_title, is_kit, kit_components, price_gbp,
+                COALESCE(variant_weight_grams, weight_grams) AS weight_grams,
+                COALESCE(variant_depth_mm, depth_mm) AS depth_mm,
+                COALESCE(variant_width_mm, width_mm) AS width_mm,
+                COALESCE(variant_height_mm, height_mm) AS height_mm
+           FROM wms_products
+          ORDER BY upper(variant_sku), is_archived`
+      ),
+      query(
+        `SELECT upper(product_code) AS product_code, product_title, method,
+                length_mm, width_mm, height_mm,
+                length_packed_mm, width_packed_mm, height_packed_mm, weight_grams
+           FROM packaging_product_specs
+          WHERE is_active`
+      ),
+      query(
+        `SELECT upper(COALESCE(b.sku, '')) AS sku, upper(COALESCE(b.product_code, '')) AS product_code
+           FROM packaging_boms b
+           JOIN packaging_bom_lines l ON l.bom_id = b.id
+           JOIN packaging_items i ON i.id = l.packaging_item_id
+          WHERE b.is_active AND i.is_active AND i.item_type = 'box'`
+      ),
+    ]);
+
+    type Catalogue = {
+      title: string | null
+      price: number | null
+      weight: number | null
+      depth: number | null
+      width: number | null
+      height: number | null
+      kit: boolean
+      parts: { sku?: string; required_quantity?: number; product_title?: string }[]
+    };
+    const catalogue = new Map<string, Catalogue>();
+    for (const row of products.rows as any[]) {
+      catalogue.set(row.sku, {
+        title: row.product_title || null,
+        price: row.price_gbp == null ? null : Number(row.price_gbp),
+        weight: row.weight_grams == null ? null : Number(row.weight_grams),
+        depth: row.depth_mm == null ? null : Number(row.depth_mm),
+        width: row.width_mm == null ? null : Number(row.width_mm),
+        height: row.height_mm == null ? null : Number(row.height_mm),
+        kit: row.is_kit === true,
+        parts: Array.isArray(row.kit_components) ? row.kit_components : [],
+      });
+    }
+    const specByCode = new Map<string, any>();
+    const codes: string[] = [];
+    for (const row of specs.rows as any[]) {
+      if (!row.product_code || specByCode.has(row.product_code)) continue;
+      specByCode.set(row.product_code, row);
+      codes.push(row.product_code);
+    }
+    codes.sort((a, b) => b.length - a.length);
+    const boxedSkus = new Set((boxes.rows as { sku: string }[]).map((row) => row.sku).filter(Boolean));
+    const boxedCodes = new Set((boxes.rows as { product_code: string }[]).map((row) => row.product_code).filter(Boolean));
+    const matchCode = (sku: string) => codes.find((code) => sku === code || sku.startsWith(`${code}-`)) || '';
+    const hasBox = (sku: string) => {
+      if (boxedSkus.has(sku)) return true;
+      const code = matchCode(sku);
+      if (code && boxedCodes.has(code)) return true;
+      const method = specByCode.get(code || sku)?.method;
+      return method === 'own_box';
+    };
+
+    const demand = new Map<string, { qty: number; orders: number; title: string | null; price: number | null }>();
+    const addDemand = (sku: string, qty: number, orders: number, title: string | null, price: number | null) => {
+      const key = sku.toUpperCase();
+      if (!key || key.includes('SAMPLE') || hasBox(key)) return;
+      const current = demand.get(key);
+      if (!current) demand.set(key, { qty, orders, title, price });
+      else {
+        current.qty += qty;
+        current.orders += orders;
+        const prices = [current.price, price].filter((value): value is number => value != null && value > 0);
+        current.price = prices.length ? Math.max(...prices) : null;
+        if (!current.title && title) current.title = title;
+      }
+    };
+
+    for (const line of lines.rows as { sku: string; qty: number; orders: number; item_title: string | null }[]) {
+      const product = catalogue.get(line.sku);
+      const parts = (product?.kit ? product.parts : []).filter((part) => part?.sku && part.sku.toUpperCase() !== line.sku);
+      if (parts.length) {
+        for (const part of parts) {
+          const per = Number(part.required_quantity) || 1;
+          const child = catalogue.get(String(part.sku).toUpperCase());
+          addDemand(
+            String(part.sku),
+            Number(line.qty) * per,
+            Number(line.orders),
+            part.product_title || child?.title || null,
+            child?.price ?? product?.price ?? null,
+          );
+        }
+        continue;
+      }
+      addDemand(line.sku, Number(line.qty) || 0, Number(line.orders) || 0, line.item_title || product?.title || null, product?.price ?? null);
+    }
+
+    const rows = [...demand.entries()].map(([sku, row]) => {
+      const code = matchCode(sku);
+      const spec = specByCode.get(code || sku);
+      const product = catalogue.get(sku);
+      const packed = [spec?.length_packed_mm, spec?.width_packed_mm, spec?.height_packed_mm].map((side) => Number(side) || 0);
+      const body = [spec?.length_mm, spec?.width_mm, spec?.height_mm].map((side) => Number(side) || 0);
+      const catalogueSize = [product?.depth, product?.width, product?.height].map((side) => Number(side) || 0);
+      const size = packed.every((side) => side > 0) ? packed : body.some((side) => side > 0) ? body : catalogueSize;
+      const weight = spec?.weight_grams ?? product?.weight ?? null;
+      return {
+        sku,
+        product_code: code || sku,
+        title: spec?.product_title || row.title || product?.title || sku,
+        qty: row.qty,
+        orders: row.orders,
+        price_gbp: row.price,
+        length_mm: size[0] || null,
+        width_mm: size[1] || null,
+        height_mm: size[2] || null,
+        weight_grams: weight == null ? null : Number(weight),
+        method: spec?.method || null,
+      };
+    });
+    const grouped = new Map<string, (typeof rows)[number]>();
+    for (const row of rows) {
+      const existing = grouped.get(row.product_code);
+      if (!existing) {
+        grouped.set(row.product_code, { ...row });
+        continue;
+      }
+      existing.qty += row.qty;
+      existing.orders += row.orders;
+      const prices = [existing.price_gbp, row.price_gbp].filter((value): value is number => value != null && value > 0);
+      existing.price_gbp = prices.length ? Math.max(...prices) : null;
+      if (!existing.length_mm && row.length_mm) {
+        existing.length_mm = row.length_mm;
+        existing.width_mm = row.width_mm;
+        existing.height_mm = row.height_mm;
+      }
+      if (existing.weight_grams == null) existing.weight_grams = row.weight_grams;
+    }
+    const productsOut = [...grouped.values()].filter((row) => {
+      if (!q) return true;
+      return `${row.product_code} ${row.sku} ${row.title}`.toLowerCase().includes(q);
+    }).sort((a, b) => (b.price_gbp ?? -1) - (a.price_gbp ?? -1) || a.product_code.localeCompare(b.product_code));
+
+    res.json({ products: productsOut });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to list products without a box', details: err.message });
   }
 });
 
