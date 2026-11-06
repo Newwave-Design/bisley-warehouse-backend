@@ -1,9 +1,13 @@
 /**
- * APC draws a collection label about 6.5 inches long. The ZD421 roll is
- * 102 × 152 mm (4 × 6 inch), so the bottom runs off. Shrink a label that is
- * larger than that roll and leave a short sample label as it was drawn.
+ * Courier labels are drawn longer than the ZD421 roll (102 × 152 mm, 4 × 6 inch,
+ * 812 × 1218 dots). DX sets ^LL1595, about 8 inches. One label still looks nearly
+ * whole because the extra feed runs off the end. The next label in the same batch
+ * starts too early, so the bottom of each sticker is missing. Shrink anything
+ * larger than the roll, then force the print length to the sticker.
  */
 
+const STOCK_W = 812
+const STOCK_H = 1218
 const SHIP_W = 770
 const SHIP_H = 1140
 
@@ -13,16 +17,25 @@ export function fitZpl(zpl: string): string {
 
 function fitLabel(label: string): string {
   const [maxX, maxY] = bounds(label)
-  if (maxY <= 500) return label
+  const declaredW = Number(label.match(/\^PW(\d+)/)?.[1] || 0)
+  const declaredH = Number(label.match(/\^LL(\d+)/)?.[1] || 0)
+  if (maxY <= 500 && declaredH <= 500) return label
+  const needW = Math.max(maxX, declaredW)
+  const needH = Math.max(maxY, declaredH)
+  if (needW <= STOCK_W && needH <= STOCK_H && maxX <= SHIP_W && maxY <= SHIP_H) return label
   const scale = Math.min(
-    maxX > SHIP_W ? SHIP_W / maxX : 1,
-    maxY > SHIP_H ? SHIP_H / maxY : 1,
+    needW > SHIP_W ? SHIP_W / needW : 1,
+    needH > SHIP_H ? SHIP_H / needH : 1,
     1,
   )
-  if (scale > 0.985) return label
-  const scaled = scaleLabel(label, scale)
-  if (scaled.includes('^PW')) return scaled
-  return scaled.replace('^XA', '^XA\n^PW812\n^LL1218')
+  const scaled = scale > 0.985 ? label : scaleLabel(label, scale)
+  return forceStock(scaled)
+}
+
+function forceStock(label: string): string {
+  let out = /\^PW\d+/.test(label) ? label.replace(/\^PW\d+/, `^PW${STOCK_W}`) : label.replace('^XA', `^XA\n^PW${STOCK_W}`)
+  out = /\^LL\d+/.test(out) ? out.replace(/\^LL\d+/, `^LL${STOCK_H}`) : out.replace('^XA', `^XA\n^LL${STOCK_H}`)
+  return out
 }
 
 function bounds(label: string): [number, number] {
