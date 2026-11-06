@@ -1,6 +1,6 @@
 /**
  * Delivery due window per pick list, counted from the order date.
- *   Standard      2-4 weeks: every coloured line (and kit part) is an approved colour AND in stock.
+ *   In stock      2-4 weeks from 9 Oct 2026, matching the shop. Orders before that day were promised 4-6 weeks.
  *   Non-standard  4-8 weeks: any line in a non-approved colour, or short of stock.
  * Traffic light: green = more than 3 days before the last date, amber = within 3 days of it, red = after it (late).
  * Finished lists get no light.
@@ -10,7 +10,15 @@ import { query } from '../db/index.js';
 import { COLOUR_NAMES, extractColourCode } from './colour-names.js';
 
 export const STANDARD_WEEKS = { min: 2, max: 4 };
+/** In-stock promise on orders placed before 9 Oct 2026. */
+export const STANDARD_WEEKS_BEFORE = { min: 4, max: 6 };
+const STOCKED_PROMISE_CHANGE = Date.UTC(2026, 9, 9);
 export const NON_STANDARD_WEEKS = { min: 4, max: 8 };
+
+/** In-stock window for an order placed on this UTC day. */
+export function stockedWeeks(orderDay: number): { min: number; max: number } {
+  return orderDay < STOCKED_PROMISE_CHANGE ? STANDARD_WEEKS_BEFORE : STANDARD_WEEKS;
+}
 
 /** Approved colours (storefront list) plus the desktop finishes; Emerald (da8) is special-order only. */
 const APPROVED_COLOUR_CODES = new Set([
@@ -43,6 +51,12 @@ function colourOf(sku: string): string | null {
 }
 
 const utcDay = (d: Date) => Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+const londonDay = (d: Date) => {
+  const [year, month, day] = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(d).split('-').map(Number);
+  return Date.UTC(year, month - 1, day);
+};
 const iso = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
 /** Orange on the last date and the 3 days before it. Red once that date has passed. */
@@ -122,8 +136,8 @@ export async function getDeliveryDues(pickListIds: string[]): Promise<Record<str
     }
 
     const standard = reasons.length === 0;
-    const weeks = standard ? STANDARD_WEEKS : NON_STANDARD_WEEKS;
     const orderDay = utcDay(new Date(pl.order_date));
+    const weeks = standard ? stockedWeeks(londonDay(new Date(pl.order_date))) : NON_STANDARD_WEEKS;
     const start = orderDay + weeks.min * 7 * DAY_MS;
     const end = orderDay + weeks.max * 7 * DAY_MS;
     const light = FINISHED_STATUSES.has(pl.status) ? null : dueLight(today, end);
