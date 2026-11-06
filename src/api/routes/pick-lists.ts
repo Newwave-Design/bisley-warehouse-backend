@@ -19,7 +19,6 @@ import { getDeliveryDues } from '../../lib/delivery-due.js';
 import { COLOUR_NAMES, enrichSampleItems, extractColourCode, isSampleSku, sampleColourList, sampleColourName } from '../../lib/colour-names.js';
 import { actorName, PICK_LIST_STATUSES, recordPickListEvents, type PickListStatus } from '../../lib/pick-list-events.js';
 import { fulfillPickListInMedusa, fulfillPickListsInMedusa } from '../../lib/medusa-fulfillment.js';
-import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { buildSampleAddressZpl, formatSampleAddressLabel, formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { attachPackaging } from '../../lib/pick-list-packaging.js';
 import { expandKitPicksByList } from '../../lib/pick-list-kits.js';
@@ -223,12 +222,11 @@ async function getPickListStockStatus(pickListId: string) {
  *   limit=50&offset=0            limit=0 returns every matching list (desktop pick lists)
  *   include_values=true          adds order_value { gross, net, vat, refunded, currency } per list (live from Medusa)
  *   payment=all                  include orders that are not paid yet (default: paid orders only)
+ *   lite=1                       rows only; stock, due dates, kits and packaging come from POST /enrichment
  */
 router.get('/', authMiddleware, async (req: Request, res: Response) => {
   try {
-    await shipCollectionsDueToday().catch((error) => {
-      console.warn('Shipping today\'s collections failed', error instanceof Error ? error.message : 'failed');
-    });
+    const lite = String(req.query.lite) === '1';
     const { status = 'UNFULFILLED', is_archived = 'false', limit = '50', offset = '0', search, sku, sort } = req.query;
 
     const statusParam = (status as string).toUpperCase();
@@ -318,17 +316,16 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          json_agg(json_build_object(
            'product_sku', pli.product_sku,
            'colour_code', pli.colour_code,
-           'item_title', COALESCE(wp.product_title, pli.item_title),
+           'item_title', ${lite ? 'pli.item_title' : 'COALESCE(wp.product_title, pli.item_title)'},
            'quantity_required', pli.quantity_required,
-           'quantity_picked', pli.quantity_picked,
-           'variant_thumbnail', wp.variant_thumbnail,
-           'product_thumbnail', wp.product_thumbnail
+           'quantity_picked', pli.quantity_picked
+           ${lite ? '' : `, 'variant_thumbnail', wp.variant_thumbnail, 'product_thumbnail', wp.product_thumbnail`}
          ) ORDER BY pli.line_number) FILTER (WHERE pli.id IS NOT NULL) AS items
          ${skuParamIndex > 0 ? `, MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_required END) as sku_quantity_required
                  , MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_picked END) as sku_quantity_picked` : ''}
        FROM pick_lists pl
        LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
-       LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
+       ${lite ? '' : 'LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku'}
        ${whereClause}
        GROUP BY pl.id
        ORDER BY pl.created_at ${orderDir}
@@ -340,6 +337,20 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
       `SELECT COUNT(*)::int AS total FROM pick_lists pl ${whereClause}`,
       countParams
     );
+
+    if (lite) {
+      return res.json({
+        pickLists: result.rows.map((pl: any) => ({
+          ...pl,
+          items: formatPickListOverview(pl.items),
+          sample_colours: sampleColourList(pl.items),
+          due: null,
+        })),
+        total: countResult.rows[0]?.total ?? result.rows.length,
+        limit: unlimited ? 0 : parseInt(limit as string),
+        offset: unlimited ? 0 : parseInt(offset as string),
+      });
+    }
 
     // Enrich each pick list with stock status
     const values = String(req.query.include_values) === 'true'
@@ -370,6 +381,43 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
     console.error('Pick list fetch error:', error);
     const errorMsg = error instanceof Error ? error.message : String(error);
     return res.status(500).json({ error: 'Failed to fetch pick lists', details: errorMsg });
+  }
+});
+
+const PICK_LIST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * POST /api/pick-lists/enrichment
+ * Due dates, kit lines and packaging for lists already shown. The desktop loads the rows first.
+ * Body: { ids: string[] }
+ */
+router.post('/enrichment', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : [])
+      .map((id: unknown) => String(id || '').trim())
+      .filter((id: string) => PICK_LIST_ID.test(id)))].slice(0, 2000);
+    if (!ids.length) return res.json({ dues: {}, items: {} });
+
+    const rows = await query(
+      `SELECT pick_list_id, product_sku, colour_code, item_title, quantity_required, quantity_picked, line_number
+       FROM pick_list_items
+       WHERE pick_list_id = ANY($1::uuid[])
+       ORDER BY line_number`,
+      [ids]
+    );
+    const grouped = new Map<string, any[]>(ids.map((id) => [id, []]));
+    for (const row of rows.rows) grouped.get(row.pick_list_id)?.push(row);
+    const ordered = ids.map((id) => formatPickListOverview(grouped.get(id)));
+    const [dues, expanded] = await Promise.all([
+      getDeliveryDues(ids),
+      expandKitPicksByList(ordered).then((groups) => attachPackaging(groups)),
+    ]);
+    const items: Record<string, unknown> = {};
+    ids.forEach((id, index) => { items[id] = expanded[index]; });
+    return res.json({ dues, items });
+  } catch (error) {
+    console.error('Pick list enrichment failed', error);
+    return res.status(500).json({ error: 'Failed to load stock and due dates' });
   }
 });
 
