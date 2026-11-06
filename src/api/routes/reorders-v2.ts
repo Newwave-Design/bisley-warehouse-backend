@@ -160,9 +160,12 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
     groups.set(sku, g);
   }
 
+  let earliest = Infinity;
+  for (const g of groups.values()) if (g.first < earliest) earliest = g.first;
+  const allTimeDays = Number.isFinite(earliest) ? Math.max(1, (now - earliest) / DAY_MS) : 1;
+
   const soldRates = [...groups.values()].map(g => {
-    const days = Math.max(1, (now - g.first) / DAY_MS);
-    const perWeek = g.sold_units / (days / 7);
+    const perWeek = g.sold_units / (allTimeDays / 7);
     const recentWeekly = g.sold_30d > 0 ? g.sold_30d / (30 / 7) : perWeek;
     const onHand = [...g.sold_skus].reduce((sum, sku) => sum + (state.onHand.get(sku) ?? 0), 0);
     let orderedUnits = 0;
