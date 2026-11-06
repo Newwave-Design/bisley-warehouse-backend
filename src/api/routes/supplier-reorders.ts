@@ -47,6 +47,7 @@ export interface ReorderLine {
   /** Units the customer bought, before the 5-pack conversion. */
   sold_quantity: number;
   pick_list_number: string;
+  customer_name: string;
   ordered_at: string;
   /** Set when a single tray is ordered on its 1-pack code because the 5-pack has no supplier code. */
   note: string;
@@ -117,7 +118,7 @@ export async function buildLines(): Promise<ReorderLine[]> {
   const items = await query(`
     SELECT pli.id AS pick_list_item_id, pli.product_sku, pli.colour_code AS item_colour,
            pli.quantity_required, pli.is_custom, pli.item_title,
-           pl.pick_list_number, pl.medusa_order_id, pl.created_at AS ordered_at,
+           pl.pick_list_number, pl.customer_name, pl.medusa_order_id, pl.created_at AS ordered_at,
            wp.product_title, wp.colour_name, wp.colour_code AS wp_colour, wp.is_kit, wp.kit_components,
            wp.supplier_part_code, wp.supplier_colour_code, wp.supplier_code_source
     FROM pick_list_items pli
@@ -164,6 +165,7 @@ export async function buildLines(): Promise<ReorderLine[]> {
     const base = {
       pick_list_item_id: r.pick_list_item_id as string,
       pick_list_number: r.pick_list_number as string,
+      customer_name: String(r.customer_name || ''),
       ordered_at: new Date(r.ordered_at).toISOString(),
     };
     const qty = Number(r.quantity_required) || 0;

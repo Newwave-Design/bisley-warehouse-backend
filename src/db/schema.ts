@@ -1679,4 +1679,14 @@ CREATE TABLE IF NOT EXISTS reorder_v2_ordered (
   updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+-- Units of a particular customer order already ordered, on top of the year-to-date quantity.
+-- The year-to-date quantity covers the oldest sales. These covers take a chosen order off the list.
+CREATE TABLE IF NOT EXISTS reorder_v2_sale_covers (
+  pick_list_item_id UUID NOT NULL,
+  sku VARCHAR(100) NOT NULL,
+  units INTEGER NOT NULL CHECK (units > 0),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (pick_list_item_id, sku)
+);
+
 `;

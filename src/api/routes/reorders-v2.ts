@@ -31,7 +31,7 @@ interface SentRow { pick_list_item_id: string; sku: string; sent_at: Date; sent_
 interface MarkRow { pick_list_item_id: string; sku: string; sent_to_chris_at: Date; sent_to_chris_by: string | null }
 
 async function loadState() {
-  const [lines, sent, marks, reordered, flags, stock, costs, bonded, orderedRows] = await Promise.all([
+  const [lines, sent, marks, reordered, flags, stock, costs, bonded, orderedRows, coverRows] = await Promise.all([
     buildLines(),
     query(`
       SELECT DISTINCT ON (l.pick_list_item_id, l.sku)
@@ -59,6 +59,7 @@ async function loadState() {
         )
     `),
     query(`SELECT LOWER(sku) AS sku, (quantity + extra)::int AS qty FROM reorder_v2_ordered`),
+    query(`SELECT pick_list_item_id, LOWER(sku) AS sku, units FROM reorder_v2_sale_covers`),
   ]);
   const sentByKey = new Map<string, SentRow>(sent.rows.map((r: SentRow) => [`${r.pick_list_item_id}|${r.sku}`, r]));
   const markByKey = new Map<string, MarkRow>(marks.rows.map((r: MarkRow) => [`${r.pick_list_item_id}|${r.sku}`, r]));
@@ -67,8 +68,13 @@ async function loadState() {
   const onHand = new Map<string, number>(stock.rows.map((r: { product_sku: string; qty: number }) => [r.product_sku, r.qty]));
   const unitCost = new Map<string, number>(costs.rows.map((r: { variant_sku: string; unit_cost_gbp: number }) => [r.variant_sku, Number(r.unit_cost_gbp)]));
   const bondedSkus = new Set<string>(bonded.rows.map((r: { product_sku: string }) => r.product_sku));
-  const ordered = new Map<string, number>(orderedRows.rows.map((r: { sku: string; qty: number }) => [r.sku, Number(r.qty)]));
-  return { lines, sentByKey, markByKey, triggers, onHand, unitCost, bondedSkus, reorderedBySku, ordered };
+  const ordered = new Map<string, number>();
+  for (const r of orderedRows.rows as { sku: string; qty: number }[]) {
+    const sku = r.sku.replace(/^aoc([23])a-/, (_, n: string) => `aoc${n}e-`);
+    ordered.set(sku, (ordered.get(sku) ?? 0) + Number(r.qty));
+  }
+  const saleCovers = new Map<string, number>(coverRows.rows.map((r: { pick_list_item_id: string; sku: string; units: number }) => [`${r.pick_list_item_id}|${r.sku}`, Number(r.units)]));
+  return { lines, sentByKey, markByKey, triggers, onHand, unitCost, bondedSkus, reorderedBySku, ordered, saleCovers };
 }
 
 function buySku(l: ReorderLine): string {
@@ -99,6 +105,7 @@ function presentLine(l: ReorderLine, state: Awaited<ReturnType<typeof loadState>
     sold_quantity: l.sold_quantity,
     note: l.note,
     pick_list_number: l.pick_list_number,
+    customer_name: l.customer_name,
     ordered_at: l.ordered_at,
     previously_sent_at: previous ? new Date(previous.sent_at).toISOString() : null,
     previously_sent_to: previous?.sent_to ?? null,
@@ -289,38 +296,33 @@ function toBuyRows(lines: ReorderLine[], state: Awaited<ReturnType<typeof loadSt
   }
   const rows = [];
   for (const [sku, group] of bySku) {
-    const soldQty = sold.get(sku) ?? 0;
-    const ordered = orderedCover(state.ordered, sold, sku);
-    const outstanding = soldQty - ordered;
-    if (outstanding <= 0) continue;
-    const newest = [...group].sort((a, b) => new Date(b.ordered_at).getTime() - new Date(a.ordered_at).getTime());
-    const sources: { pick_list_item_id: string; sku: string }[] = [];
-    let remaining = outstanding;
-    for (const l of newest) {
-      if (remaining <= 0) break;
-      sources.push({ pick_list_item_id: l.pick_list_item_id, sku: l.sku });
-      remaining -= l.sold_quantity;
+    let pool = orderedCover(state.ordered, sold, sku);
+    const oldest = [...group].sort((a, b) => new Date(a.ordered_at).getTime() - new Date(b.ordered_at).getTime());
+    for (const l of oldest) {
+      let open = l.sold_quantity;
+      const specific = state.saleCovers.get(`${l.pick_list_item_id}|${sku}`) ?? 0;
+      open -= Math.min(open, specific);
+      const fromPool = Math.min(open, pool);
+      open -= fromPool;
+      pool -= fromPool;
+      const presented = presentLine(l, state);
+      for (let i = 0; i < open; i++) {
+        rows.push({
+          ...presented,
+          key: `buy:${l.pick_list_item_id}:${sku}:${i}`,
+          sku: l.sku,
+          order_sku: l.sku,
+          buy_sku: l.sku,
+          quantity: 1,
+          sold_quantity: l.sold_quantity,
+          ordered_quantity: orderedCover(state.ordered, sold, sku),
+          sent_to_chris_at: null,
+          sources: [],
+        });
+      }
     }
-    const sample = newest[0];
-    const presented = presentLine(sample, state);
-    rows.push({
-      ...presented,
-      key: `buy:${sku}`,
-      sku: sample.sku,
-      order_sku: sample.sku,
-      buy_sku: sample.sku,
-      quantity: outstanding,
-      sold_quantity: soldQty,
-      ordered_quantity: ordered,
-      pick_list_item_id: sources[0]?.pick_list_item_id ?? '',
-      pick_list_number: '',
-      ordered_at: '',
-      note: '',
-      sent_to_chris_at: null,
-      sources,
-    });
   }
-  return rows.sort((a, b) => b.quantity - a.quantity || a.sku.localeCompare(b.sku));
+  return rows.sort((a, b) => new Date(a.ordered_at).getTime() - new Date(b.ordered_at).getTime() || a.sku.localeCompare(b.sku));
 }
 
 async function payload() {
@@ -383,6 +385,17 @@ router.get('/', async (_req: AuthRequest, res: Response) => {
   }
 });
 
+function covers(body: any): { pick_list_item_id: string; sku: string; quantity: number }[] {
+  const rows = Array.isArray(body?.covers) ? body.covers : [];
+  return rows
+    .map((c: any) => ({
+      pick_list_item_id: String(c.pick_list_item_id || ''),
+      sku: String(c.sku || '').trim().toLowerCase(),
+      quantity: Number(c.quantity),
+    }))
+    .filter(c => c.pick_list_item_id && c.sku && Number.isInteger(c.quantity) && c.quantity > 0);
+}
+
 function adjustments(body: any): { sku: string; quantity: number }[] {
   const rows = Array.isArray(body?.adjustments) ? body.adjustments : [];
   return rows
@@ -394,7 +407,8 @@ router.post('/sent', async (req: AuthRequest, res: Response) => {
   try {
     const lines = linePairs(req.body);
     const adds = adjustments(req.body);
-    if (!lines.length && !adds.length) return res.status(400).json({ error: 'Choose at least one line' });
+    const chosen = covers(req.body);
+    if (!lines.length && !adds.length && !chosen.length) return res.status(400).json({ error: 'Choose at least one line' });
     for (const l of lines) {
       await query(
         `INSERT INTO reorder_v2_line_marks (pick_list_item_id, sku, sent_to_chris_at, sent_to_chris_by)
@@ -412,7 +426,16 @@ router.post('/sent', async (req: AuthRequest, res: Response) => {
         [a.sku, a.quantity]
       );
     }
-    res.json({ updated: lines.length, ordered: adds.length });
+    for (const c of chosen) {
+      await query(
+        `INSERT INTO reorder_v2_sale_covers (pick_list_item_id, sku, units, updated_at)
+         VALUES ($1::uuid, $2, $3, NOW())
+         ON CONFLICT (pick_list_item_id, sku)
+         DO UPDATE SET units = reorder_v2_sale_covers.units + EXCLUDED.units, updated_at = NOW()`,
+        [c.pick_list_item_id, c.sku, c.quantity]
+      );
+    }
+    res.json({ updated: lines.length, ordered: adds.length, covers: chosen.length });
   } catch (err: any) {
     console.error('[reorders-v2] mark sent failed:', err);
     res.status(500).json({ error: 'Failed to mark lines sent to Chris' });
