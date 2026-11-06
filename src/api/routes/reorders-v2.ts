@@ -4,8 +4,8 @@
  * Rows come from the same paid-order calculation as Supplier Re-orders. A row counts as already sent
  * when the current spreadsheet log has it, or when someone marks it sent to Chris here. Nothing is emailed.
  * Run rates are every SKU on those paid orders, plus any SKU with stock on hand that has never sold.
- * Sold is every paid sale. Sent to Chris is the sold quantity of lines marked sent to Chris.
- * Still to buy is sold minus sent to Chris.
+ * Sold is every paid sale. Ordered is everything bought from Ovara, including opening stock, plus later amounts marked sent.
+ * Still to buy is sold minus that ordered quantity. A five-pack already ordered covers single-tray sales at five each.
  * Do-not-reorder is stored against the buy SKU and hides later sales of that SKU from the buying list.
  * It can only be set when that SKU has stock on hand. Clearing the flag is always allowed.
  *
@@ -19,6 +19,7 @@ import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { buildLines, type ReorderLine } from './supplier-reorders.js';
+import { orderedCover, orderedQuantity } from '../../lib/ovara-orders.js';
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -30,7 +31,7 @@ interface SentRow { pick_list_item_id: string; sku: string; sent_at: Date; sent_
 interface MarkRow { pick_list_item_id: string; sku: string; sent_to_chris_at: Date; sent_to_chris_by: string | null }
 
 async function loadState() {
-  const [lines, sent, marks, reordered, flags, stock, costs, bonded] = await Promise.all([
+  const [lines, sent, marks, reordered, flags, stock, costs, bonded, orderedRows] = await Promise.all([
     buildLines(),
     query(`
       SELECT DISTINCT ON (l.pick_list_item_id, l.sku)
@@ -57,6 +58,7 @@ async function loadState() {
           HAVING SUM(wi.quantity) > 0
         )
     `),
+    query(`SELECT LOWER(sku) AS sku, (quantity + extra)::int AS qty FROM reorder_v2_ordered`),
   ]);
   const sentByKey = new Map<string, SentRow>(sent.rows.map((r: SentRow) => [`${r.pick_list_item_id}|${r.sku}`, r]));
   const markByKey = new Map<string, MarkRow>(marks.rows.map((r: MarkRow) => [`${r.pick_list_item_id}|${r.sku}`, r]));
@@ -65,7 +67,8 @@ async function loadState() {
   const onHand = new Map<string, number>(stock.rows.map((r: { product_sku: string; qty: number }) => [r.product_sku, r.qty]));
   const unitCost = new Map<string, number>(costs.rows.map((r: { variant_sku: string; unit_cost_gbp: number }) => [r.variant_sku, Number(r.unit_cost_gbp)]));
   const bondedSkus = new Set<string>(bonded.rows.map((r: { product_sku: string }) => r.product_sku));
-  return { lines, sentByKey, markByKey, triggers, onHand, unitCost, bondedSkus, reorderedBySku };
+  const ordered = new Map<string, number>(orderedRows.rows.map((r: { sku: string; qty: number }) => [r.sku, Number(r.qty)]));
+  return { lines, sentByKey, markByKey, triggers, onHand, unitCost, bondedSkus, reorderedBySku, ordered };
 }
 
 function buySku(l: ReorderLine): string {
@@ -109,10 +112,21 @@ function presentLine(l: ReorderLine, state: Awaited<ReturnType<typeof loadState>
   };
 }
 
+function soldBySku(lines: ReorderLine[]): Map<string, number> {
+  const sold = new Map<string, number>();
+  for (const l of lines) {
+    const sku = l.sku.toLowerCase();
+    if (sku === 'custom' || sku.includes('sample')) continue;
+    sold.set(sku, (sold.get(sku) ?? 0) + l.sold_quantity);
+  }
+  return sold;
+}
+
 async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof loadState>>) {
   const now = Date.now();
   const recent = now - 30 * DAY_MS;
   const week = now - 7 * DAY_MS;
+  const sold = soldBySku(lines);
   const groups = new Map<string, {
     sku: string; title: string; colour: string; sold_skus: Set<string>
     sold_units: number; buy_units: number; orders: Set<string>
@@ -121,7 +135,6 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
 
   for (const l of lines) {
     const sku = buySku(l);
-    const row = presentLine(l, state);
     const g = groups.get(sku) ?? {
       sku, title: l.title, colour: l.colour, sold_skus: new Set<string>(),
       sold_units: 0, buy_units: 0, orders: new Set<string>(),
@@ -136,17 +149,27 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
     if (at > g.last) g.last = at;
     if (at >= recent) g.sold_30d += l.sold_quantity;
     if (at >= week) g.sold_7d += l.sold_quantity;
-    if (row.sent_to_chris_at) g.marked_units += l.sold_quantity;
-    else g.unsent_buy_units += l.sold_quantity;
     if (l.title) g.title = l.title;
     groups.set(sku, g);
   }
 
-  const sold = [...groups.values()].map(g => {
+  const soldRates = [...groups.values()].map(g => {
     const days = Math.max(1, (now - g.first) / DAY_MS);
     const perWeek = g.sold_units / (days / 7);
     const recentWeekly = g.sold_30d > 0 ? g.sold_30d / (30 / 7) : perWeek;
     const onHand = [...g.sold_skus].reduce((sum, sku) => sum + (state.onHand.get(sku) ?? 0), 0);
+    let orderedUnits = 0;
+    let still = 0;
+    const soldKeys = new Set([...g.sold_skus].map(sku => sku.toLowerCase()));
+    for (const sku of g.sold_skus) {
+      if (sku.toLowerCase() === 'custom' || sku.toLowerCase().includes('sample')) continue;
+      orderedUnits += orderedQuantity(state.ordered, sku);
+      if (/p1-/i.test(sku)) {
+        const pack = sku.replace(/p1-/i, 'p5-').toLowerCase();
+        if (!soldKeys.has(pack)) orderedUnits += orderedQuantity(state.ordered, pack);
+      }
+      still += Math.max(0, (sold.get(sku.toLowerCase()) ?? 0) - orderedCover(state.ordered, sold, sku));
+    }
     return {
       sku: g.sku,
       title: g.title,
@@ -163,9 +186,9 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
       unit_cost_gbp: state.unitCost.get(g.sku) ?? null,
       trigger_quantity: state.triggers.get(g.sku) ?? null,
       needs_reorder: needsReorder(onHand, state.triggers.get(g.sku) ?? null),
-      already_bought: g.marked_units,
+      already_bought: orderedUnits,
       cover_weeks: recentWeekly > 0 ? Math.round((onHand / recentWeekly) * 10) / 10 : null,
-      unsent_buy_units: g.unsent_buy_units,
+      unsent_buy_units: still,
       bonded: state.bondedSkus.has(g.sku) || [...g.sold_skus].some((sku) => state.bondedSkus.has(sku)),
     };
   });
@@ -193,7 +216,7 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
   }
   for (const [sku, onHand] of unsold) {
     const meta = info.get(sku);
-    sold.push({
+    soldRates.push({
       sku,
       title: meta?.title || sku,
       colour: meta?.colour || '',
@@ -209,7 +232,7 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
       unit_cost_gbp: state.unitCost.get(sku) ?? null,
       trigger_quantity: state.triggers.get(sku) ?? null,
       needs_reorder: needsReorder(onHand, state.triggers.get(sku) ?? null),
-      already_bought: 0,
+      already_bought: orderedQuantity(state.ordered, sku),
       cover_weeks: null,
       unsent_buy_units: 0,
       bonded: state.bondedSkus.has(sku),
@@ -227,7 +250,7 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
     const named = new Map(found.rows.map((row: { variant_sku: string; product_title: string; colour_name: string; colour_code: string }) => [row.variant_sku, row]));
     for (const sku of onlyReordered) {
       const meta = named.get(sku);
-      sold.push({
+      soldRates.push({
         sku,
         title: meta?.product_title || sku,
         colour: meta?.colour_name || meta?.colour_code || '',
@@ -243,7 +266,7 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
         unit_cost_gbp: state.unitCost.get(sku) ?? null,
         trigger_quantity: state.triggers.get(sku) ?? null,
         needs_reorder: needsReorder(state.onHand.get(sku) ?? 0, state.triggers.get(sku) ?? null),
-        already_bought: 0,
+        already_bought: orderedQuantity(state.ordered, sku),
         cover_weeks: null,
         unsent_buy_units: 0,
         bonded: state.bondedSkus.has(sku),
@@ -251,13 +274,59 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
     }
   }
 
-  return sold.sort((a, b) => b.per_week - a.per_week || b.sold_units - a.sold_units || a.sku.localeCompare(b.sku));
+  return soldRates.sort((a, b) => b.per_week - a.per_week || b.sold_units - a.sold_units || a.sku.localeCompare(b.sku));
+}
+
+function toBuyRows(lines: ReorderLine[], state: Awaited<ReturnType<typeof loadState>>) {
+  const sold = soldBySku(lines);
+  const bySku = new Map<string, ReorderLine[]>();
+  for (const l of lines) {
+    const sku = l.sku.toLowerCase();
+    if (!sold.has(sku)) continue;
+    const list = bySku.get(sku) ?? [];
+    list.push(l);
+    bySku.set(sku, list);
+  }
+  const rows = [];
+  for (const [sku, group] of bySku) {
+    const soldQty = sold.get(sku) ?? 0;
+    const ordered = orderedCover(state.ordered, sold, sku);
+    const outstanding = soldQty - ordered;
+    if (outstanding <= 0) continue;
+    const newest = [...group].sort((a, b) => new Date(b.ordered_at).getTime() - new Date(a.ordered_at).getTime());
+    const sources: { pick_list_item_id: string; sku: string }[] = [];
+    let remaining = outstanding;
+    for (const l of newest) {
+      if (remaining <= 0) break;
+      sources.push({ pick_list_item_id: l.pick_list_item_id, sku: l.sku });
+      remaining -= l.sold_quantity;
+    }
+    const sample = newest[0];
+    const presented = presentLine(sample, state);
+    rows.push({
+      ...presented,
+      key: `buy:${sku}`,
+      sku: sample.sku,
+      order_sku: sample.sku,
+      buy_sku: sample.sku,
+      quantity: outstanding,
+      sold_quantity: soldQty,
+      ordered_quantity: ordered,
+      pick_list_item_id: sources[0]?.pick_list_item_id ?? '',
+      pick_list_number: '',
+      ordered_at: '',
+      note: '',
+      sent_to_chris_at: null,
+      sources,
+    });
+  }
+  return rows.sort((a, b) => b.quantity - a.quantity || a.sku.localeCompare(b.sku));
 }
 
 async function payload() {
   const state = await loadState();
   const lines = state.lines.map(l => presentLine(l, state));
-  const toBuy = lines.filter(l => !l.sent_to_chris_at);
+  const toBuy = toBuyRows(state.lines, state);
   const runRatesRows = await runRates(state.lines, state);
   return {
     generated_at: new Date().toISOString(),
@@ -314,10 +383,18 @@ router.get('/', async (_req: AuthRequest, res: Response) => {
   }
 });
 
+function adjustments(body: any): { sku: string; quantity: number }[] {
+  const rows = Array.isArray(body?.adjustments) ? body.adjustments : [];
+  return rows
+    .map((a: any) => ({ sku: String(a.sku || '').trim().toLowerCase(), quantity: Number(a.quantity) }))
+    .filter(a => a.sku && Number.isInteger(a.quantity) && a.quantity > 0);
+}
+
 router.post('/sent', async (req: AuthRequest, res: Response) => {
   try {
     const lines = linePairs(req.body);
-    if (!lines.length) return res.status(400).json({ error: 'Choose at least one line' });
+    const adds = adjustments(req.body);
+    if (!lines.length && !adds.length) return res.status(400).json({ error: 'Choose at least one line' });
     for (const l of lines) {
       await query(
         `INSERT INTO reorder_v2_line_marks (pick_list_item_id, sku, sent_to_chris_at, sent_to_chris_by)
@@ -327,7 +404,15 @@ router.post('/sent', async (req: AuthRequest, res: Response) => {
         [l.pick_list_item_id, l.sku, actor(req)]
       );
     }
-    res.json({ updated: lines.length });
+    for (const a of adds) {
+      await query(
+        `INSERT INTO reorder_v2_ordered (sku, quantity, extra, updated_at)
+         VALUES ($1, 0, $2, NOW())
+         ON CONFLICT (sku) DO UPDATE SET extra = reorder_v2_ordered.extra + EXCLUDED.extra, updated_at = NOW()`,
+        [a.sku, a.quantity]
+      );
+    }
+    res.json({ updated: lines.length, ordered: adds.length });
   } catch (err: any) {
     console.error('[reorders-v2] mark sent failed:', err);
     res.status(500).json({ error: 'Failed to mark lines sent to Chris' });
@@ -338,11 +423,20 @@ router.post('/unsent', async (req: AuthRequest, res: Response) => {
   try {
     const lines = linePairs(req.body);
     if (!lines.length) return res.status(400).json({ error: 'Choose at least one line' });
+    const built = await buildLines();
     for (const l of lines) {
       await query(
         `DELETE FROM reorder_v2_line_marks WHERE pick_list_item_id = $1::uuid AND sku = $2`,
         [l.pick_list_item_id, l.sku]
       );
+      const match = built.find(b => b.pick_list_item_id === l.pick_list_item_id && b.sku === l.sku);
+      const qty = match?.sold_quantity ?? 0;
+      if (qty > 0) {
+        await query(
+          `UPDATE reorder_v2_ordered SET extra = GREATEST(0, extra - $2), updated_at = NOW() WHERE LOWER(sku) = LOWER($1)`,
+          [l.sku, qty]
+        );
+      }
     }
     res.json({ updated: lines.length });
   } catch (err: any) {

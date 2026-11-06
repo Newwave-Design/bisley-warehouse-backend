@@ -1670,4 +1670,13 @@ CREATE TABLE IF NOT EXISTS reorder_v2_sku_flags (
 );
 ALTER TABLE reorder_v2_sku_flags ADD COLUMN IF NOT EXISTS trigger_quantity INTEGER;
 
+-- Everything ordered from Ovara, including opening stock that was checked in.
+-- quantity is that baseline. extra is added when a later shortfall is marked sent to Chris.
+CREATE TABLE IF NOT EXISTS reorder_v2_ordered (
+  sku VARCHAR(100) PRIMARY KEY,
+  quantity INTEGER NOT NULL DEFAULT 0,
+  extra INTEGER NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 `;
