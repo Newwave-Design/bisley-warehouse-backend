@@ -8,7 +8,7 @@ import { query } from '../../db/index.js';
 import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { toUuidOrNull } from './mobile.js';
 import { importPackagingSnapshot } from '../../lib/packaging-import.js';
-import { seedDpdRateCards } from '../../lib/shipping-rate-seed.js';
+import { getDeliveryDues } from '../../lib/delivery-due.js';
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -564,8 +564,8 @@ router.get('/unboxed', async (req: Request, res: Response) => {
     const [lines, products, specs, boxes] = await Promise.all([
       query(
         `SELECT upper(pli.product_sku) AS sku,
+                pl.id AS pick_list_id,
                 SUM(pli.quantity_required)::int AS qty,
-                COUNT(DISTINCT pl.id)::int AS orders,
                 MAX(NULLIF(pli.item_title, '')) AS item_title
            FROM pick_list_items pli
            JOIN pick_lists pl ON pl.id = pli.pick_list_id
@@ -575,7 +575,7 @@ router.get('/unboxed', async (req: Request, res: Response) => {
             AND COALESCE(pli.is_archived, false) = false
             AND COALESCE(pli.product_sku, '') <> ''
             AND upper(pli.product_sku) NOT LIKE '%SAMPLE%'
-          GROUP BY upper(pli.product_sku)`
+          GROUP BY upper(pli.product_sku), pl.id`
       ),
       query(
         `SELECT DISTINCT ON (upper(variant_sku))
@@ -650,22 +650,22 @@ router.get('/unboxed', async (req: Request, res: Response) => {
       return method === 'own_box';
     };
 
-    const demand = new Map<string, { qty: number; orders: number; title: string | null; price: number | null }>();
-    const addDemand = (sku: string, qty: number, orders: number, title: string | null, price: number | null) => {
+    const demand = new Map<string, { qty: number; lists: Set<string>; title: string | null; price: number | null }>();
+    const addDemand = (sku: string, qty: number, listId: string, title: string | null, price: number | null) => {
       const key = sku.toUpperCase();
       if (!key || key.includes('SAMPLE') || hasBox(key)) return;
       const current = demand.get(key);
-      if (!current) demand.set(key, { qty, orders, title, price });
+      if (!current) demand.set(key, { qty, lists: new Set([listId]), title, price });
       else {
         current.qty += qty;
-        current.orders += orders;
+        current.lists.add(listId);
         const prices = [current.price, price].filter((value): value is number => value != null && value > 0);
         current.price = prices.length ? Math.max(...prices) : null;
         if (!current.title && title) current.title = title;
       }
     };
 
-    for (const line of lines.rows as { sku: string; qty: number; orders: number; item_title: string | null }[]) {
+    for (const line of lines.rows as { sku: string; pick_list_id: string; qty: number; item_title: string | null }[]) {
       const product = catalogue.get(line.sku);
       const parts = (product?.kit ? product.parts : []).filter((part) => part?.sku && part.sku.toUpperCase() !== line.sku);
       if (parts.length) {
@@ -675,14 +675,14 @@ router.get('/unboxed', async (req: Request, res: Response) => {
           addDemand(
             String(part.sku),
             Number(line.qty) * per,
-            Number(line.orders),
+            line.pick_list_id,
             part.product_title || child?.title || null,
             child?.price ?? product?.price ?? null,
           );
         }
         continue;
       }
-      addDemand(line.sku, Number(line.qty) || 0, Number(line.orders) || 0, line.item_title || product?.title || null, product?.price ?? null);
+      addDemand(line.sku, Number(line.qty) || 0, line.pick_list_id, line.item_title || product?.title || null, product?.price ?? null);
     }
 
     const rows = [...demand.entries()].map(([sku, row]) => {
@@ -700,7 +700,8 @@ router.get('/unboxed', async (req: Request, res: Response) => {
         title: spec?.product_title || row.title || product?.title || sku,
         thumbnail: product?.thumbnail || null,
         qty: row.qty,
-        orders: row.orders,
+        orders: row.lists.size,
+        lists: row.lists,
         price_gbp: row.price,
         length_mm: size[0] || null,
         width_mm: size[1] || null,
@@ -717,7 +718,8 @@ router.get('/unboxed', async (req: Request, res: Response) => {
         continue;
       }
       existing.qty += row.qty;
-      existing.orders += row.orders;
+      for (const id of row.lists) existing.lists.add(id);
+      existing.orders = existing.lists.size;
       const prices = [existing.price_gbp, row.price_gbp].filter((value): value is number => value != null && value > 0);
       existing.price_gbp = prices.length ? Math.max(...prices) : null;
       if (!existing.length_mm && row.length_mm) {
@@ -732,8 +734,16 @@ router.get('/unboxed', async (req: Request, res: Response) => {
       if (!q) return true;
       return `${row.product_code} ${row.sku} ${row.title}`.toLowerCase().includes(q);
     }).sort((a, b) => (b.price_gbp ?? -1) - (a.price_gbp ?? -1) || a.product_code.localeCompare(b.product_code));
+    const due = await getDeliveryDues([...new Set(productsOut.flatMap((row) => [...row.lists]))]);
+    const listed = productsOut.map((row) => {
+      const windows = [...row.lists].map((id) => due[id]).filter(Boolean);
+      const earliest = windows.reduce((min, window) => (!min || window.earliest < min ? window.earliest : min), '');
+      const latest = windows.reduce((max, window) => (window.latest > max ? window.latest : max), '');
+      const { lists: _lists, ...rest } = row;
+      return { ...rest, due_earliest: earliest || null, due_latest: latest || null };
+    });
 
-    res.json({ products: productsOut });
+    res.json({ products: listed });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to list products without a box', details: err.message });
   }
