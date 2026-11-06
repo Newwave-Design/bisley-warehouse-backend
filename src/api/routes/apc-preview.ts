@@ -9,6 +9,7 @@ import { getPool, query } from '../../db/index.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { rememberShipmentTracking } from '../../lib/shipment-tracking.js';
 import { returnStockForCancelledCollection, takeStockForBookedCollection } from '../../lib/collection-stock.js';
+import { fitZpl } from '../../lib/zpl-fit.js';
 import { addDxConsignment, deleteDxConsignment, dxConfigured, DxError, fetchDxLabels, quoteDxCollection } from '../../lib/dx-freight.js';
 
 const router = express.Router();
@@ -605,6 +606,13 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   }
 });
 
+function containLabels(labels: { content: string }[]) {
+  for (const label of labels) {
+    const zpl = Buffer.from(label.content, 'base64').toString('latin1');
+    if (zpl.includes('^XA')) label.content = Buffer.from(fitZpl(zpl), 'latin1').toString('base64');
+  }
+}
+
 function collectLabels(payload: any): { trackingNumber: string; format: string; content: string }[] {
   const orders = asList<any>(payload?.Orders?.Order || payload?.Order);
   const labels: { trackingNumber: string; format: string; content: string }[] = [];
@@ -664,6 +672,7 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
       if (!dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
       const tracking = (Array.isArray(booking.pieces) ? booking.pieces : []).map((piece) => text(piece?.trackingNumber)).filter(Boolean);
       const labels = await fetchDxLabels(waybill, text(booking.apc_order_number) || 'F', format, tracking);
+      if (format === 'ZPL') containLabels(labels);
       return res.json({ labels });
     }
     if (booking.courier !== 'APC') {
@@ -687,6 +696,7 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
     if (!response.ok || !labels.length) {
       return res.status(502).json({ error: 'APC did not return the label. Print it again in a few seconds.' });
     }
+    if (format === 'ZPL') containLabels(labels);
     return res.json({ labels });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Could not reach the courier';
