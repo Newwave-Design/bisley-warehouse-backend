@@ -23,8 +23,8 @@ import { catalogueRevisedAt } from './mobile-sync.js';
 
 const router = express.Router();
 
-function latestTime(a: unknown, b: unknown): string {
-  const times = [a, b].map((value) => {
+function latestTime(...values: unknown[]): string {
+  const times = values.map((value) => {
     if (!value) return 0;
     const date = value instanceof Date ? value : new Date(String(value));
     return date.getTime();
@@ -329,7 +329,7 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
       ORDER BY order_date ${orderDir}
     `, [statuses]);
     const ids = result.rows.map((r: any) => r.id);
-    const [dues, revisedAt, kits] = await Promise.all([
+    const [dues, revisedAt, kits, stockTimes] = await Promise.all([
       getDeliveryDues(ids),
       catalogueRevisedAt(),
       query(
@@ -346,8 +346,20 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
           GROUP BY pli.pick_list_id`,
         [ids]
       ),
+      // The handheld only re-downloads an order when this time changes. Bay stock is not on the
+      // order, so a unit booked into a bay has to move the time or the phone keeps "no bay".
+      query(
+        `SELECT pli.pick_list_id, MAX(wi.updated_at) AS stock_at
+           FROM pick_list_items pli
+           JOIN warehouse_inventory wi ON wi.product_sku = pli.product_sku AND wi.quantity > 0
+          WHERE pli.pick_list_id = ANY($1::uuid[])
+            AND COALESCE(pli.is_archived, false) = false
+          GROUP BY pli.pick_list_id`,
+        [ids]
+      ),
     ]);
     const kitAt = new Map(kits.rows.map((row: any) => [row.pick_list_id, row.kit_at]));
+    const stockAt = new Map(stockTimes.rows.map((row: any) => [row.pick_list_id, row.stock_at]));
     res.json({
       catalogue_revised_at: revisedAt || '',
       pick_lists: result.rows.map((r: any) => {
@@ -360,7 +372,7 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
           sample_lines: undefined,
           sku_lines: undefined,
           shipping_type: shippingTypeForLines(lines) || null,
-          updated_at: latestTime(r.updated_at, kitAt.get(r.id)),
+          updated_at: latestTime(r.updated_at, kitAt.get(r.id), stockAt.get(r.id)),
         };
       }),
     });
