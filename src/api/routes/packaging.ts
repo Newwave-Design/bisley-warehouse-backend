@@ -580,12 +580,15 @@ router.get('/unboxed', async (req: Request, res: Response) => {
       query(
         `SELECT DISTINCT ON (upper(variant_sku))
                 upper(variant_sku) AS sku, product_title, is_kit, kit_components, price_gbp,
+                COALESCE(NULLIF(variant_thumbnail, ''), NULLIF(product_thumbnail, '')) AS thumbnail,
                 COALESCE(variant_weight_grams, weight_grams) AS weight_grams,
                 COALESCE(variant_depth_mm, depth_mm) AS depth_mm,
                 COALESCE(variant_width_mm, width_mm) AS width_mm,
                 COALESCE(variant_height_mm, height_mm) AS height_mm
            FROM wms_products
-          ORDER BY upper(variant_sku), is_archived`
+          ORDER BY upper(variant_sku),
+                   (COALESCE(NULLIF(variant_thumbnail, ''), NULLIF(product_thumbnail, '')) IS NULL),
+                   is_archived`
       ),
       query(
         `SELECT upper(product_code) AS product_code, product_title, method,
@@ -605,6 +608,7 @@ router.get('/unboxed', async (req: Request, res: Response) => {
 
     type Catalogue = {
       title: string | null
+      thumbnail: string | null
       price: number | null
       weight: number | null
       depth: number | null
@@ -617,6 +621,7 @@ router.get('/unboxed', async (req: Request, res: Response) => {
     for (const row of products.rows as any[]) {
       catalogue.set(row.sku, {
         title: row.product_title || null,
+        thumbnail: row.thumbnail || null,
         price: row.price_gbp == null ? null : Number(row.price_gbp),
         weight: row.weight_grams == null ? null : Number(row.weight_grams),
         depth: row.depth_mm == null ? null : Number(row.depth_mm),
@@ -693,6 +698,7 @@ router.get('/unboxed', async (req: Request, res: Response) => {
         sku,
         product_code: code || sku,
         title: spec?.product_title || row.title || product?.title || sku,
+        thumbnail: product?.thumbnail || null,
         qty: row.qty,
         orders: row.orders,
         price_gbp: row.price,
@@ -720,6 +726,7 @@ router.get('/unboxed', async (req: Request, res: Response) => {
         existing.height_mm = row.height_mm;
       }
       if (existing.weight_grams == null) existing.weight_grams = row.weight_grams;
+      if (!existing.thumbnail && row.thumbnail) existing.thumbnail = row.thumbnail;
     }
     const productsOut = [...grouped.values()].filter((row) => {
       if (!q) return true;
