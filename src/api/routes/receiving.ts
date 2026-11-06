@@ -32,6 +32,7 @@ import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { getLogger } from '../../lib/logger.js';
 import { getProductDetails } from '../../lib/inventory-sync-service.js';
+import { scheduleStockHolds } from '../../lib/stock-holds.js';
 
 const router = express.Router();
 const logger = getLogger('receiving');
@@ -356,6 +357,7 @@ router.post('/pallets/:id/stock', authMiddleware, async (req: AuthRequest, res: 
       [req.params.id]
     );
 
+    scheduleStockHolds();
     res.json({
       success: true,
       pallet_code: pallet.rows[0].pallet_code,
@@ -561,6 +563,7 @@ router.post('/queue/:id/stock', authMiddleware, async (req: AuthRequest, res: Re
       logger.info(`Unblocked ${unblocked.length} pick lists for ${sku}`);
     }
 
+    scheduleStockHolds();
     res.json({ 
       success: true, 
       stocked: quantity, 
@@ -629,6 +632,7 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
       logger.info(`Unblocked ${unblocked.length} pick lists`);
     }
 
+    scheduleStockHolds();
     res.json({ success: true, stocked, medusa_synced: syncedSkus.size - syncErrors.length, sync_errors: syncErrors.length, unblocked_pick_lists: unblocked });
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : JSON.stringify(err);

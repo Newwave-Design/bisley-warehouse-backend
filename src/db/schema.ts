@@ -1539,6 +1539,16 @@ CREATE INDEX IF NOT EXISTS idx_sale_alloc_week ON sale_allocations (week_start, 
 CREATE INDEX IF NOT EXISTS idx_sale_alloc_line ON sale_allocations (pick_list_item_id, sku, status);
 CREATE INDEX IF NOT EXISTS idx_sale_alloc_sku ON sale_allocations (sku, status);
 
+-- How many units of a SKU an open order may pick. Rebuilt from stock on hand, oldest paid order first.
+-- Samples are not held. A kit is held as its parts, and only as complete kits.
+CREATE TABLE IF NOT EXISTS order_stock_holds (
+  pick_list_item_id UUID NOT NULL REFERENCES pick_list_items(id) ON DELETE CASCADE,
+  sku VARCHAR(100) NOT NULL,
+  qty INT NOT NULL CHECK (qty > 0),
+  PRIMARY KEY (pick_list_item_id, sku)
+);
+CREATE INDEX IF NOT EXISTS idx_order_stock_holds_sku ON order_stock_holds (sku);
+
 -- A week (Friday to Thursday) becomes fixed once locked: its statement lines are copied here and never change
 CREATE TABLE IF NOT EXISTS settlement_weeks (
   week_start DATE PRIMARY KEY,

@@ -9,6 +9,7 @@ import { authMiddleware, requirePermission, AuthRequest } from '../../middleware
 import { applyDispatchStock } from '../../lib/dispatch-stock.js';
 import { paidSql, isPaid } from '../../lib/payment-status.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
+import { kitParts, refuseUnassignedPick } from '../../lib/stock-holds.js';
 import { toUuidOrNull } from './mobile.js';
 import { v4 as uuidv4 } from 'uuid';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
@@ -1388,6 +1389,29 @@ router.patch('/:pickListId/items/:itemId/pick', authMiddleware, async (req: Requ
     // Check if this is a sandbox pick list — skip real inventory updates if so
     const plCheck = await query(`SELECT is_sandbox FROM pick_lists WHERE id = $1`, [pickListId]);
     const isSandbox = plCheck.rows[0]?.is_sandbox ?? false;
+
+    if (!isSandbox && quantityPicked > 0) {
+      const line = await query(
+        `SELECT pli.product_sku, pli.is_custom, wp.kit_components
+           FROM pick_list_items pli
+           LEFT JOIN LATERAL (
+             SELECT kit_components FROM wms_products WHERE variant_sku = pli.product_sku ORDER BY is_archived LIMIT 1
+           ) wp ON true
+          WHERE pli.id = $1 AND pli.pick_list_id = $2`,
+        [itemId, pickListId]
+      );
+      const row = line.rows[0];
+      if (row && !row.is_custom && !/SAMPLE/i.test(row.product_sku || '')) {
+        const parts = kitParts(row.product_sku, row.kit_components);
+        const checks = parts.length
+          ? parts.map((part) => ({ sku: part.sku, take: quantityPicked * part.per }))
+          : [{ sku: row.product_sku, take: quantityPicked }];
+        for (const check of checks) {
+          const held = await refuseUnassignedPick({ pickListId, itemId, sku: check.sku, already: 0, take: check.take });
+          if (held) return res.status(409).json({ error: held });
+        }
+      }
+    }
 
     // Get location ID
     let locationId = null;

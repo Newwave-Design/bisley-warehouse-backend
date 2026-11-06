@@ -13,6 +13,7 @@
 import { getPool, query } from '../db/index.js';
 import { currentWeekStart } from './weeks.js';
 import { setAuditContext } from './audit.js';
+import { scheduleStockHolds } from './stock-holds.js';
 
 interface DemandRow {
   key: string;
@@ -257,6 +258,7 @@ const pendingReasons = new Set<string>();
 
 /** Debounced, serialised, never throws: safe to call after any change that could affect demand or stock. The reasons are written to the audit trail. */
 export function scheduleAllocationRun(reason = 'scheduled check', delayMs = 3000): void {
+  scheduleStockHolds();
   if (pendingReasons.size < 25) pendingReasons.add(reason);
   if (timer) return;
   timer = setTimeout(async () => {

@@ -1,30 +1,31 @@
 /**
  * Delivery due window per pick list, counted from the order date.
- *   In stock      2-4 weeks from 9 Oct 2026, matching the shop. Orders before that day were promised 4-6 weeks.
- *   Non-standard  4-8 weeks: any line in a non-approved colour, or short of stock.
+ *   Stock assigned  2-4 weeks from 9 Oct 2026, matching the shop. Orders before that day were promised 4-6 weeks.
+ *   Nothing assigned  the shop's out-of-stock promise: palette 1 colours 4-6 weeks, every other colour 6-8 weeks.
+ * A list with several short lines uses the longest of those windows.
  * Traffic light: green = more than 3 days before the last date, amber = within 3 days of it, red = after it (late).
  * Finished lists get no light.
- * Stock is read live from warehouse_inventory, so a list moves bracket as stock arrives or runs out.
  */
 import { query } from '../db/index.js';
-import { COLOUR_NAMES, extractColourCode } from './colour-names.js';
+import { extractColourCode } from './colour-names.js';
+import { ensureStockHolds, kitParts } from './stock-holds.js';
 
 export const STANDARD_WEEKS = { min: 2, max: 4 };
 /** In-stock promise on orders placed before 9 Oct 2026. */
 export const STANDARD_WEEKS_BEFORE = { min: 4, max: 6 };
 const STOCKED_PROMISE_CHANGE = Date.UTC(2026, 9, 9);
-export const NON_STANDARD_WEEKS = { min: 4, max: 8 };
+/** Shop backorder copy. Palette 1 is the shorter batch; anything else uses palette 2. */
+export const PALETTE_1_WEEKS = { min: 4, max: 6 };
+export const PALETTE_2_WEEKS = { min: 6, max: 8 };
+const PALETTE_1 = new Set([
+  'ba5', 'ab9', 'av6', 'cj6', 'av5', 'ag8', 'bx6', 'ay7',
+  'an7', 'bc6', 'av7', 'av4', 'arn', 'an9', 'aa3', 'av1', 'ay8',
+]);
 
 /** In-stock window for an order placed on this UTC day. */
 export function stockedWeeks(orderDay: number): { min: number; max: number } {
   return orderDay < STOCKED_PROMISE_CHANGE ? STANDARD_WEEKS_BEFORE : STANDARD_WEEKS;
 }
-
-/** Approved colours (storefront list) plus the desktop finishes; Emerald (da8) is special-order only. */
-const APPROVED_COLOUR_CODES = new Set([
-  'bx6', 'ag8', 'av1', 'cj6', 'bc6', 'ba5', 'ab9', 'bn6', 'cb2', 'aa3', 'cd1', 'bz2', 'av4',
-  '001', '018', '562', '998',
-]);
 
 const FINISHED_STATUSES = new Set(['DISPATCHED', 'CANCELLED']);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -38,16 +39,21 @@ export interface DeliveryDue {
   latest: string;
   light: 'green' | 'amber' | 'red' | null;
   reasons: string[];
-  /** Every remaining line can be picked from what is on the shelf. Samples are ignored. */
+  /** Every remaining line has stock assigned to this order. Samples are ignored. */
   in_stock: boolean;
 }
 
-/** Null when the SKU carries no colour (nothing to approve). */
-function colourOf(sku: string): string | null {
+type Weeks = { min: number; max: number };
+
+/** Out-of-stock window the shop shows for this SKU's colour. */
+export function backorderWeeks(sku: string): Weeks {
   const code = extractColourCode(sku);
-  if (code) return code;
-  const finish = /-(\d{3})$/.exec(sku)?.[1];
-  return finish && APPROVED_COLOUR_CODES.has(finish) ? finish : null;
+  return code && PALETTE_1.has(code) ? PALETTE_1_WEEKS : PALETTE_2_WEEKS;
+}
+
+function longer(a: Weeks, b: Weeks): Weeks {
+  if (a.max !== b.max) return a.max > b.max ? a : b;
+  return a.min >= b.min ? a : b;
 }
 
 const utcDay = (d: Date) => Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
@@ -78,27 +84,27 @@ export async function getDeliveryDues(pickListIds: string[]): Promise<Record<str
       WHERE pl.id = ANY($1::uuid[])`,
     [pickListIds]
   );
+  await ensureStockHolds();
   const items = await query(
-    `SELECT pli.pick_list_id, pli.product_sku, pli.quantity_required - COALESCE(pli.quantity_picked, 0) AS remaining,
-            wp.kit_components,
-            COALESCE((SELECT SUM(quantity) FROM warehouse_inventory WHERE product_sku = pli.product_sku), 0)::int AS stock
+    `SELECT pli.id, pli.pick_list_id, pli.product_sku, pli.quantity_required,
+            pli.quantity_required - COALESCE(pli.quantity_picked, 0) AS remaining,
+            wp.kit_components
        FROM pick_list_items pli
        LEFT JOIN LATERAL (SELECT kit_components FROM wms_products WHERE variant_sku = pli.product_sku LIMIT 1) wp ON true
       WHERE pli.pick_list_id = ANY($1::uuid[]) AND pli.is_archived = false`,
     [pickListIds]
   );
-
-  const componentSkus = new Set<string>();
-  for (const it of items.rows) {
-    for (const c of kitParts(it)) componentSkus.add(c.sku);
-  }
-  const componentStock = new Map<string, number>();
-  if (componentSkus.size > 0) {
-    const r = await query(
-      `SELECT product_sku, COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE product_sku = ANY($1::text[]) GROUP BY product_sku`,
-      [[...componentSkus]]
+  const holds = new Map<string, Map<string, number>>();
+  const itemIds = items.rows.map((row: any) => row.id);
+  if (itemIds.length) {
+    const held = await query(
+      `SELECT pick_list_item_id, sku, qty FROM order_stock_holds WHERE pick_list_item_id = ANY($1::uuid[])`,
+      [itemIds]
     );
-    for (const row of r.rows) componentStock.set(row.product_sku, row.qty);
+    for (const row of held.rows) {
+      if (!holds.has(row.pick_list_item_id)) holds.set(row.pick_list_item_id, new Map());
+      holds.get(row.pick_list_item_id)!.set(row.sku, Number(row.qty) || 0);
+    }
   }
 
   const itemsByList = new Map<string, any[]>();
@@ -111,33 +117,34 @@ export async function getDeliveryDues(pickListIds: string[]): Promise<Record<str
   for (const pl of lists.rows) {
     const reasons: string[] = [];
     let inStock = true;
+    let shortWindow: Weeks | null = null;
     const note = (msg: string) => { if (!reasons.includes(msg)) reasons.push(msg); };
 
     for (const it of itemsByList.get(pl.id) ?? []) {
-      if (/SAMPLE/i.test(it.product_sku)) continue; // colour samples don't hold up delivery
-      const parts = kitParts(it);
-      const skus = parts.length > 0 ? [it.product_sku, ...parts.map(p => p.sku)] : [it.product_sku];
-
-      for (const sku of skus) {
-        const code = colourOf(sku);
-        if (code && !APPROVED_COLOUR_CODES.has(code)) note(`Non-approved colour: ${COLOUR_NAMES[code] ?? code} (${sku})`);
-      }
-
-      const remaining = Number(it.remaining);
-      if (remaining > 0) {
-        const short = parts.length > 0
-          ? parts.some(p => (componentStock.get(p.sku) ?? 0) < p.required_quantity * remaining)
-          : it.stock < remaining;
-        if (short) {
-          inStock = false;
-          note(`Not fully in stock: ${it.product_sku}`);
-        }
-      }
+      if (/SAMPLE/i.test(it.product_sku)) continue;
+      if (Number(it.remaining) <= 0) continue;
+      const parts = kitParts(it.product_sku, it.kit_components);
+      const assigned = holds.get(it.id) ?? new Map<string, number>();
+      const required = Number(it.quantity_required) || 0;
+      const shortSkus = parts.length
+        ? parts.filter((part) => (assigned.get(part.sku) ?? 0) < part.per * required).map((part) => part.sku)
+        : ((assigned.get(it.product_sku) ?? 0) < required ? [it.product_sku] : []);
+      if (!shortSkus.length) continue;
+      inStock = false;
+      let lineWindow = backorderWeeks(shortSkus[0]);
+      for (const sku of shortSkus) lineWindow = longer(lineWindow, backorderWeeks(sku));
+      shortWindow = shortWindow ? longer(shortWindow, lineWindow) : lineWindow;
+      const got = parts.length
+        ? Math.min(...parts.map((part) => Math.floor((assigned.get(part.sku) ?? 0) / part.per)))
+        : (assigned.get(it.product_sku) ?? 0);
+      note(got > 0
+        ? `Only ${got} of ${required} assigned: ${it.product_sku} (${lineWindow.min}-${lineWindow.max} weeks)`
+        : `No stock assigned: ${it.product_sku} (${lineWindow.min}-${lineWindow.max} weeks)`);
     }
 
-    const standard = reasons.length === 0;
+    const standard = shortWindow === null;
     const orderDay = utcDay(new Date(pl.order_date));
-    const weeks = standard ? stockedWeeks(londonDay(new Date(pl.order_date))) : NON_STANDARD_WEEKS;
+    const weeks = shortWindow ?? stockedWeeks(londonDay(new Date(pl.order_date)));
     const start = orderDay + weeks.min * 7 * DAY_MS;
     const end = orderDay + weeks.max * 7 * DAY_MS;
     const light = FINISHED_STATUSES.has(pl.status) ? null : dueLight(today, end);
@@ -154,11 +161,4 @@ export async function getDeliveryDues(pickListIds: string[]): Promise<Record<str
     };
   }
   return out;
-}
-
-/** Kit parts only when there is more than the item itself. */
-function kitParts(item: any): { sku: string; required_quantity: number }[] {
-  const parts = Array.isArray(item.kit_components) ? item.kit_components : [];
-  if (parts.length === 0 || (parts.length === 1 && parts[0].sku === item.product_sku)) return [];
-  return parts.map((p: any) => ({ sku: String(p.sku), required_quantity: Number(p.required_quantity) || 1 }));
 }

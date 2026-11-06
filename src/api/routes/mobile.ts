@@ -17,6 +17,7 @@ import { paidSql } from '../../lib/payment-status.js';
 import { COLOUR_NAMES, componentDisplaySku, enrichSampleItems, extractColourCode, sampleColourList } from '../../lib/colour-names.js';
 import { formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
+import { refuseUnassignedPick, scheduleStockHolds } from '../../lib/stock-holds.js';
 import { attachPackaging, shippingTypeForLines } from '../../lib/pick-list-packaging.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { catalogueRevisedAt } from './mobile-sync.js';
@@ -158,6 +159,7 @@ router.post('/receive', authMiddleware, async (req: AuthRequest, res: Response) 
       RETURNING id
     `, [locationId, sku, colour_code ?? null, quantity, notes ?? null, (req as any).user?.id ?? '1']);
 
+    scheduleStockHolds();
     res.json({
       success: true,
       movement_id: mvt.rows[0].id,
@@ -268,6 +270,7 @@ router.post('/undo', authMiddleware, async (req: AuthRequest, res: Response) => 
       VALUES ('ADJUST',$1,$2,$3,$4,$5,$6)
     `, [m.location_id, m.product_sku, m.colour_code, -m.quantity, `Undo of movement ${movement_id}`, (req as any).user?.id ?? '1']);
 
+    scheduleStockHolds();
     res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message ?? 'Undo failed' });
@@ -714,6 +717,8 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
       if (qty > left) {
         return res.status(400).json({ error: `Only ${left} remaining — reduce the quantity` });
       }
+      const held = await refuseUnassignedPick({ pickListId, itemId: item.id, sku: scannedSku, already: got, take: qty });
+      if (held) return res.status(409).json({ error: held });
 
       let locationId: string | null = null;
       if (location_code) {
@@ -786,6 +791,10 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
       if (qty > remainingQty) {
         return res.status(400).json({ error: `Only ${remainingQty} remaining — reduce the quantity` });
       }
+      const held = await refuseUnassignedPick({
+        pickListId, itemId: item.id, sku: scannedSku, already: Number(item.quantity_picked) || 0, take: qty,
+      });
+      if (held) return res.status(409).json({ error: held });
 
       let locationId: string | null = null;
       if (location_code) {
@@ -832,6 +841,10 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
     if (qty > remainingQty) {
       return res.status(400).json({ error: `Only ${remainingQty} remaining — reduce the quantity` });
     }
+    const held = await refuseUnassignedPick({
+      pickListId, itemId, sku: item.rows[0].product_sku, already: Number(item.rows[0].quantity_picked) || 0, take: qty,
+    });
+    if (held) return res.status(409).json({ error: held });
 
     // Colour samples are ticked by hand, not scanned.
     if (/SAMPLE/i.test(item.rows[0].product_sku || '') && scanned_barcode) {
@@ -907,7 +920,7 @@ router.patch('/pick-lists/:id/scans/:scanId', authMiddleware, async (req: AuthRe
     );
     if (!scan.rows[0]) return res.status(404).json({ error: 'Scan not found' });
 
-    const item = await query(`SELECT quantity_required FROM pick_list_items WHERE id = $1`, [scan.rows[0].pick_list_item_id]);
+    const item = await query(`SELECT quantity_required, product_sku FROM pick_list_items WHERE id = $1`, [scan.rows[0].pick_list_item_id]);
     const otherScans = await query(
       `SELECT COALESCE(SUM(quantity),0)::int AS qty FROM pick_scans WHERE pick_list_item_id = $1 AND id != $2`,
       [scan.rows[0].pick_list_item_id, req.params.scanId]
@@ -916,6 +929,16 @@ router.patch('/pick-lists/:id/scans/:scanId', authMiddleware, async (req: AuthRe
     if (quantity > maxAllowed) {
       return res.status(400).json({ error: `Quantity would exceed the ${item.rows[0].quantity_required} required — max ${maxAllowed}` });
     }
+    const sku = scan.rows[0].component_sku || item.rows[0].product_sku;
+    const sameSku = await query(
+      `SELECT COALESCE(SUM(quantity),0)::int AS qty FROM pick_scans
+        WHERE pick_list_item_id = $1 AND id <> $2 AND COALESCE(component_sku, $4) = $3`,
+      [scan.rows[0].pick_list_item_id, req.params.scanId, sku, item.rows[0].product_sku]
+    );
+    const held = await refuseUnassignedPick({
+      pickListId: req.params.id, itemId: scan.rows[0].pick_list_item_id, sku, already: sameSku.rows[0].qty, take: quantity,
+    });
+    if (held) return res.status(409).json({ error: held });
 
     await query(`UPDATE pick_scans SET quantity = $1, updated_at = NOW() WHERE id = $2`, [quantity, req.params.scanId]);
     const { item: updatedItem, allPicked } = await recomputePickItem(req.params.id, scan.rows[0].pick_list_item_id);
@@ -935,6 +958,7 @@ router.delete('/pick-lists/:id/scans/:scanId', authMiddleware, async (req: AuthR
     if (!scan.rows[0]) return res.status(404).json({ error: 'Scan not found' });
 
     await query(`DELETE FROM pick_scans WHERE id = $1`, [req.params.scanId]);
+    scheduleStockHolds();
     const { item: updatedItem, allPicked } = await recomputePickItem(req.params.id, scan.rows[0].pick_list_item_id);
     res.json({ success: true, item: updatedItem, all_picked: allPicked });
   } catch (err: any) {
@@ -954,6 +978,7 @@ router.post('/pick-lists/:id/reset', authMiddleware, async (req: AuthRequest, re
       [req.params.id]
     );
     await query(`UPDATE pick_lists SET status = 'PENDING', updated_at = NOW() WHERE id = $1`, [req.params.id]);
+    scheduleStockHolds();
 
     res.json({ success: true });
   } catch (err: any) {

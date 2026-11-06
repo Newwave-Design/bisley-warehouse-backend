@@ -18,6 +18,7 @@ import { stockInUnits, getHoldingLocation, resolveColourCode } from './stock-in.
 import { query, getPool } from '../../db/index.js';
 import { toUuidOrNull } from './mobile.js';
 import { failedScansFor } from '../../lib/failed-scans.js';
+import { scheduleStockHolds } from '../../lib/stock-holds.js';
 import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
@@ -438,6 +439,7 @@ router.post('/sessions/:id/complete', authMiddleware, async (req: AuthRequest, r
     }
 
     if (syncedSkus.size) await unblockBackorderedPickLists([...syncedSkus]);
+    scheduleStockHolds();
 
     const summary = await query(
       `SELECT COUNT(*) as items, SUM(quantity_scanned) as units FROM checkin_items WHERE session_id = $1 AND removed_at IS NULL`,
