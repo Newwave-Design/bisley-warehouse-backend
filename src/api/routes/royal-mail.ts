@@ -50,7 +50,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   try {
     const found = await query(
       `SELECT pl.id, pl.pick_list_number, pl.customer_name, pl.shipping_address, pl.is_sandbox, pl.status,
-              (SELECT COUNT(*)::int FROM pick_list_items pli
+              (SELECT COALESCE(SUM(GREATEST(COALESCE(pli.quantity_required, 1), 1)), 0)::int FROM pick_list_items pli
                 WHERE pli.pick_list_id = pl.id AND NOT pli.is_archived AND pli.product_sku ILIKE '%SAMPLE%') AS sample_count,
               (SELECT COUNT(*)::int FROM pick_list_items pli
                 WHERE pli.pick_list_id = pl.id AND NOT pli.is_archived AND pli.product_sku ILIKE '%SAMPLE%' AND pli.status <> 'PICKED') AS samples_open,
