@@ -152,6 +152,7 @@ export async function rememberShipmentTracking(pickListId?: string): Promise<{ f
      JOIN collection_bookings b ON b.pick_list_id = pl.id AND b.status <> 'cancelled'
      WHERE NOT pl.is_archived
        AND pl.status <> 'CANCELLED'
+       AND b.courier IN ('APC', 'DX')
        ${onlyOne}
        AND (
          COALESCE(btrim(pl.tracking_url), '') = ''

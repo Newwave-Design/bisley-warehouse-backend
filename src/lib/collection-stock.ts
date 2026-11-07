@@ -44,7 +44,7 @@ export async function takeStockForBookedCollection(pickListId: string, preferred
   );
   const list = found.rows[0];
   if (!list || list.is_sandbox || !isPaid(list)) return;
-  const skus = (list.skus as string[]).filter((sku) => sku && !sku.startsWith('extra-'));
+  const skus = (list.skus as string[]).filter((sku) => sku && sku !== 'SAMPLE' && !sku.startsWith('extra-'));
   if (!skus.length) return;
 
   const client = await getPool().connect();
