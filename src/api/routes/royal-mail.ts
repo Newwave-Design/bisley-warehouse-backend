@@ -6,6 +6,8 @@
 import express, { Response } from 'express';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { query } from '../../db/index.js';
+import { fulfillPickListsInMedusa } from '../../lib/medusa-fulfillment.js';
+import { actorName, recordPickListEvents } from '../../lib/pick-list-events.js';
 import {
   createRoyalMailOrders,
   deleteRoyalMailOrders,
@@ -50,6 +52,8 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       `SELECT pl.id, pl.pick_list_number, pl.customer_name, pl.shipping_address, pl.is_sandbox, pl.status,
               (SELECT COUNT(*)::int FROM pick_list_items pli
                 WHERE pli.pick_list_id = pl.id AND NOT pli.is_archived AND pli.product_sku ILIKE '%SAMPLE%') AS sample_count,
+              (SELECT COUNT(*)::int FROM pick_list_items pli
+                WHERE pli.pick_list_id = pl.id AND NOT pli.is_archived AND pli.product_sku ILIKE '%SAMPLE%' AND pli.status <> 'PICKED') AS samples_open,
               cb.apc_order_number AS royal_mail_order_id
        FROM pick_lists pl
        LEFT JOIN collection_bookings cb
@@ -74,6 +78,10 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       }
       if (Number(row.sample_count) < 1) {
         skipped.push({ id, pick_list_number: row.pick_list_number, reason: 'Not a sample order' });
+        continue;
+      }
+      if (Number(row.samples_open) > 0) {
+        skipped.push({ id, pick_list_number: row.pick_list_number, reason: 'Mark the colours picked first' });
         continue;
       }
       const existingId = Number(row.royal_mail_order_id);
@@ -192,6 +200,32 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       return res.status(500).json({ error: 'Royal Mail postage could not be saved, so it was cancelled. Book these orders again.' });
     }
 
+    const bookedIds = [...created.map((row) => row.id), ...already.map((row) => row.id)];
+    if (bookedIds.length) {
+      const ready = await query(
+        `SELECT pl.id
+         FROM pick_lists pl
+         WHERE pl.id = ANY($1::uuid[])
+           AND pl.status IN ('PENDING', 'IN_PROGRESS')
+           AND NOT EXISTS (
+             SELECT 1 FROM pick_list_items pli
+             WHERE pli.pick_list_id = pl.id AND NOT pli.is_archived
+               AND pli.product_sku ILIKE '%SAMPLE%' AND pli.status <> 'PICKED'
+           )`,
+        [bookedIds],
+      );
+      const ids = ready.rows.map((row) => row.id as string);
+      if (ids.length) {
+        await recordPickListEvents({
+          ids,
+          actor: actorName(req.user),
+          action: 'status',
+          summary: 'Collection booked',
+          status: 'PICKED',
+        });
+      }
+    }
+
     const printable = [
       ...created.map((row) => row.orderIdentifier),
       ...already.map((row) => row.orderIdentifier),
@@ -254,7 +288,25 @@ router.post('/manifest', authMiddleware, async (_req: AuthRequest, res: Response
   }
   try {
     const result = await manifestRoyalMail();
-    return res.json(result);
+    const found = await query(
+      `SELECT DISTINCT pl.id
+       FROM pick_lists pl
+       JOIN collection_bookings cb ON cb.pick_list_id = pl.id AND cb.courier = 'RM' AND cb.status <> 'cancelled'
+       WHERE pl.status NOT IN ('DISPATCHED', 'CANCELLED') AND NOT pl.is_archived`,
+    );
+    const ids = found.rows.map((row) => row.id as string);
+    let medusa_sync: { ok: boolean; error?: string }[] = [];
+    if (ids.length) {
+      await recordPickListEvents({
+        ids,
+        actor: actorName(_req.user),
+        action: 'status',
+        summary: 'Shipped',
+        status: 'DISPATCHED',
+      });
+      medusa_sync = await fulfillPickListsInMedusa(ids);
+    }
+    return res.json({ ...result, shipped: ids.length, shippedIds: ids, medusa_sync });
   } catch (error) {
     const message = error instanceof RoyalMailError ? error.message : 'Could not send the Royal Mail collection.';
     console.error('Royal Mail manifest failed', error instanceof Error ? error.message : 'request failed');
