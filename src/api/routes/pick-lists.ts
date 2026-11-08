@@ -7,6 +7,7 @@ import express, { Request, Response } from 'express';
 import { query, getPool } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { applyDispatchStock } from '../../lib/dispatch-stock.js';
+import { consumeBoxesForShipments } from '../../lib/packaging-usage.js';
 import { paidSql, isPaid } from '../../lib/payment-status.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { kitParts, refuseUnassignedPick } from '../../lib/stock-holds.js';
@@ -17,12 +18,13 @@ import { createUpsShipmentLabel } from '../../lib/ups.js';
 import { getOrderValues } from '../../lib/order-values.js';
 import { refreshKitsForSkus } from '../../lib/kit-refresh.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
-import { COLOUR_NAMES, enrichSampleItems, extractColourCode, isSampleSku, sampleColourList, sampleColourName } from '../../lib/colour-names.js';
+import { COLOUR_NAMES, componentDisplaySku, enrichSampleItems, extractColourCode, isSampleSku, sampleColourList, sampleColourName } from '../../lib/colour-names.js';
 import { actorName, PICK_LIST_STATUSES, recordPickListEvents, type PickListStatus } from '../../lib/pick-list-events.js';
 import { fulfillPickListInMedusa, fulfillPickListsInMedusa } from '../../lib/medusa-fulfillment.js';
 import { buildSampleAddressZpl, formatSampleAddressLabel, formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { attachPackaging } from '../../lib/pick-list-packaging.js';
 import { expandKitPicksByList } from '../../lib/pick-list-kits.js';
+import { confirmPartFulfilment, inspectPartFulfilment, PartFulfilError } from '../../lib/part-fulfilment.js';
 
 const router = express.Router();
 
@@ -121,21 +123,29 @@ async function expandDetailKitItems(items: any[]) {
     }
   }
   const info = new Map<string, any>();
+  const stockBySku = new Map<string, { available_stock: number; location_code: string | null }>();
   if (componentSkus.size) {
-    const found = await query(
-      `SELECT DISTINCT ON (wp.variant_sku)
-              wp.variant_sku, wp.product_title, wp.colour_name, wp.colour_code,
-              COALESCE(SUM(wi.quantity), 0)::int AS available_stock,
-              (ARRAY_AGG(wl.location_code ORDER BY wi.quantity DESC NULLS LAST))[1] AS location_code
-       FROM wms_products wp
-       LEFT JOIN warehouse_inventory wi ON wi.product_sku = wp.variant_sku
-       LEFT JOIN warehouse_locations wl ON wl.id = wi.location_id
-       WHERE wp.variant_sku = ANY($1::text[])
-       GROUP BY wp.variant_sku, wp.product_title, wp.colour_name, wp.colour_code, wp.is_archived
-       ORDER BY wp.variant_sku, wp.is_archived`,
-      [[...componentSkus]]
-    );
+    const lookup = [...new Set([...componentSkus].flatMap(sku => [sku, componentDisplaySku(sku)]))];
+    const [found, stock] = await Promise.all([
+      query(
+        `SELECT DISTINCT ON (variant_sku) variant_sku, product_title, colour_name, colour_code
+         FROM wms_products WHERE variant_sku = ANY($1::text[])
+         ORDER BY variant_sku, is_archived`,
+        [lookup]
+      ),
+      query(
+        `SELECT wi.product_sku,
+                COALESCE(SUM(wi.quantity), 0)::int AS available_stock,
+                (ARRAY_AGG(wl.location_code ORDER BY wi.quantity DESC NULLS LAST))[1] AS location_code
+         FROM warehouse_inventory wi
+         LEFT JOIN warehouse_locations wl ON wl.id = wi.location_id
+         WHERE wi.product_sku = ANY($1::text[])
+         GROUP BY wi.product_sku`,
+        [[...componentSkus]]
+      ),
+    ]);
     for (const row of found.rows) info.set(row.variant_sku, row);
+    for (const row of stock.rows) stockBySku.set(row.product_sku, row);
   }
   return items.flatMap(item => {
     const kit = bySku.get(item.product_sku) as { is_kit?: boolean; kit_components?: { sku?: string; required_quantity?: number }[] } | undefined;
@@ -144,7 +154,8 @@ async function expandDetailKitItems(items: any[]) {
     if (!parts.length) return [item];
     const header = { ...item, kit_header: true, available_stock: null };
     return [header, ...parts.map(c => {
-      const meta = info.get(c.sku as string);
+      const stock = stockBySku.get(c.sku as string);
+      const meta = info.get(c.sku as string) || info.get(componentDisplaySku(c.sku as string));
       const per = Number(c.required_quantity) || 1;
       return {
         ...item,
@@ -156,8 +167,8 @@ async function expandDetailKitItems(items: any[]) {
         colour_code: meta?.colour_code || extractColourCode(c.sku as string),
         quantity_required: Number(item.quantity_required) * per,
         quantity_picked: Number(item.quantity_picked) * per,
-        available_stock: Number(meta?.available_stock) || 0,
-        location_code: item.location_code || meta?.location_code || null,
+        available_stock: Number(stock?.available_stock) || 0,
+        location_code: item.location_code || stock?.location_code || null,
         kit_part: true,
         kit_header: false,
       };
@@ -305,6 +316,11 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.deferred_at,
          pl.payment_status,
          pl.purchase_order_number,
+         (SELECT parent.pick_list_number FROM pick_lists parent
+           WHERE parent.id = pl.parent_pick_list_id AND pl.medusa_order_id LIKE '%-PF%') AS part_of_number,
+         (SELECT string_agg(child.pick_list_number, ', ' ORDER BY child.created_at)
+            FROM pick_lists child
+           WHERE child.parent_pick_list_id = pl.id AND child.medusa_order_id LIKE '%-PF%') AS part_numbers,
          pl.last_event_at,
          pl.last_event_by,
          pl.last_event_summary,
@@ -877,9 +893,9 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
     // Related backorder split — either the list this one was split off, or lists split off it
     const [parentResult, childrenResult] = await Promise.all([
       pickList.parent_pick_list_id
-        ? query(`SELECT id, pick_list_number, status FROM pick_lists WHERE id = $1`, [pickList.parent_pick_list_id])
+        ? query(`SELECT id, pick_list_number, status, customer_name, medusa_order_id FROM pick_lists WHERE id = $1`, [pickList.parent_pick_list_id])
         : Promise.resolve({ rows: [] as any[] }),
-      query(`SELECT id, pick_list_number, status FROM pick_lists WHERE parent_pick_list_id = $1`, [pickListId]),
+      query(`SELECT id, pick_list_number, status, customer_name, medusa_order_id FROM pick_lists WHERE parent_pick_list_id = $1`, [pickListId]),
     ]);
 
     const stockStatus = await getPickListStockStatus(pickListId);
@@ -980,6 +996,35 @@ router.patch('/:pickListId/notes/:noteId', authMiddleware, async (req: AuthReque
   } catch (error) {
     console.error('Pick list note update error:', error);
     return res.status(500).json({ error: 'Failed to update note' });
+  }
+});
+
+/**
+ * POST /api/pick-lists/:pickListId/part-fulfil
+ *
+ * Without confirm, says whether booking should ask to part fulfil.
+ * With confirm, moves scanned goods onto a linked pick list and leaves the rest in To pick.
+ * A normal line can split by the quantity already scanned. An inventory kit stays whole. This does not raise a reorder.
+ */
+router.post('/:pickListId/part-fulfil', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const { pickListId } = req.params;
+    if (req.body?.confirm === true) {
+      const result = await confirmPartFulfilment(pickListId, actorName((req as AuthRequest).user));
+      return res.json(result);
+    }
+    const plan = await inspectPartFulfilment(pickListId);
+    if (plan.action === 'prompt') {
+      const { ready_ids, qty_splits, ...rest } = plan;
+      void ready_ids;
+      void qty_splits;
+      return res.json(rest);
+    }
+    return res.json(plan);
+  } catch (error) {
+    if (error instanceof PartFulfilError) return res.status(error.status).json({ error: error.message });
+    console.error('Part fulfilment error:', error);
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to part fulfil' });
   }
 });
 
@@ -1716,6 +1761,7 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: AuthRequest, r
       `UPDATE pick_lists SET status = 'DISPATCHED', dispatched_at = NOW(), updated_at = NOW() WHERE id = $1`,
       [pickListId]
     );
+    if (!pickList.is_sandbox) await consumeBoxesForShipments(client, [pickListId], userId);
     await client.query('COMMIT');
     scheduleAllocationRun(`pick list ${pickListId} dispatched`);
   } catch (error) {
@@ -2146,6 +2192,7 @@ router.post('/:pickListId/shipment-to-medusa', authMiddleware, requirePermission
       `UPDATE pick_lists SET status = 'DISPATCHED', dispatched_at = NOW(), updated_at = NOW() WHERE id = $1`,
       [pickListId]
     );
+    await consumeBoxesForShipments({ query }, [pickListId], toUuidOrNull((req as AuthRequest).user?.id));
 
     console.log(`✓ Shipment created for fulfillment ${pickList.medusa_fulfillment_id} with tracking ${tracking_number || '(none)'}`);
     res.json({ success: true, shipment_tracking_id: shipmentResponse.shipment?.id });

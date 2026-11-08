@@ -23,7 +23,7 @@ function alreadyDone(status: string | null | undefined): boolean {
 
 async function loadMedusaOrder(orderId: string): Promise<any> {
   const data = await medusaGet(
-    `/admin/orders/${encodeURIComponent(orderId)}?fields=*items,*items.variant,*fulfillments,fulfillment_status`
+    `/admin/orders/${encodeURIComponent(orderId)}?fields=*items,*items.variant,*fulfillments,*fulfillments.items,fulfillment_status`
   );
   if (data?.type === 'not_allowed' || data?.message || data?.code) {
     if (!data?.order && !data?.id) {
@@ -57,13 +57,39 @@ async function resolveLineItems(pickListId: string, order: any): Promise<{ id: s
 
   const payload: { id: string; quantity: number }[] = [];
   for (const row of items.rows) {
-    const qty = Math.max(1, Number(row.quantity_picked) || Number(row.quantity_required) || 1);
+    const wanted = Math.max(1, Number(row.quantity_picked) || Number(row.quantity_required) || 1);
     const line = (row.medusa_order_line_item_id && byId.get(row.medusa_order_line_item_id))
       || bySku.get(row.product_sku);
     if (!line?.id) continue;
-    payload.push({ id: line.id, quantity: Math.min(qty, Number(line.quantity) || qty) });
+    const remaining = (Number(line.quantity) || wanted) - fulfilledQuantity(order, line.id);
+    const qty = Math.min(wanted, remaining);
+    if (qty <= 0) continue;
+    payload.push({ id: line.id, quantity: qty });
   }
   return payload;
+}
+
+function fulfilledQuantity(order: any, lineId: string): number {
+  let total = 0;
+  for (const fulfillment of order.fulfillments || []) {
+    if (fulfillment?.canceled_at || fulfillment?.cancelled_at) continue;
+    for (const item of fulfillment.items || []) {
+      const id = item.line_item_id || item.id;
+      if (id === lineId) total += Number(item.quantity) || 0;
+    }
+  }
+  return total;
+}
+
+async function sharesOrder(orderId: string, pickListId: string): Promise<boolean> {
+  const result = await query(
+    `SELECT 1 FROM pick_lists
+      WHERE id <> $2
+        AND (medusa_order_id = $1 OR left(medusa_order_id, length($1) + 3) = $1 || '-BO' OR left(medusa_order_id, length($1) + 3) = $1 || '-PF')
+      LIMIT 1`,
+    [orderId, pickListId],
+  );
+  return result.rows.length > 0;
 }
 
 async function createFulfillment(orderId: string, items: { id: string; quantity: number }[]): Promise<string> {
@@ -146,14 +172,15 @@ export async function fulfillPickListInMedusa(pickListId: string): Promise<Medus
     }
 
     let fulfillmentId = pickList.medusa_fulfillment_id as string | null;
-    if (!fulfillmentId && alreadyDone(order.fulfillment_status)) {
+    // A part fulfilment has its own fulfillment. Do not attach this list to the other part's.
+    if (!fulfillmentId && alreadyDone(order.fulfillment_status) && !(await sharesOrder(orderId, pickListId))) {
       fulfillmentId = order.fulfillments?.slice(-1)[0]?.id || null;
     }
 
     if (!fulfillmentId) {
       const items = await resolveLineItems(pickListId, order);
       if (!items.length) {
-        return { ok: false, error: `No Medusa line items on ${orderId} to fulfill` };
+        return { ok: false, error: `No remaining shop quantity to fulfill for ${orderId}. These lines may already be on another fulfillment.` };
       }
       fulfillmentId = await createFulfillment(orderId, items);
     }

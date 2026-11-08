@@ -27,9 +27,15 @@ export function royalMailServiceCode(): string {
   return (process.env.ROYAL_MAIL_SERVICE_CODE || '').trim().slice(0, 10);
 }
 
+export type RoyalMailPackageFormat = 'letter' | 'largeLetter';
+
 /** Four samples or fewer post as a letter. More than that is a large letter. */
-export function royalMailPackageFormat(sampleCount: number): string {
+export function royalMailPackageFormat(sampleCount: number): RoyalMailPackageFormat {
   return Math.max(1, Math.round(Number(sampleCount)) || 1) <= 4 ? 'letter' : 'largeLetter';
+}
+
+export function asRoyalMailPackageFormat(value: unknown, sampleCount: number): RoyalMailPackageFormat {
+  return value === 'letter' || value === 'largeLetter' ? value : royalMailPackageFormat(sampleCount);
 }
 
 export function royalMailSampleWeightGrams(): number {
@@ -79,6 +85,7 @@ export type RoyalMailOrderInput = {
     phoneNumber?: string;
   };
   sampleCount: number;
+  packageFormat?: RoyalMailPackageFormat;
 };
 
 export type CreatedRoyalMailOrder = {
@@ -107,7 +114,7 @@ export async function createRoyalMailOrders(orders: RoyalMailOrderInput[]): Prom
       currencyCode: 'GBP',
       packages: [{
         weightInGrams: weight,
-        packageFormatIdentifier: royalMailPackageFormat(quantity),
+        packageFormatIdentifier: asRoyalMailPackageFormat(order.packageFormat, quantity),
         contents: [{
           name: 'Colour finish samples',
           quantity,

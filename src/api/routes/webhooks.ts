@@ -20,6 +20,7 @@ import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { logError, logWarning } from '../../lib/logger.js';
 import { createNotification, createNotificationOnce } from '../../lib/notifications.js';
+import { splitOrderMatch } from '../../lib/order-values.js';
 
 const router = express.Router();
 
@@ -426,7 +427,7 @@ async function handleOrderCancelled(order: any) {
 
   // Find the pick list and any split children (keyed `<order_id>-BO...`)
   const plResult = await query(
-    `SELECT id, status FROM pick_lists WHERE medusa_order_id = $1 OR left(medusa_order_id, length($1) + 3) = $1 || '-BO'`,
+    `SELECT id, status FROM pick_lists WHERE ${splitOrderMatch('medusa_order_id', '$1')}`,
     [medusaOrderId]
   );
   if (plResult.rows.length === 0) {
@@ -495,7 +496,7 @@ export async function handleOrderEdited(order: any) {
   const medusaOrderId = order.id;
   const lists = (await query(
     `SELECT id, status, medusa_order_id, is_sandbox FROM pick_lists
-     WHERE medusa_order_id = $1 OR left(medusa_order_id, length($1) + 3) = $1 || '-BO'`,
+     WHERE ${splitOrderMatch('medusa_order_id', '$1')}`,
     [medusaOrderId]
   )).rows;
   const label = `#${order.display_id ?? medusaOrderId}`;

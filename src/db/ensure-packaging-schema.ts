@@ -149,6 +149,9 @@ export async function ensurePackagingSchema() {
       created_at TIMESTAMP DEFAULT NOW()
     )`,
     `CREATE INDEX IF NOT EXISTS idx_pkg_moves_item ON packaging_stock_movements(packaging_item_id, created_at DESC)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_pkg_moves_shipment
+      ON packaging_stock_movements (pick_list_id, packaging_item_id)
+      WHERE movement_type = 'pack_usage' AND extra->>'source' = 'shipment'`,
 
     `CREATE TABLE IF NOT EXISTS pick_list_package_packaging (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -223,6 +226,12 @@ export async function ensurePackagingSchema() {
       ON collection_bookings (pick_list_id, sku)
       WHERE status <> 'cancelled'`,
     `ALTER TABLE collection_bookings ADD COLUMN IF NOT EXISTS collection_date VARCHAR(40)`,
+    `ALTER TABLE collection_bookings ADD COLUMN IF NOT EXISTS direction VARCHAR(20) NOT NULL DEFAULT 'outbound'`,
+    `ALTER TABLE collection_bookings ADD COLUMN IF NOT EXISTS outcome VARCHAR(20)`,
+    `DROP INDEX IF EXISTS idx_collection_bookings_line`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_bookings_line
+      ON collection_bookings (pick_list_id, sku, direction)
+      WHERE status <> 'cancelled'`,
 
     `CREATE TABLE IF NOT EXISTS booking_templates (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

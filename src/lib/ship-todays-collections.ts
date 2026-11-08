@@ -1,5 +1,6 @@
 import { query } from '../db/index.js';
 import { takeStockForOpenCollections } from './collection-stock.js';
+import { consumeOutstandingShipmentBoxes } from './packaging-usage.js';
 import { fulfillPickListsInMedusa } from './medusa-fulfillment.js';
 import { recordPickListEvents } from './pick-list-events.js';
 import { rememberShipmentTracking } from './shipment-tracking.js';
@@ -33,11 +34,14 @@ export async function shipCollectionsDueToday(): Promise<string[]> {
     await takeStockForOpenCollections().catch((error) => {
       console.warn('Removing booked collection stock failed', error instanceof Error ? error.message : 'failed');
     });
+    await consumeOutstandingShipmentBoxes().catch((error) => {
+      console.warn('Taking shipped box stock failed', error instanceof Error ? error.message : 'failed');
+    });
     const today = londonToday();
     const found = await query(
       `SELECT pl.id, cb.collection_date
        FROM pick_lists pl
-       JOIN collection_bookings cb ON cb.pick_list_id = pl.id AND cb.status <> 'cancelled'
+       JOIN collection_bookings cb ON cb.pick_list_id = pl.id AND cb.status <> 'cancelled' AND COALESCE(cb.direction, 'outbound') <> 'return'
        WHERE pl.status = ANY($1::text[])
          AND NOT pl.is_archived`,
       [PICKED],
@@ -59,7 +63,7 @@ export async function shipCollectionsDueToday(): Promise<string[]> {
          FROM (
            SELECT DISTINCT ON (pick_list_id) pick_list_id, waybill, courier
            FROM collection_bookings
-           WHERE status <> 'cancelled' AND COALESCE(waybill, '') <> ''
+           WHERE status <> 'cancelled' AND COALESCE(waybill, '') <> '' AND COALESCE(direction, 'outbound') <> 'return'
            ORDER BY pick_list_id, created_at DESC
          ) cb
          WHERE pl.id = cb.pick_list_id AND pl.id = ANY($1::uuid[])`,
@@ -80,6 +84,9 @@ export async function shipCollectionsDueToday(): Promise<string[]> {
       action: 'status',
       summary: 'Shipped — collection is today',
       status: 'DISPATCHED',
+    });
+    await consumeOutstandingShipmentBoxes().catch((error) => {
+      console.warn('Taking shipped box stock failed', error instanceof Error ? error.message : 'failed');
     });
     await fulfillPickListsInMedusa(ids);
     console.log(`[collections] Shipped ${ids.length} order(s) booked for collection today`);

@@ -126,6 +126,14 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
   if (!collectionPostcode || !deliveryPostcode) {
     return res.status(400).json({ error: 'Collection and delivery postcodes are required' });
   }
+  const returning = text(req.body?.direction).trim().toLowerCase() === 'return';
+  const agreedDate = returning ? agreedCollectionDate(req.body?.collectionDate) : '';
+  if (returning && text(req.body?.courier).trim().toUpperCase() === 'DX') {
+    return res.status(400).json({ error: 'A return is collected by APC from the customer.' });
+  }
+  if (returning && !agreedDate) {
+    return res.status(400).json({ error: 'Enter the collection date agreed with the customer. It has to be a weekday that has not passed.' });
+  }
   if (text(req.body?.courier).trim().toUpperCase() === 'DX') {
     if (!dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
     try {
@@ -146,7 +154,7 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
     return res.status(500).json({ error: 'APC login is not configured on this computer' });
   }
 
-  const requestedDate = text(req.body?.collectionDate).trim();
+  const requestedDate = agreedDate || text(req.body?.collectionDate).trim();
   const items = pieces.map((piece) => ({
     Type: 'ALL',
     Weight: text(piece.weightKg, '1'),
@@ -179,6 +187,22 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
       .sort((left, right) => dateSortKey(left[0]) - dateSortKey(right[0]))
       .map(([date, services]) => ({ date, services }));
     const services = collectionDates[0]?.services || [];
+    if (returning) {
+      const exact = collectionDates.filter((entry) => entry.date === agreedDate && entry.services.length);
+      if (!exact.length) {
+        return res.status(409).json({ error: 'APC cannot collect on that date. Call the customer and agree another date.' });
+      }
+      return res.json({
+        booked: false,
+        pieces: items.length,
+        collectionPostcode,
+        deliveryPostcode,
+        collectionDate: agreedDate,
+        collectionDates: exact,
+        message: quoted.find((entry) => entry.message)?.message || null,
+        services: exact[0].services,
+      });
+    }
 
     return res.json({
       booked: false,
@@ -282,6 +306,25 @@ function collectionDateOf(value: unknown): string {
   return nextCollectionDate();
 }
 
+/** A return can only be collected on the weekday the customer agreed. */
+function agreedCollectionDate(value: unknown, now = new Date()): string {
+  const raw = text(value).trim();
+  const dmy = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const day = Number(dmy?.[1] || iso?.[3]);
+  const month = Number(dmy?.[2] || iso?.[2]);
+  const year = Number(dmy?.[3] || iso?.[1]);
+  if (!day || !month || !year) return '';
+  const parts = londonParts(new Date(Date.UTC(year, month - 1, day, 12)));
+  if (parts.year !== year || parts.month !== month || parts.day !== day) return '';
+  if (weekend(parts.weekday)) return '';
+  const today = londonParts(now);
+  const key = year * 10000 + month * 100 + day;
+  const todayKey = today.year * 10000 + today.month * 100 + today.day;
+  if (key < todayKey) return '';
+  return apcDate(year, month, day);
+}
+
 function fieldErrors(entry: any): string[] {
   const fields = asList<any>(entry?.ErrorFields?.ErrorField || entry?.ErrorFields);
   return fields.map((field) => {
@@ -382,7 +425,19 @@ function apcContactNumbers(value: string): { PhoneNumber?: string; MobileNumber?
 }
 
 router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => {
-  const courier = text(req.body?.courier).trim().toUpperCase() === 'DX' ? 'DX' : 'APC';
+  const returning = text(req.body?.direction).trim().toLowerCase() === 'return';
+  const outcome = text(req.body?.outcome).trim().toLowerCase();
+  const agreedDate = returning ? agreedCollectionDate(req.body?.collectionDate) : '';
+  const courier = returning ? 'APC' : (text(req.body?.courier).trim().toUpperCase() === 'DX' ? 'DX' : 'APC');
+  if (returning && text(req.body?.courier).trim().toUpperCase() === 'DX') {
+    return res.status(400).json({ error: 'A return is collected by APC from the customer.' });
+  }
+  if (returning && outcome !== 'refund' && outcome !== 'replace') {
+    return res.status(400).json({ error: 'Choose whether this return is a refund or a replacement.' });
+  }
+  if (returning && !agreedDate) {
+    return res.status(400).json({ error: 'Enter the collection date agreed with the customer. It has to be a weekday that has not passed.' });
+  }
   const remoteUser = courier === 'APC' ? authHeader() : null;
   if (courier === 'APC' && !remoteUser) return res.status(500).json({ error: 'APC login is not configured' });
   if (courier === 'DX' && !dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
@@ -417,15 +472,18 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     if (skus.length) {
       const already = await query(
         `SELECT sku FROM collection_bookings
-          WHERE pick_list_id = $1 AND sku = ANY($2::text[]) AND status <> 'cancelled'`,
-        [pickListId, skus]
+          WHERE pick_list_id = $1 AND sku = ANY($2::text[]) AND status <> 'cancelled'
+            AND COALESCE(direction, 'outbound') = $3`,
+        [pickListId, skus, returning ? 'return' : 'outbound']
       );
-      if (already.rows.length) return res.status(409).json({ error: 'One of these items already has a collection' });
+      if (already.rows.length) {
+        return res.status(409).json({ error: returning ? 'This item already has a return collection' : 'One of these items already has a collection' });
+      }
     }
 
     const delivery = deliveryFrom(list);
     if (!['GB', 'UK'].includes(delivery.country)) {
-      return res.status(400).json({ error: `${courier} collections are only booked to a UK address` });
+      return res.status(400).json({ error: returning ? 'A return can only be collected from a UK address' : `${courier} collections are only booked to a UK address` });
     }
     if (!delivery.line1 || !delivery.city || !delivery.postcode || !delivery.company) {
       return res.status(400).json({ error: 'This order needs a name, street, city and postcode before it can be booked' });
@@ -444,7 +502,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     let orderNumber = '';
     let bookedService = serviceCode;
     let bookedName = serviceName;
-    let collectionDate = text(req.body?.collectionDate).trim().slice(0, 40) || null;
+    let collectionDate = (returning ? agreedDate : text(req.body?.collectionDate).trim()).slice(0, 40) || null;
     let savedPieces: { reference: string; trackingNumber: string; title: string; weightKg: string; lengthCm: string; widthCm: string; heightCm: string }[] = [];
 
     if (courier === 'DX') {
@@ -498,6 +556,16 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     Object.assign(contact, apcContactNumbers(delivery.phone));
     if (delivery.email) contact.Email = delivery.email;
     const [addressLine1, addressLine2] = apcStreet(delivery.line1, delivery.line2);
+    const customerParty = {
+      CompanyName: clipApc(delivery.company, 34),
+      AddressLine1: addressLine1,
+      AddressLine2: addressLine2,
+      PostalCode: delivery.postcode,
+      City: clipApc(delivery.city, 31),
+      County: clipApc(delivery.county, 31),
+      CountryCode: 'GB',
+      ...(Object.keys(contact).length ? { Contact: contact } : {}),
+    };
 
     const response = await fetch(ORDER_URL, {
       method: 'POST',
@@ -509,22 +577,13 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       body: JSON.stringify({
         Orders: {
           Order: {
-            CollectionDate: collectionDateOf(req.body?.collectionDate),
+            CollectionDate: returning ? agreedDate : collectionDateOf(req.body?.collectionDate),
             ReadyAt: '09:00',
             ClosedAt: '17:00',
             ProductCode: serviceCode,
             Reference: reference,
-            Collection: COLLECTION,
-            Delivery: {
-              CompanyName: clipApc(delivery.company, 34),
-              AddressLine1: addressLine1,
-              AddressLine2: addressLine2,
-              PostalCode: delivery.postcode,
-              City: clipApc(delivery.city, 31),
-              County: clipApc(delivery.county, 31),
-              CountryCode: 'GB',
-              ...(Object.keys(contact).length ? { Contact: contact } : {}),
-            },
+            Collection: returning ? customerParty : COLLECTION,
+            Delivery: returning ? COLLECTION : customerParty,
             GoodsInfo: { GoodsValue: '50', Fragile: 'false' },
             ShipmentDetails: {
               NumberOfPieces: String(items.length),
@@ -547,6 +606,20 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     if (!waybill) {
       return res.status(502).json({ error: 'APC replied without a tracking number. Check APC before booking this order again.' });
     }
+    if (returning) {
+      const bookedDay = text(order?.CollectionDate).trim();
+      if (bookedDay && bookedDay !== agreedDate) {
+        const orderNumber = text(order?.OrderNumber).trim();
+        const lookup = orderNumber || waybill;
+        await fetch(`https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(lookup)}.json${orderNumber ? '' : '?searchtype=CarrierWaybill'}`, {
+          method: 'PUT',
+          headers: { 'remote-user': remoteUser || '', 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({ Orders: { Order: { Status: 'CANCELLED' } } }),
+        }).catch(() => undefined);
+        return res.status(409).json({ error: `APC booked ${bookedDay} instead of the agreed date ${agreedDate}. That collection was cancelled. Call the customer and agree another date.` });
+      }
+      collectionDate = agreedDate;
+    }
 
     const tracked = asList<any>(order?.ShipmentDetails?.Items?.Item);
     savedPieces = pieces.map((piece, index) => ({
@@ -559,9 +632,13 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       heightCm: piece.heightCm,
     }));
     orderNumber = text(order?.OrderNumber).trim();
-    collectionDate = (text(order?.CollectionDate).trim() || text(req.body?.collectionDate).trim()).slice(0, 40) || null;
+    collectionDate = returning
+      ? agreedDate
+      : (text(order?.CollectionDate).trim() || text(req.body?.collectionDate).trim()).slice(0, 40) || null;
     }
     const summary = [delivery.company, delivery.line1, delivery.city, delivery.postcode].filter(Boolean).join(', ');
+    const collectionPostcode = returning ? delivery.postcode : COLLECTION.PostalCode;
+    const deliveryPostcode = returning ? COLLECTION.PostalCode : delivery.postcode;
     const rowSkus = skus.length ? skus : [`extra-${Date.now().toString(36)}`];
 
     const client = await getPool().connect();
@@ -572,11 +649,11 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         const inserted = await client.query(
           `INSERT INTO collection_bookings
              (pick_list_id, sku, courier, service_code, service_name, waybill, apc_order_number,
-              collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date)
-           VALUES ($1, $2, $12, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, 'booked', $11)
+              collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date, direction, outcome)
+           VALUES ($1, $2, $12, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, 'booked', $11, $13, $14)
            RETURNING id, pick_list_id, sku, courier, service_code, service_name, waybill,
-                     collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date`,
-          [pickListId, sku, bookedService, bookedName || null, waybill, orderNumber || null, COLLECTION.PostalCode, delivery.postcode, summary, JSON.stringify(savedPieces), collectionDate, courier]
+                     collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date, direction, outcome`,
+          [pickListId, sku, bookedService, bookedName || null, waybill, orderNumber || null, collectionPostcode, deliveryPostcode, summary, JSON.stringify(savedPieces), collectionDate, courier, returning ? 'return' : 'outbound', returning ? outcome : null]
         );
         saved.push(inserted.rows[0]);
       }
@@ -589,16 +666,18 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       client.release();
     }
 
-    console.log(`${courier} collection booked ${waybill} for pick list ${pickListId}`);
-    await rememberShipmentTracking(pickListId).catch((error) => {
-      console.warn('Saving shipment tracking failed', error instanceof Error ? error.message : 'failed');
-    });
-    await takeStockForBookedCollection(pickListId, text(req.user?.id)).catch((error) => {
-      console.warn('Removing booked collection stock failed', error instanceof Error ? error.message : 'failed');
-    });
-    await shipCollectionsDueToday().catch((error) => {
-      console.warn('Shipping today\'s collections failed', error instanceof Error ? error.message : 'failed');
-    });
+    console.log(`${courier} ${returning ? 'return ' : ''}collection booked ${waybill} for pick list ${pickListId}`);
+    if (!returning) {
+      await rememberShipmentTracking(pickListId).catch((error) => {
+        console.warn('Saving shipment tracking failed', error instanceof Error ? error.message : 'failed');
+      });
+      await takeStockForBookedCollection(pickListId, text(req.user?.id)).catch((error) => {
+        console.warn('Removing booked collection stock failed', error instanceof Error ? error.message : 'failed');
+      });
+      await shipCollectionsDueToday().catch((error) => {
+        console.warn('Shipping today\'s collections failed', error instanceof Error ? error.message : 'failed');
+      });
+    }
     return res.status(201).json({ booked: true, waybill, bookings: saved });
   } catch (error) {
     console.error('Collection booking failed', error instanceof Error ? error.message : 'request failed');
@@ -628,9 +707,11 @@ router.get('/bookings', authMiddleware, async (_req: AuthRequest, res: Response)
   try {
     const result = await query(
       `SELECT id, pick_list_id, sku, courier, service_code, service_name, waybill,
-              collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date, created_at
+              collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date,
+              direction, outcome, created_at
        FROM collection_bookings
        WHERE status <> 'cancelled'
+         AND COALESCE(direction, 'outbound') ${text(_req.query.direction).trim().toLowerCase() === 'return' ? '=' : '<>'} 'return'
        ORDER BY created_at DESC`
     );
     return res.json({ bookings: result.rows });
@@ -716,12 +797,12 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
 
   try {
     const found = await query(
-      `SELECT id, pick_list_id, waybill, apc_order_number, courier, status
+      `SELECT id, pick_list_id, waybill, apc_order_number, courier, status, direction
        FROM collection_bookings WHERE id = $1`,
       [id]
     );
     const booking = found.rows[0] as {
-      pick_list_id?: string; waybill?: string; apc_order_number?: string; courier?: string; status?: string
+      pick_list_id?: string; waybill?: string; apc_order_number?: string; courier?: string; status?: string; direction?: string
     } | undefined;
     if (!booking) return res.status(404).json({ error: 'Unknown booking' });
     if (booking.status === 'cancelled') return res.json({ cancelled: true });
@@ -748,7 +829,7 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
           [booking.pick_list_id, waybill]
         );
       }
-      if (booking.pick_list_id && waybill) {
+      if (booking.pick_list_id && waybill && booking.direction !== 'return') {
         await returnStockForCancelledCollection(booking.pick_list_id, waybill, text(req.user?.id)).catch((error) => {
           console.warn('Returning cancelled collection stock failed', error instanceof Error ? error.message : 'failed');
         });
@@ -798,7 +879,7 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
         [booking.pick_list_id, waybill]
       );
     }
-    if (booking.pick_list_id && waybill) {
+    if (booking.pick_list_id && waybill && booking.direction !== 'return') {
       await returnStockForCancelledCollection(booking.pick_list_id, waybill, text(req.user?.id)).catch((error) => {
         console.warn('Returning cancelled collection stock failed', error instanceof Error ? error.message : 'failed');
       });

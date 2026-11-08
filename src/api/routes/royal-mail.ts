@@ -14,6 +14,7 @@ import {
   fetchRoyalMailLabelPdf,
   manifestRoyalMail,
   RoyalMailError,
+  asRoyalMailPackageFormat,
   royalMailConfigured,
   royalMailServiceCode,
 } from '../../lib/royal-mail.js';
@@ -64,7 +65,10 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     const byId = new Map(found.rows.map((row) => [row.id, row]));
     const skipped: { id: string; pick_list_number?: string; reason: string }[] = [];
     const already: { id: string; orderIdentifier: number }[] = [];
-    const pending: { id: string; orderReference: string; recipient: any; sampleCount: number; postcode: string; summary: string }[] = [];
+    const requestedFormats = (req.body?.packageFormats && typeof req.body.packageFormats === 'object')
+      ? req.body.packageFormats as Record<string, unknown>
+      : {};
+    const pending: { id: string; orderReference: string; recipient: any; sampleCount: number; packageFormat: 'letter' | 'largeLetter'; postcode: string; summary: string }[] = [];
 
     for (const id of ids) {
       const row = byId.get(id);
@@ -99,6 +103,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         skipped.push({ id, pick_list_number: row.pick_list_number, reason: 'The shipping address is incomplete' });
         continue;
       }
+      const sampleCount = Number(row.sample_count) || 1;
       const company = clean(address.company);
       const line2 = clean(address.address_2);
       const county = clean(address.province);
@@ -106,7 +111,8 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       pending.push({
         id,
         orderReference: clean(row.pick_list_number).slice(0, 40),
-        sampleCount: Number(row.sample_count) || 1,
+        sampleCount,
+        packageFormat: asRoyalMailPackageFormat(requestedFormats[id], sampleCount),
         postcode,
         summary: [company, line1, city, postcode].filter(Boolean).join(', '),
         recipient: {
@@ -132,6 +138,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         orderReference: row.orderReference,
         recipient: row.recipient,
         sampleCount: row.sampleCount,
+        packageFormat: row.packageFormat,
       })));
       const pendingByRef = new Map(pending.map((row) => [row.orderReference, row]));
       created = result.created.map((row) => {

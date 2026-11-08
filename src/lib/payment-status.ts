@@ -9,6 +9,7 @@
 import { query } from '../db/index.js';
 import { medusaGet } from './medusa-client.js';
 import { scheduleAllocationRun } from './allocation.js';
+import { splitOrderMatch } from './order-values.js';
 
 export const PAID_STATUSES = ['captured', 'partially_refunded'] as const;
 
@@ -51,7 +52,7 @@ async function fetchStatuses(ids: string[]): Promise<Map<string, string>> {
 
 /** Store a Medusa payment status on the order's pick lists (including split children). Returns true if it changed. */
 export async function storePaymentStatus(orderId: string, status: string): Promise<boolean> {
-  const match = `(medusa_order_id = $1 OR left(medusa_order_id, length($1) + 3) = $1 || '-BO')`;
+  const match = splitOrderMatch('medusa_order_id', '$1');
   const changed = await query(`SELECT 1 FROM pick_lists WHERE ${match} AND payment_status IS DISTINCT FROM $2 LIMIT 1`, [orderId, status]);
   await query(`UPDATE pick_lists SET payment_status = $2, payment_checked_at = NOW() WHERE ${match}`, [orderId, status]);
   if (changed.rows.length) scheduleAllocationRun(`payment status of order ${orderId} is now ${status}`);
@@ -59,7 +60,7 @@ export async function storePaymentStatus(orderId: string, status: string): Promi
 }
 
 async function storePurchaseOrder(orderId: string, purchaseOrder: string): Promise<void> {
-  const match = `(medusa_order_id = $1 OR left(medusa_order_id, length($1) + 3) = $1 || '-BO')`;
+  const match = splitOrderMatch('medusa_order_id', '$1');
   await query(
     `UPDATE pick_lists SET purchase_order_number = $2, updated_at = NOW()
      WHERE ${match} AND COALESCE(purchase_order_number, '') = ''`,

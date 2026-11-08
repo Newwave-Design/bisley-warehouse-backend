@@ -24,10 +24,15 @@ const cache = new Map<string, { at: number; ttl: number; value: OrderValue | nul
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
-/** Split child lists use `{orderId}-BO…`; Medusa still keys the order on the root id. */
+/** Split child lists use `{orderId}-BO…` (backorder) or `{orderId}-PF…` (part fulfilment). Medusa still keys the order on the root id. */
 export function rootMedusaOrderId(orderId: string): string {
-  const i = orderId.indexOf('-BO');
-  return i === -1 ? orderId : orderId.slice(0, i);
+  const match = /-(?:BO|PF)/.exec(orderId);
+  return match ? orderId.slice(0, match.index) : orderId;
+}
+
+/** SQL boolean: the column is this Medusa order or one of its split children. `param` is the `$n` placeholder. */
+export function splitOrderMatch(column: string, param: string): string {
+  return `(${column} = ${param} OR left(${column}, length(${param}) + 3) = ${param} || '-BO' OR left(${column}, length(${param}) + 3) = ${param} || '-PF')`;
 }
 
 async function persistOrderValue(orderId: string, value: OrderValue): Promise<void> {
@@ -37,7 +42,7 @@ async function persistOrderValue(orderId: string, value: OrderValue): Promise<vo
       `UPDATE pick_lists SET
          order_gross_gbp = $2, order_net_gbp = $3, order_vat_gbp = $4,
          order_refunded_gbp = $5, order_currency = $6, order_value_checked_at = NOW()
-       WHERE medusa_order_id = $1 OR medusa_order_id LIKE $1 || '-BO%'`,
+       WHERE ${splitOrderMatch('medusa_order_id', '$1')}`,
       [root, value.gross, value.net, value.vat, value.refunded, value.currency]
     );
   } catch {
@@ -95,7 +100,7 @@ export async function getOrderValues(orderIds: string[]): Promise<Record<string,
                 order_refunded_gbp, order_currency, order_value_checked_at
          FROM pick_lists
          WHERE parent_pick_list_id IS NULL
-           AND (medusa_order_id = ANY($1::text[]) OR split_part(medusa_order_id, '-BO', 1) = ANY($1::text[]))`,
+           AND (medusa_order_id = ANY($1::text[]) OR split_part(medusa_order_id, '-BO', 1) = ANY($1::text[]) OR split_part(medusa_order_id, '-PF', 1) = ANY($1::text[]))`,
         [missing.map(rootMedusaOrderId)]
       );
       const byRoot = new Map<string, OrderValue>();

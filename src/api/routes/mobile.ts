@@ -298,6 +298,11 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
     const result = await query(`
       SELECT
         pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at,
+        (SELECT parent.pick_list_number FROM pick_lists parent
+          WHERE parent.id = pl.parent_pick_list_id AND pl.medusa_order_id LIKE '%-PF%') AS part_of_number,
+        (SELECT string_agg(child.pick_list_number, ', ' ORDER BY child.created_at)
+           FROM pick_lists child
+          WHERE child.parent_pick_list_id = pl.id AND child.medusa_order_id LIKE '%-PF%') AS part_numbers,
         COALESCE(
           (SELECT parent.created_at FROM pick_lists parent WHERE parent.id = pl.parent_pick_list_id),
           pl.created_at
@@ -414,9 +419,14 @@ async function attachMobilePackaging(rows: any[]) {
 router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const pl = await query(`
-      SELECT id, pick_list_number, medusa_order_id, status, created_at, deferred_at,
-             customer_name, customer_email, shipping_address
-      FROM pick_lists WHERE id = $1
+      SELECT pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at,
+             pl.customer_name, pl.customer_email, pl.shipping_address,
+             (SELECT parent.pick_list_number FROM pick_lists parent
+               WHERE parent.id = pl.parent_pick_list_id AND pl.medusa_order_id LIKE '%-PF%') AS part_of_number,
+             (SELECT string_agg(child.pick_list_number, ', ' ORDER BY child.created_at)
+                FROM pick_lists child
+               WHERE child.parent_pick_list_id = pl.id AND child.medusa_order_id LIKE '%-PF%') AS part_numbers
+      FROM pick_lists pl WHERE pl.id = $1
     `, [req.params.id]);
     if (!pl.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
 
@@ -609,9 +619,14 @@ async function recomputePickItem(pickListId: string, itemId: string) {
     [pickListId]
   );
   const allPicked = parseInt(remaining.rows[0].count) === 0;
+  const scansOnList = await query(
+    `SELECT COUNT(*)::int AS n FROM pick_scans WHERE pick_list_id = $1`,
+    [pickListId]
+  );
+  const started = scansOnList.rows[0].n > 0;
   await query(
     `UPDATE pick_lists SET status = $1, updated_at = NOW() WHERE id = $2`,
-    [allPicked ? 'PICKED' : 'IN_PROGRESS', pickListId]
+    [allPicked ? 'PICKED' : started ? 'IN_PROGRESS' : 'PENDING', pickListId]
   );
 
   return { item: updated.rows[0], allPicked };

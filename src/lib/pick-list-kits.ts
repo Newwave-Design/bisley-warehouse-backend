@@ -1,5 +1,5 @@
 import { query } from '../db/index.js';
-import { COLOUR_NAMES, extractColourCode } from './colour-names.js';
+import { COLOUR_NAMES, componentDisplaySku, extractColourCode } from './colour-names.js';
 
 /** Replace kit lines with the parent plus the pieces to pick. The same expansion Pick Lists v2 uses. */
 export async function expandKitPicksByList<T extends { sku: string; quantity_required: number; quantity_picked: number }>(groups: T[][]): Promise<T[][]> {
@@ -21,22 +21,23 @@ export async function expandKitPicksByList<T extends { sku: string; quantity_req
   }
   const info = new Map<string, { product_title: string; colour_name: string; colour_code: string; variant_thumbnail: string; product_thumbnail: string }>();
   if (componentSkus.size) {
+    const lookup = [...new Set([...componentSkus].flatMap(sku => [sku, componentDisplaySku(sku)]))];
     const found = await query(
       `SELECT DISTINCT ON (variant_sku) variant_sku, product_title, colour_name, colour_code, variant_thumbnail, product_thumbnail
        FROM wms_products WHERE variant_sku = ANY($1::text[])
        ORDER BY variant_sku, is_archived`,
-      [[...componentSkus]]
+      [lookup]
     );
     for (const row of found.rows) info.set(row.variant_sku, row);
   }
-  return groups.map(items => items.flatMap(item => {
+  const expanded = groups.map(items => items.flatMap(item => {
     const kit = bySku.get(item.sku) as { is_kit?: boolean; kit_components?: { sku?: string; required_quantity?: number }[] } | undefined;
     const parts = (kit?.is_kit && Array.isArray(kit.kit_components) ? kit.kit_components : [])
       .filter(c => c?.sku && c.sku !== item.sku);
     if (!parts.length) return [item];
     const header = { ...item, kit_header: true };
     return [header, ...parts.map(c => {
-      const meta = info.get(c.sku as string);
+      const meta = info.get(c.sku as string) || info.get(componentDisplaySku(c.sku as string));
       const per = Number(c.required_quantity) || 1;
       const code = (meta?.colour_code || extractColourCode(c.sku as string) || '').toLowerCase();
       const colourName = meta?.colour_name || COLOUR_NAMES[code] || '';
@@ -56,5 +57,37 @@ export async function expandKitPicksByList<T extends { sku: string; quantity_req
         kit_parent_sku: item.sku,
       };
     })];
+  }));
+
+  const pickSkus = [...new Set(expanded.flat().filter((item: { kit_header?: boolean; sku?: string }) => !item.kit_header && item.sku).map((item) => item.sku as string))];
+  const lookup = [...new Set(pickSkus.flatMap((sku) => [sku, componentDisplaySku(sku)]))];
+  const stockBySku = new Map<string, { available_stock: number; location_code: string | null }>();
+  if (lookup.length) {
+    const stock = await query(
+      `SELECT wi.product_sku,
+              COALESCE(SUM(wi.quantity), 0)::int AS available_stock,
+              (ARRAY_AGG(wl.location_code ORDER BY wi.quantity DESC NULLS LAST))[1] AS location_code
+       FROM warehouse_inventory wi
+       LEFT JOIN warehouse_locations wl ON wl.id = wi.location_id
+       WHERE wi.product_sku = ANY($1::text[])
+       GROUP BY wi.product_sku`,
+      [lookup]
+    );
+    for (const row of stock.rows) {
+      stockBySku.set(row.product_sku, {
+        available_stock: Number(row.available_stock) || 0,
+        location_code: row.location_code || null,
+      });
+    }
+  }
+
+  return expanded.map((items) => items.map((item) => {
+    if ((item as { kit_header?: boolean }).kit_header) return { ...item, available_stock: null };
+    const stock = stockBySku.get(item.sku) || stockBySku.get(componentDisplaySku(item.sku));
+    return {
+      ...item,
+      available_stock: stock?.available_stock ?? 0,
+      location_code: (item as { location_code?: string | null }).location_code || stock?.location_code || null,
+    };
   }));
 }

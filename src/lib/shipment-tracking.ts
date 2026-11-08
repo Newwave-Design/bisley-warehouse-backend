@@ -7,8 +7,10 @@ import { rootMedusaOrderId } from './order-values.js';
  * Customer tracking for a shipped order.
  * APC's live page reads the 22-digit consignment id. The older track-parcel.php
  * address now redirects away and drops the number.
- * DX's tracking page reads the parcel tracking number and the delivery postcode
- * with the space removed.
+ * DX Freight tracking reads the consignment (a letter plus 7 digits, or 8 digits)
+ * and the delivery postcode with the space removed. The box barcode is that
+ * consignment plus a piece suffix, and the old my.dxdelivery.com query does not
+ * open it.
  */
 
 type Piece = { trackingNumber?: string; [key: string]: unknown };
@@ -50,14 +52,22 @@ export function apcCustomerTracking(waybill: string): StoredTracking | null {
   };
 }
 
-export function dxCustomerTracking(code: string, postcode: string): StoredTracking | null {
-  const number = code.replace(/\s+/g, '');
+export function dxCustomerTracking(consignment: string, postcode: string): StoredTracking | null {
+  const number = consignment.replace(/\s+/g, '').toUpperCase();
   const tpc = compactPostcode(postcode);
-  if (number.length < 6 || tpc.length < 5) return null;
+  if (!/^[A-Z]\d{7}$|^\d{8}$/.test(number) || tpc.length < 5) return null;
   return {
     number,
-    url: `https://my.dxdelivery.com/?tn=${encodeURIComponent(number)}&tpc=${encodeURIComponent(tpc)}`,
+    url: `https://dx-track.com/track/dx.aspx?consno=${encodeURIComponent(number)}&postcode=${encodeURIComponent(tpc)}`,
   };
+}
+
+function dxConsignment(waybill: string, pieceNumber: string): string {
+  const stored = waybill.replace(/\s+/g, '').toUpperCase();
+  if (/^[A-Z]\d{7}$|^\d{8}$/.test(stored)) return stored;
+  const piece = pieceNumber.replace(/\s+/g, '').toUpperCase();
+  const fromPiece = piece.slice(0, 8);
+  return /^[A-Z]\d{7}$|^\d{8}$/.test(fromPiece) ? fromPiece : '';
 }
 
 function pieceNumbers(pieces: Piece[] | null): string[] {
@@ -82,7 +92,7 @@ function trackingFor(row: BookingRow, fetched: string[]): StoredTracking | null 
   const waybill = text(row.waybill);
   const numbers = fetched.length ? fetched : pieceNumbers(row.pieces);
   if (courier === 'APC') return apcCustomerTracking(waybill);
-  if (courier === 'DX') return dxCustomerTracking(numbers[0] || waybill, text(row.delivery_postcode));
+  if (courier === 'DX') return dxCustomerTracking(dxConsignment(waybill, numbers[0] || ''), text(row.delivery_postcode));
   return null;
 }
 
@@ -149,7 +159,7 @@ export async function rememberShipmentTracking(pickListId?: string): Promise<{ f
             pl.medusa_order_id, pl.medusa_fulfillment_id, pl.is_sandbox,
             b.courier, b.waybill, b.delivery_postcode, b.apc_order_number, b.pieces
      FROM pick_lists pl
-     JOIN collection_bookings b ON b.pick_list_id = pl.id AND b.status <> 'cancelled'
+     JOIN collection_bookings b ON b.pick_list_id = pl.id AND b.status <> 'cancelled' AND COALESCE(b.direction, 'outbound') <> 'return'
      WHERE NOT pl.is_archived
        AND pl.status <> 'CANCELLED'
        AND b.courier IN ('APC', 'DX')
