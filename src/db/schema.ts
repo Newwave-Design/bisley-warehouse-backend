@@ -1567,6 +1567,7 @@ CREATE TABLE IF NOT EXISTS return_requests (
   pick_list_id UUID NOT NULL REFERENCES pick_lists(id) ON DELETE CASCADE,
   sku VARCHAR(120) NOT NULL,
   status VARCHAR(20) NOT NULL DEFAULT 'requested',
+  outcome VARCHAR(20),
   booking_id UUID REFERENCES collection_bookings(id) ON DELETE SET NULL,
   created_by VARCHAR(255),
   created_at TIMESTAMP DEFAULT NOW(),

@@ -740,6 +740,13 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         });
       }
     }
+    if (returning && outcome === 'refund') {
+      for (const sku of rowSkus) {
+        await releaseReturnReplacement(pickListId, sku).catch((error) => {
+          console.warn('Removing the replacement pick failed', error instanceof Error ? error.message : 'failed');
+        });
+      }
+    }
     if (returning) {
       for (const row of saved) {
         await markReturnRequestsBooked(pickListId, row.sku, row.id).catch((error) => {

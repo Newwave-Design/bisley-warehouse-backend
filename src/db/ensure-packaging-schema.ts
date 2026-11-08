@@ -277,6 +277,7 @@ export async function ensurePackagingSchema() {
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_return_requests_open
       ON return_requests (pick_list_id, sku)
       WHERE status <> 'cancelled'`,
+    `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS outcome VARCHAR(20)`,
   ];
 
   for (const sql of statements) {

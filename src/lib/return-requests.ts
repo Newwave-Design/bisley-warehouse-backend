@@ -2,6 +2,7 @@
  * A return request is the queue for the warehouse. Booking the collection comes after.
  */
 import { query } from '../db/index.js';
+import { openReturnReplacement, releaseReturnReplacement } from './return-replacement.js';
 
 const RETURNABLE = ['DISPATCHED', 'PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED'];
 
@@ -21,7 +22,7 @@ export async function listReturnRequests(pickListId?: string) {
     where += ` AND r.pick_list_id = $1`;
   }
   const result = await query(
-    `SELECT r.id, r.pick_list_id, r.sku, r.status, r.booking_id, r.created_by, r.created_at,
+    `SELECT r.id, r.pick_list_id, r.sku, r.status, r.outcome, r.booking_id, r.created_by, r.created_at,
             pli.item_title
        FROM return_requests r
        LEFT JOIN LATERAL (
@@ -49,8 +50,10 @@ async function skusOnList(pickListId: string): Promise<string[]> {
   return items.rows.map((row: { product_sku: string }) => row.product_sku);
 }
 
-/** Mark the whole order, or the given items, as waiting for a return collection. */
-export async function requestReturns(pickListId: string, skus: string[] | null, actor: string) {
+/** Mark the whole order, or the given items, as waiting for a return collection. A replacement goes straight to To pick. */
+export async function requestReturns(pickListId: string, skus: string[] | null, actor: string, outcome: string) {
+  const choice = outcome === 'replace' ? 'replace' : outcome === 'refund' ? 'refund' : '';
+  if (!choice) throw new ReturnRequestError('Choose whether this return is a refund or a replacement.');
   const found = await query(`SELECT id, status FROM pick_lists WHERE id = $1`, [pickListId]);
   const list = found.rows[0];
   if (!list) throw new ReturnRequestError('Unknown order', 404);
@@ -65,11 +68,15 @@ export async function requestReturns(pickListId: string, skus: string[] | null, 
 
   for (const sku of wanted) {
     await query(
-      `INSERT INTO return_requests (pick_list_id, sku, created_by)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (pick_list_id, sku) WHERE status <> 'cancelled' DO NOTHING`,
-      [pickListId, sku, actor.slice(0, 255)]
+      `INSERT INTO return_requests (pick_list_id, sku, created_by, outcome)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (pick_list_id, sku) WHERE status <> 'cancelled'
+       DO UPDATE SET outcome = EXCLUDED.outcome, updated_at = NOW()
+       WHERE return_requests.status = 'requested'`,
+      [pickListId, sku, actor.slice(0, 255), choice]
     );
+    if (choice === 'replace') await openReturnReplacement(pickListId, sku);
+    else await releaseReturnReplacement(pickListId, sku);
   }
   return listReturnRequests(pickListId);
 }
@@ -78,12 +85,18 @@ export async function requestReturns(pickListId: string, skus: string[] | null, 
 export async function cancelReturnRequests(pickListId: string, skus: string[]) {
   const wanted = [...new Set(skus.map((sku) => sku.trim()).filter(Boolean))];
   if (!wanted.length) throw new ReturnRequestError('Choose an item to remove.');
+  const replacing = await query(
+    `SELECT sku FROM return_requests
+      WHERE pick_list_id = $1 AND sku = ANY($2::text[]) AND status = 'requested' AND outcome = 'replace'`,
+    [pickListId, wanted]
+  );
   await query(
     `UPDATE return_requests
         SET status = 'cancelled', updated_at = NOW()
       WHERE pick_list_id = $1 AND sku = ANY($2::text[]) AND status = 'requested'`,
     [pickListId, wanted]
   );
+  for (const row of replacing.rows) await releaseReturnReplacement(pickListId, row.sku);
   return listReturnRequests(pickListId);
 }
 

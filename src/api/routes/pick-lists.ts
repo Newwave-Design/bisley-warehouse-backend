@@ -857,7 +857,7 @@ router.get('/return-requests', authMiddleware, async (req: Request, res: Respons
 router.post('/:pickListId/return-requests', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const body = Array.isArray(req.body?.skus) ? req.body.skus.map((sku: unknown) => String(sku)) : null;
-    const requests = await requestReturns(req.params.pickListId, body, req.user?.email || '');
+    const requests = await requestReturns(req.params.pickListId, body, req.user?.email || '', String(req.body?.outcome || ''));
     return res.status(201).json({ requests });
   } catch (error) {
     if (error instanceof ReturnRequestError) return res.status(error.status).json({ error: error.message });
