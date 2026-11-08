@@ -146,13 +146,13 @@ async function createShipment(orderId: string, fulfillmentId: string, trackingNu
 /** Create (or reuse) a Medusa fulfillment so a WMS "Shipped" order is fulfilled on the shop. */
 export async function fulfillPickListInMedusa(pickListId: string): Promise<MedusaFulfillResult> {
   const pl = await query(
-    `SELECT id, medusa_order_id, medusa_fulfillment_id, tracking_number, tracking_url, is_sandbox, status
+    `SELECT id, medusa_order_id, medusa_fulfillment_id, tracking_number, tracking_url, is_sandbox, status, is_return
      FROM pick_lists WHERE id = $1`,
     [pickListId]
   );
   const pickList = pl.rows[0];
   if (!pickList) return { ok: false, error: 'Pick list not found' };
-  if (pickList.is_sandbox) return { ok: true, skipped: true };
+  if (pickList.is_sandbox || pickList.is_return) return { ok: true, skipped: true };
   if (!pickList.medusa_order_id || !String(pickList.medusa_order_id).startsWith('order_')) {
     return { ok: true, skipped: true };
   }

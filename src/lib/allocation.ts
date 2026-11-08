@@ -66,6 +66,7 @@ const DEMAND_SQL = `
     AND (NOT pli.is_archived OR (pl.is_archived AND pl.status = 'DISPATCHED'))
     AND (NOT pl.is_archived OR pl.status = 'DISPATCHED')
     AND pl.status <> 'CANCELLED'
+    AND NOT COALESCE(pl.is_return, false)
     AND (pl.status = 'DISPATCHED' OR pl.payment_status IN ('captured', 'partially_refunded') OR COALESCE(pl.purchase_order_number, '') <> '')
     AND pli.product_sku NOT LIKE 'FINSAMPLE-%'
     AND pli.quantity_required > 0

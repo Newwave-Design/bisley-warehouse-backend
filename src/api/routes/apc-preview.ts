@@ -11,6 +11,27 @@ import { rememberShipmentTracking } from '../../lib/shipment-tracking.js';
 import { returnStockForCancelledCollection, takeStockForBookedCollection } from '../../lib/collection-stock.js';
 import { fitZpl } from '../../lib/zpl-fit.js';
 import { addDxConsignment, deleteDxConsignment, dxConfigured, DxError, fetchDxLabels, quoteDxCollection } from '../../lib/dx-freight.js';
+import { openReturnReplacement, releaseReturnReplacement } from '../../lib/return-replacement.js';
+import { markReturnRequestsBooked, reopenReturnRequests } from '../../lib/return-requests.js';
+
+async function dropReplacements(pickListId: string | undefined, waybill: string) {
+  if (!pickListId || !waybill) return;
+  const rows = await query(
+    `SELECT sku, outcome FROM collection_bookings
+      WHERE pick_list_id = $1 AND waybill = $2 AND status <> 'cancelled'
+        AND COALESCE(direction, 'outbound') = 'return'`,
+    [pickListId, waybill]
+  );
+  for (const row of rows.rows) {
+    await reopenReturnRequests(pickListId, row.sku).catch((error) => {
+      console.warn('Reopening the return request failed', error instanceof Error ? error.message : 'failed');
+    });
+    if (row.outcome !== 'replace') continue;
+    await releaseReturnReplacement(pickListId, row.sku).catch((error) => {
+      console.warn('Removing the replacement pick failed', error instanceof Error ? error.message : 'failed');
+    });
+  }
+}
 
 const router = express.Router();
 const QUOTE_URL = 'https://apc.hypaship.com/api/3.0/ServiceAvailability.json';
@@ -667,6 +688,22 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     }
 
     console.log(`${courier} ${returning ? 'return ' : ''}collection booked ${waybill} for pick list ${pickListId}`);
+    let replacement: { id: string; pick_list_number: string } | null = null;
+    if (returning && outcome === 'replace') {
+      for (const sku of rowSkus) {
+        replacement = await openReturnReplacement(pickListId, sku).catch((error) => {
+          console.warn('Opening the replacement pick failed', error instanceof Error ? error.message : 'failed');
+          return replacement;
+        });
+      }
+    }
+    if (returning) {
+      for (const row of saved) {
+        await markReturnRequestsBooked(pickListId, row.sku, row.id).catch((error) => {
+          console.warn('Marking the return request booked failed', error instanceof Error ? error.message : 'failed');
+        });
+      }
+    }
     if (!returning) {
       await rememberShipmentTracking(pickListId).catch((error) => {
         console.warn('Saving shipment tracking failed', error instanceof Error ? error.message : 'failed');
@@ -678,7 +715,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         console.warn('Shipping today\'s collections failed', error instanceof Error ? error.message : 'failed');
       });
     }
-    return res.status(201).json({ booked: true, waybill, bookings: saved });
+    return res.status(201).json({ booked: true, waybill, bookings: saved, replacement });
   } catch (error) {
     console.error('Collection booking failed', error instanceof Error ? error.message : 'request failed');
     return res.status(502).json({ error: `Could not reach ${courier}. Nothing was saved.` });
@@ -815,6 +852,7 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
         const message = error instanceof Error ? error.message : 'DX did not cancel the collection. It is still booked here.';
         return res.status(502).json({ error: message });
       }
+      await dropReplacements(booking.pick_list_id, waybill);
       await query(
         `UPDATE collection_bookings
             SET status = 'cancelled', updated_at = NOW()
@@ -865,6 +903,7 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
       return res.status(502).json({ error: message.detail || 'APC did not cancel the collection. It is still booked here.' });
     }
 
+    await dropReplacements(booking.pick_list_id, waybill);
     await query(
       `UPDATE collection_bookings
           SET status = 'cancelled', updated_at = NOW()

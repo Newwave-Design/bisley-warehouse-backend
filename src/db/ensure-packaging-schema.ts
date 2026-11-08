@@ -254,6 +254,29 @@ export async function ensurePackagingSchema() {
       created_at TIMESTAMP DEFAULT NOW(),
       UNIQUE (entity, field_key)
     )`,
+    `ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_return BOOLEAN NOT NULL DEFAULT false`,
+    `CREATE TABLE IF NOT EXISTS stock_preempts (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      pick_list_item_id UUID NOT NULL REFERENCES pick_list_items(id) ON DELETE CASCADE,
+      from_pick_list_item_id UUID NOT NULL REFERENCES pick_list_items(id) ON DELETE CASCADE,
+      sku VARCHAR(100) NOT NULL,
+      qty INT NOT NULL CHECK (qty > 0),
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE (pick_list_item_id, from_pick_list_item_id, sku)
+    )`,
+    `CREATE TABLE IF NOT EXISTS return_requests (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      pick_list_id UUID NOT NULL REFERENCES pick_lists(id) ON DELETE CASCADE,
+      sku VARCHAR(120) NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'requested',
+      booking_id UUID REFERENCES collection_bookings(id) ON DELETE SET NULL,
+      created_by VARCHAR(255),
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_return_requests_open
+      ON return_requests (pick_list_id, sku)
+      WHERE status <> 'cancelled'`,
   ];
 
   for (const sql of statements) {

@@ -25,6 +25,8 @@ import { buildSampleAddressZpl, formatSampleAddressLabel, formatShippingAddressT
 import { attachPackaging } from '../../lib/pick-list-packaging.js';
 import { expandKitPicksByList } from '../../lib/pick-list-kits.js';
 import { confirmPartFulfilment, inspectPartFulfilment, PartFulfilError } from '../../lib/part-fulfilment.js';
+import { stockReservations, takeReservedItem } from '../../lib/stock-reservations.js';
+import { cancelReturnRequests, listReturnRequests, requestReturns, ReturnRequestError } from '../../lib/return-requests.js';
 
 const router = express.Router();
 
@@ -302,10 +304,12 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.medusa_order_id,
          pl.status,
          pl.created_at,
-         COALESCE(
+         pl.is_return,
+         CASE WHEN COALESCE(pl.is_return, false) THEN pl.created_at
+         ELSE COALESCE(
            (SELECT parent.created_at FROM pick_lists parent WHERE parent.id = pl.parent_pick_list_id),
            pl.created_at
-         ) AS order_date,
+         ) END AS order_date,
          pl.customer_name,
          pl.customer_email,
          pl.shipping_address,
@@ -835,6 +839,64 @@ router.post('/:pickListId/packages/:packageNumber/ups-label', authMiddleware, as
   } catch (error) {
     console.error('UPS label generation error:', error)
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to generate UPS label' })
+  }
+});
+
+/** GET /api/pick-lists/return-requests — orders and items waiting for a return collection. */
+router.get('/return-requests', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const pickListId = String(req.query.pickListId || '').trim();
+    return res.json({ requests: await listReturnRequests(pickListId || undefined) });
+  } catch (error) {
+    console.error('Return requests failed', error instanceof Error ? error.message : error);
+    return res.status(500).json({ error: 'Could not load return requests.' });
+  }
+});
+
+/** POST /api/pick-lists/:pickListId/return-requests — mark the order, or the given items, for return. */
+router.post('/:pickListId/return-requests', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const body = Array.isArray(req.body?.skus) ? req.body.skus.map((sku: unknown) => String(sku)) : null;
+    const requests = await requestReturns(req.params.pickListId, body, req.user?.email || '');
+    return res.status(201).json({ requests });
+  } catch (error) {
+    if (error instanceof ReturnRequestError) return res.status(error.status).json({ error: error.message });
+    console.error('Creating a return request failed', error instanceof Error ? error.message : error);
+    return res.status(500).json({ error: 'Could not mark this return.' });
+  }
+});
+
+/** POST /api/pick-lists/:pickListId/return-requests/cancel — take an unbooked request off the list. */
+router.post('/:pickListId/return-requests/cancel', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const skus = Array.isArray(req.body?.skus) ? req.body.skus.map((sku: unknown) => String(sku)) : [];
+    return res.json({ requests: await cancelReturnRequests(req.params.pickListId, skus) });
+  } catch (error) {
+    if (error instanceof ReturnRequestError) return res.status(error.status).json({ error: error.message });
+    console.error('Cancelling a return request failed', error instanceof Error ? error.message : error);
+    return res.status(500).json({ error: 'Could not remove that return request.' });
+  }
+});
+
+/** GET /api/pick-lists/:pickListId/stock-reservations — on-hand stock and the other orders holding it. */
+router.get('/:pickListId/stock-reservations', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    return res.json(await stockReservations(req.params.pickListId));
+  } catch (error) {
+    console.error('Stock reservations failed', error instanceof Error ? error.message : error);
+    return res.status(500).json({ error: 'Could not check which order has this item reserved.' });
+  }
+});
+
+/** POST /api/pick-lists/:pickListId/take-reserved — give one reserved unit to this return. */
+router.post('/:pickListId/take-reserved', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const result = await takeReservedItem(req.params.pickListId, String(req.body?.fromItemId || ''), String(req.body?.sku || ''));
+    if (!result.ok) return res.status(409).json({ error: result.error });
+    return res.json(await stockReservations(req.params.pickListId));
+  } catch (error) {
+    console.error('Taking reserved stock failed', error instanceof Error ? error.message : error);
+    return res.status(500).json({ error: 'Could not take that item from the other order.' });
   }
 });
 

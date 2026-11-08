@@ -23,6 +23,9 @@ export interface HoldDemand {
 
 export interface PlannedHold { itemId: string; sku: string; qty: number }
 
+/** Move unpicked stock from one open order onto another. Already picked units stay where they are. */
+export interface HoldClaim { itemId: string; fromItemId: string; sku: string; qty: number }
+
 const SAMPLE = /SAMPLE/i;
 
 export function kitParts(parentSku: string, raw: unknown): HoldPart[] {
@@ -40,8 +43,13 @@ function taken(line: HoldDemand, sku: string, per: number): number {
   return Math.max(line.picked * per, line.scanned.get(sku) ?? 0);
 }
 
-/** Pure assignment. `onHand` is the physical quantity still in the warehouse. */
-export function planHolds(lines: HoldDemand[], onHand: Map<string, number>): PlannedHold[] {
+function demandFor(line: HoldDemand, sku: string, per: number): number {
+  if (line.parts.length) return Math.max(0, line.required - line.picked) * per;
+  return Math.max(0, line.required * per - taken(line, sku, per));
+}
+
+/** Pure assignment. `onHand` is the physical quantity still in the warehouse. Claims are satisfied before older orders. */
+export function planHolds(lines: HoldDemand[], onHand: Map<string, number>, claims: HoldClaim[] = []): PlannedHold[] {
   const committed = new Map<string, number>();
   const add = (sku: string, qty: number) => committed.set(sku, (committed.get(sku) ?? 0) + qty);
   for (const line of lines) {
@@ -57,6 +65,33 @@ export function planHolds(lines: HoldDemand[], onHand: Map<string, number>): Pla
     free.set(sku, Math.max(0, (onHand.get(sku) ?? 0) - (committed.get(sku) ?? 0)));
   }
 
+  const byId = new Map(lines.map((line) => [line.itemId, line]));
+  const grant = new Map<string, number>();
+  const claimKey = (itemId: string, sku: string) => `${itemId}\n${sku}`;
+  for (const claim of claims) {
+    const donor = byId.get(claim.fromItemId);
+    const receiver = byId.get(claim.itemId);
+    const sku = claim.sku;
+    const qty = Math.max(0, Math.round(claim.qty));
+    if (!donor || !receiver || !sku || qty <= 0 || donor.itemId === receiver.itemId) continue;
+    const donorPart = donor.parts.find((part) => part.sku === sku);
+    const receiverPart = receiver.parts.find((part) => part.sku === sku);
+    const donorPer = donorPart ? donorPart.per : (!donor.parts.length && donor.sku === sku ? 1 : 0);
+    const receiverPer = receiverPart ? receiverPart.per : (!receiver.parts.length && receiver.sku === sku ? 1 : 0);
+    if (!donorPer || !receiverPer) continue;
+    const fromKey = `from:${claimKey(donor.itemId, sku)}`;
+    const toKey = claimKey(receiver.itemId, sku);
+    const usedFrom = grant.get(fromKey) ?? 0;
+    const usedTo = grant.get(toKey) ?? 0;
+    const room = Math.max(0, demandFor(donor, sku, donorPer) - usedFrom);
+    const receiverRoom = Math.max(0, demandFor(receiver, sku, receiverPer) - usedTo);
+    const give = Math.min(qty, room, receiverRoom, Math.max(0, free.get(sku) ?? 0));
+    if (give <= 0) continue;
+    grant.set(fromKey, usedFrom + give);
+    grant.set(toKey, usedTo + give);
+    free.set(sku, (free.get(sku) ?? 0) - give);
+  }
+
   const ordered = [...lines].sort((a, b) => a.orderedAt - b.orderedAt || a.pickListNumber.localeCompare(b.pickListNumber) || a.lineNumber - b.lineNumber);
   const holds: PlannedHold[] = [];
   for (const line of ordered) {
@@ -64,14 +99,17 @@ export function planHolds(lines: HoldDemand[], onHand: Map<string, number>): Pla
       let extra = Math.max(0, line.required - line.picked);
       for (const part of line.parts) extra = Math.min(extra, Math.floor((free.get(part.sku) ?? 0) / part.per));
       for (const part of line.parts) {
-        const qty = taken(line, part.sku, part.per) + extra * part.per;
+        const granted = grant.get(claimKey(line.itemId, part.sku)) ?? 0;
+        const qty = Math.min(line.required * part.per, taken(line, part.sku, part.per) + extra * part.per + granted);
         if (qty > 0) holds.push({ itemId: line.itemId, sku: part.sku, qty });
         free.set(part.sku, (free.get(part.sku) ?? 0) - extra * part.per);
       }
     } else {
       const have = taken(line, line.sku, 1);
-      const extra = Math.min(Math.max(0, line.required - have), free.get(line.sku) ?? 0);
-      if (have + extra > 0) holds.push({ itemId: line.itemId, sku: line.sku, qty: have + extra });
+      const granted = grant.get(claimKey(line.itemId, line.sku)) ?? 0;
+      const extra = Math.min(Math.max(0, line.required - have - granted), free.get(line.sku) ?? 0);
+      const qty = have + extra + granted;
+      if (qty > 0) holds.push({ itemId: line.itemId, sku: line.sku, qty });
       free.set(line.sku, (free.get(line.sku) ?? 0) - extra);
     }
   }
@@ -86,7 +124,9 @@ async function computeHolds(): Promise<void> {
   const demand = await query(
     `SELECT pli.id AS item_id, pli.line_number, pli.product_sku, pli.quantity_required, pli.quantity_picked,
             pli.is_custom, wp.kit_components,
-            pl.pick_list_number, COALESCE(parent.created_at, pl.created_at) AS ordered_at
+            pl.pick_list_number,
+            CASE WHEN COALESCE(pl.is_return, false) THEN pl.created_at
+                 ELSE COALESCE(parent.created_at, pl.created_at) END AS ordered_at
        FROM pick_list_items pli
        JOIN pick_lists pl ON pl.id = pli.pick_list_id
        LEFT JOIN pick_lists parent ON parent.id = pl.parent_pick_list_id
@@ -148,7 +188,26 @@ async function computeHolds(): Promise<void> {
     for (const row of stock.rows) onHand.set(row.product_sku, Number(row.qty) || 0);
   }
 
-  const holds = planHolds(lines, onHand);
+  const claims: HoldClaim[] = [];
+  if (lines.length) {
+    const claimed = await query(
+      `SELECT pick_list_item_id, from_pick_list_item_id, sku, qty
+         FROM stock_preempts
+        WHERE pick_list_item_id = ANY($1::uuid[])
+          AND from_pick_list_item_id = ANY($1::uuid[])`,
+      [lines.map((line) => line.itemId)]
+    );
+    for (const row of claimed.rows) {
+      claims.push({
+        itemId: row.pick_list_item_id,
+        fromItemId: row.from_pick_list_item_id,
+        sku: row.sku,
+        qty: Number(row.qty) || 0,
+      });
+    }
+  }
+
+  const holds = planHolds(lines, onHand, claims);
   const client = await getPool().connect();
   try {
     await client.query('BEGIN');

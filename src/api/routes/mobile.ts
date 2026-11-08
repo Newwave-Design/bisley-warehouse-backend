@@ -297,16 +297,17 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
 
     const result = await query(`
       SELECT
-        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at,
+        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at, pl.is_return,
         (SELECT parent.pick_list_number FROM pick_lists parent
           WHERE parent.id = pl.parent_pick_list_id AND pl.medusa_order_id LIKE '%-PF%') AS part_of_number,
         (SELECT string_agg(child.pick_list_number, ', ' ORDER BY child.created_at)
            FROM pick_lists child
           WHERE child.parent_pick_list_id = pl.id AND child.medusa_order_id LIKE '%-PF%') AS part_numbers,
-        COALESCE(
+        CASE WHEN COALESCE(pl.is_return, false) THEN pl.created_at
+        ELSE COALESCE(
           (SELECT parent.created_at FROM pick_lists parent WHERE parent.id = pl.parent_pick_list_id),
           pl.created_at
-        ) AS order_date,
+        ) END AS order_date,
         pl.customer_name, pl.shipping_address,
         EXISTS (SELECT 1 FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL) AS has_flag,
         (SELECT LEFT(pln.note_text, 120) FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL ORDER BY pln.created_at DESC LIMIT 1) AS flag_preview,
@@ -334,7 +335,7 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
       WHERE pl.is_archived = false AND ${paidSql('pl')} AND ($1::text[] IS NULL OR pl.status = ANY($1::text[]))
       ${sampleClause}
       GROUP BY pl.id
-      ORDER BY order_date ${orderDir}
+      ORDER BY CASE WHEN COALESCE(pl.is_return, false) AND pl.status IN ('PENDING', 'IN_PROGRESS', 'AWAITING_STOCK') THEN 0 ELSE 1 END, order_date ${orderDir}
     `, [statuses]);
     const ids = result.rows.map((r: any) => r.id);
     const [dues, revisedAt, kits, stockTimes] = await Promise.all([
@@ -419,7 +420,7 @@ async function attachMobilePackaging(rows: any[]) {
 router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const pl = await query(`
-      SELECT pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at,
+      SELECT pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at, pl.is_return,
              pl.customer_name, pl.customer_email, pl.shipping_address,
              (SELECT parent.pick_list_number FROM pick_lists parent
                WHERE parent.id = pl.parent_pick_list_id AND pl.medusa_order_id LIKE '%-PF%') AS part_of_number,

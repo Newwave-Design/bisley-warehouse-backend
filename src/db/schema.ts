@@ -376,6 +376,7 @@ ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_vat_gbp DECIMAL(10,2);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_refunded_gbp DECIMAL(10,2);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_currency VARCHAR(10);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_value_checked_at TIMESTAMP;
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_return BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_pick_lists_parent ON pick_lists(parent_pick_list_id);
 CREATE INDEX IF NOT EXISTS idx_pick_lists_archived ON pick_lists(is_archived);
 
@@ -1548,6 +1549,32 @@ CREATE TABLE IF NOT EXISTS order_stock_holds (
   PRIMARY KEY (pick_list_item_id, sku)
 );
 CREATE INDEX IF NOT EXISTS idx_order_stock_holds_sku ON order_stock_holds (sku);
+
+-- A return replacement has been given units that were held for another open order.
+CREATE TABLE IF NOT EXISTS stock_preempts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  pick_list_item_id UUID NOT NULL REFERENCES pick_list_items(id) ON DELETE CASCADE,
+  from_pick_list_item_id UUID NOT NULL REFERENCES pick_list_items(id) ON DELETE CASCADE,
+  sku VARCHAR(100) NOT NULL,
+  qty INT NOT NULL CHECK (qty > 0),
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE (pick_list_item_id, from_pick_list_item_id, sku)
+);
+
+-- A return request sits on the Returns tab until the warehouse books the collection.
+CREATE TABLE IF NOT EXISTS return_requests (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  pick_list_id UUID NOT NULL REFERENCES pick_lists(id) ON DELETE CASCADE,
+  sku VARCHAR(120) NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'requested',
+  booking_id UUID REFERENCES collection_bookings(id) ON DELETE SET NULL,
+  created_by VARCHAR(255),
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_return_requests_open
+  ON return_requests (pick_list_id, sku)
+  WHERE status <> 'cancelled';
 
 -- A week (Friday to Thursday) becomes fixed once locked: its statement lines are copied here and never change
 CREATE TABLE IF NOT EXISTS settlement_weeks (
