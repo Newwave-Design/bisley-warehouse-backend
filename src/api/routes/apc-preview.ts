@@ -10,7 +10,7 @@ import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { rememberShipmentTracking } from '../../lib/shipment-tracking.js';
 import { returnStockForCancelledCollection, takeStockForBookedCollection } from '../../lib/collection-stock.js';
 import { fitZpl } from '../../lib/zpl-fit.js';
-import { addDxConsignment, deleteDxConsignment, dxConfigured, DxError, fetchDxLabels, quoteDxCollection } from '../../lib/dx-freight.js';
+import { addDxCollection, addDxConsignment, deleteDxConsignment, dxConfigured, DxError, fetchDxLabels, quoteDxCollection } from '../../lib/dx-freight.js';
 import { openReturnReplacement, releaseReturnReplacement } from '../../lib/return-replacement.js';
 import { markReturnRequestsBooked, reopenReturnRequests } from '../../lib/return-requests.js';
 
@@ -139,6 +139,25 @@ function text(value: unknown, fallback = ''): string {
   return String(value);
 }
 
+async function deliveredCourier(pickListId: string): Promise<'APC' | 'DX'> {
+  const booked = await query(
+    `SELECT courier FROM collection_bookings
+      WHERE pick_list_id = $1 AND status <> 'cancelled'
+        AND COALESCE(direction, 'outbound') <> 'return'
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [pickListId]
+  );
+  const fromBooking = text(booked.rows[0]?.courier).toUpperCase();
+  if (fromBooking === 'DX' || fromBooking === 'APC') return fromBooking;
+  const list = await query(
+    `SELECT shipping_method_name, selected_courier_code FROM pick_lists WHERE id = $1`,
+    [pickListId]
+  );
+  const blob = `${text(list.rows[0]?.shipping_method_name)} ${text(list.rows[0]?.selected_courier_code)}`.toUpperCase();
+  return blob.includes('DX') ? 'DX' : 'APC';
+}
+
 router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) => {
   const pieces = asList<PieceInput>(req.body?.pieces).slice(0, 20);
   const collectionPostcode = text(req.body?.collectionPostcode).trim();
@@ -149,21 +168,22 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
   }
   const returning = text(req.body?.direction).trim().toLowerCase() === 'return';
   const agreedDate = returning ? agreedCollectionDate(req.body?.collectionDate) : '';
-  if (returning && text(req.body?.courier).trim().toUpperCase() === 'DX') {
-    return res.status(400).json({ error: 'A return is collected by APC from the customer.' });
-  }
+  const pickListId = text(req.body?.pickListId).trim();
+  let courier: 'APC' | 'DX' = text(req.body?.courier).trim().toUpperCase() === 'DX' ? 'DX' : 'APC';
+  if (returning && /^[0-9a-f-]{36}$/i.test(pickListId)) courier = await deliveredCourier(pickListId);
   if (returning && !agreedDate) {
     return res.status(400).json({ error: 'Enter the collection date agreed with the customer. It has to be a weekday that has not passed.' });
   }
-  if (text(req.body?.courier).trim().toUpperCase() === 'DX') {
+  if (courier === 'DX') {
     if (!dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
     try {
-      return res.json(quoteDxCollection({
+      const quoted = quoteDxCollection({
         pieces: pieces.length,
         collectionPostcode,
         deliveryPostcode,
-        collectionDate: text(req.body?.collectionDate).trim(),
-      }));
+        collectionDate: returning ? agreedDate : text(req.body?.collectionDate).trim(),
+      });
+      return res.json({ ...quoted, courier });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Could not build DX collection dates';
       return res.status(400).json({ error: message });
@@ -215,6 +235,7 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
       }
       return res.json({
         booked: false,
+        courier,
         pieces: items.length,
         collectionPostcode,
         deliveryPostcode,
@@ -449,10 +470,9 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   const returning = text(req.body?.direction).trim().toLowerCase() === 'return';
   const outcome = text(req.body?.outcome).trim().toLowerCase();
   const agreedDate = returning ? agreedCollectionDate(req.body?.collectionDate) : '';
-  const courier = returning ? 'APC' : (text(req.body?.courier).trim().toUpperCase() === 'DX' ? 'DX' : 'APC');
-  if (returning && text(req.body?.courier).trim().toUpperCase() === 'DX') {
-    return res.status(400).json({ error: 'A return is collected by APC from the customer.' });
-  }
+  const pickListId = text(req.body?.pickListId).trim();
+  let courier: 'APC' | 'DX' = text(req.body?.courier).trim().toUpperCase() === 'DX' ? 'DX' : 'APC';
+  if (returning && /^[0-9a-f-]{36}$/i.test(pickListId)) courier = await deliveredCourier(pickListId);
   if (returning && outcome !== 'refund' && outcome !== 'replace') {
     return res.status(400).json({ error: 'Choose whether this return is a refund or a replacement.' });
   }
@@ -463,7 +483,6 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   if (courier === 'APC' && !remoteUser) return res.status(500).json({ error: 'APC login is not configured' });
   if (courier === 'DX' && !dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
 
-  const pickListId = text(req.body?.pickListId).trim();
   if (!/^[0-9a-f-]{36}$/i.test(pickListId)) return res.status(400).json({ error: 'Choose an order to book' });
   const serviceCode = text(req.body?.serviceCode).trim();
   const serviceName = text(req.body?.serviceName).trim().slice(0, 120);
@@ -528,29 +547,53 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
 
     if (courier === 'DX') {
       try {
-        const booked = await addDxConsignment({
-          reference,
-          serviceCode,
-          collectionDate: text(req.body?.collectionDate).trim(),
-          delivery: {
-            name: delivery.person,
-            company: text(list.shipping_address?.company).trim(),
-            email: delivery.email,
-            phone: delivery.phone,
-            line1: delivery.line1,
-            line2: delivery.line2,
-            city: delivery.city,
-            county: delivery.county,
-            postcode: delivery.postcode,
-          },
-          pieces: pieces.map((piece) => ({
-            title: piece.title,
-            weightKg: Number(piece.weightKg),
-            lengthCm: Number(piece.lengthCm),
-            widthCm: Number(piece.widthCm),
-            heightCm: Number(piece.heightCm),
-          })),
-        });
+        const booked = returning
+          ? await addDxCollection({
+              reference,
+              serviceCode,
+              collectionDate: agreedDate,
+              collection: {
+                name: delivery.person,
+                company: text(list.shipping_address?.company).trim(),
+                email: delivery.email,
+                phone: delivery.phone,
+                line1: delivery.line1,
+                line2: delivery.line2,
+                city: delivery.city,
+                county: delivery.county,
+                postcode: delivery.postcode,
+              },
+              pieces: pieces.map((piece) => ({
+                title: piece.title,
+                weightKg: Number(piece.weightKg),
+                lengthCm: Number(piece.lengthCm),
+                widthCm: Number(piece.widthCm),
+                heightCm: Number(piece.heightCm),
+              })),
+            })
+          : await addDxConsignment({
+              reference,
+              serviceCode,
+              collectionDate: text(req.body?.collectionDate).trim(),
+              delivery: {
+                name: delivery.person,
+                company: text(list.shipping_address?.company).trim(),
+                email: delivery.email,
+                phone: delivery.phone,
+                line1: delivery.line1,
+                line2: delivery.line2,
+                city: delivery.city,
+                county: delivery.county,
+                postcode: delivery.postcode,
+              },
+              pieces: pieces.map((piece) => ({
+                title: piece.title,
+                weightKg: Number(piece.weightKg),
+                lengthCm: Number(piece.lengthCm),
+                widthCm: Number(piece.widthCm),
+                heightCm: Number(piece.heightCm),
+              })),
+            });
         waybill = booked.consignmentNumber;
         orderNumber = booked.routingStream;
         bookedService = booked.serviceCode;

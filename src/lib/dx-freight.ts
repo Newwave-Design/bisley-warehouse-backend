@@ -443,6 +443,122 @@ export async function addDxConsignment(input: {
   };
 }
 
+const WAREHOUSE_DELIVERY: DxDelivery = {
+  name: 'Ovara Products',
+  company: 'Ovara Products Limited',
+  email: '',
+  phone: FALLBACK_PHONE,
+  line1: 'Unit B7A, Brecon House',
+  line2: 'Mamhilad Park Estate',
+  city: 'Pontypool',
+  county: 'Torfaen',
+  postcode: 'NP4 0HZ',
+};
+
+function dxInstant(value: string, hour: number): string {
+  const parsed = parseDmy(value);
+  if (!parsed) throw new DxError('Choose a collection date');
+  return `/Date(${Date.UTC(parsed.year, parsed.month - 1, parsed.day, hour)}+0000)/`;
+}
+
+function dxAccepted(json: any): boolean {
+  return json?.Status === 0 || json?.Status === 'Success';
+}
+
+function responseDay(value: unknown): string {
+  const raw = text(value);
+  if (!raw) return '';
+  const ms = raw.match(/\/Date\((-?\d+)/);
+  const date = ms ? new Date(Number(ms[1])) : new Date(raw);
+  if (Number.isNaN(date.getTime())) return '';
+  return formatDmy(londonParts(date));
+}
+
+/** Collect a return from the customer and deliver it to the warehouse. */
+export async function addDxCollection(input: {
+  reference: string;
+  serviceCode: string;
+  collectionDate: string;
+  collection: DxDelivery;
+  pieces: DxPiece[];
+}): Promise<DxBooked> {
+  const service = SERVICES.find((entry) => entry.code === input.serviceCode);
+  if (!service) throw new DxError('Choose a DX service');
+  const day = parseDmy(input.collectionDate);
+  if (!day || isWeekend(day.weekday)) throw new DxError('DX collects on a weekday');
+  if (dateKey(day) < dateKey(londonParts())) throw new DxError('That collection date has passed');
+  if (!input.pieces.length) throw new DxError('Add at least one box');
+
+  const postcode = input.collection.postcode.toUpperCase().replace(/\s+/g, ' ').trim();
+  if (/^BT/i.test(postcode)) throw new DxError('Northern Ireland needs a customs declaration before DX can collect it');
+  if (postcode.length < 5 || postcode.length > 8) throw new DxError('DX needs a UK postcode');
+  const from = packAddress(input.collection);
+  const to = packAddress(WAREHOUSE_DELIVERY);
+  const name = clipWords(input.collection.company || input.collection.name, 25)[0] || '';
+  const contact = clipWords(input.collection.name || name, 25)[0] || name;
+  if (!from[0] || !name || !contact) throw new DxError('This order needs a name and street before it can be booked');
+
+  const { accountNumber, depot } = account();
+  const weight = input.pieces.reduce((sum, piece) => sum + kg(piece.weightKg), 0);
+  const json = await authed('AddCollection', {
+    CloseTime: dxInstant(input.collectionDate, 17),
+    CollectionAddress1: from[0],
+    CollectionAddress2: from[1] || '',
+    CollectionAddress3: from[2] || '',
+    CollectionAddress4: from[3] || '',
+    CollectionAddress5: from[4] || '',
+    CollectionContact: contact,
+    CollectionCountry: 'GB',
+    CollectionDate: dxInstant(input.collectionDate, 12),
+    CollectionEmail: input.collection.email.slice(0, 100),
+    CollectionName: name,
+    CollectionPhoneNumber: dxPhone(input.collection.phone),
+    CollectionPostcode: postcode,
+    CollectionReference: dxReference(input.reference),
+    DXAccountNumber: accountNumber,
+    DeliverTo: WAREHOUSE_DELIVERY.company,
+    DeliveryAddress1: to[0],
+    DeliveryAddress2: to[1] || '',
+    DeliveryAddress3: to[2] || '',
+    DeliveryAddress4: to[3] || '',
+    DeliveryAddress5: to[4] || '',
+    DeliveryContact: WAREHOUSE_DELIVERY.name,
+    DeliveryCountry: 'GB',
+    DeliveryEmail: '',
+    DeliveryName: clipWords(WAREHOUSE_DELIVERY.company, 25)[0],
+    DeliveryPhoneNumber: FALLBACK_PHONE,
+    DeliveryPostcode: WAREHOUSE_DELIVERY.postcode,
+    DeliveryType: 2,
+    DescriptionOfGoods: dxContentDescription(input.pieces[0]?.title || 'Return'),
+    FreightType: 'F',
+    HowPackaged: 'Carton',
+    ItemCount: input.pieces.length,
+    OrigServiceCentre: depot,
+    ReadyTime: dxInstant(input.collectionDate, 9),
+    ServiceCode: service.code,
+    TotalWeight: weight,
+  });
+  if (!dxAccepted(json) || !json?.ConsignmentNumber) {
+    throw new DxError(text(json?.StatusMessage) || 'DX did not accept the return collection. Nothing was saved.', 502);
+  }
+
+  const consignmentNumber = text(json.ConsignmentNumber);
+  const bookedDay = responseDay(json.CollectionDate);
+  if (bookedDay && bookedDay !== input.collectionDate) {
+    await deleteDxConsignment(consignmentNumber, 'F').catch(() => undefined);
+    throw new DxError(`DX booked ${bookedDay} instead of the agreed date ${input.collectionDate}. That collection was cancelled. Call the customer and agree another date.`, 409);
+  }
+  const trackingNumbers = await fetchDxTrackingNumbers(consignmentNumber, 'F').catch(() => [] as string[]);
+  return {
+    consignmentNumber,
+    routingStream: 'F',
+    serviceCode: service.code,
+    serviceDescription: service.name,
+    trackingNumbers,
+    collectionDate: input.collectionDate,
+  };
+}
+
 export async function fetchDxTrackingNumbers(consignmentNumber: string, routingStream: string): Promise<string[]> {
   const json = await authed('GetConsignmentTrackingInfo', {
     ConsignmentNumber: consignmentNumber,
