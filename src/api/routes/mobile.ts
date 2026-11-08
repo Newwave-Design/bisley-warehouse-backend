@@ -300,6 +300,8 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
         pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at, pl.is_return,
         (SELECT parent.pick_list_number FROM pick_lists parent
           WHERE parent.id = pl.parent_pick_list_id AND pl.medusa_order_id LIKE '%-PF%') AS part_of_number,
+        (SELECT parent.pick_list_number FROM pick_lists parent
+          WHERE parent.id = pl.parent_pick_list_id AND COALESCE(pl.is_return, false)) AS return_of_number,
         (SELECT string_agg(child.pick_list_number, ', ' ORDER BY child.created_at)
            FROM pick_lists child
           WHERE child.parent_pick_list_id = pl.id AND child.medusa_order_id LIKE '%-PF%') AS part_numbers,

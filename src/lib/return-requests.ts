@@ -23,13 +23,26 @@ export async function listReturnRequests(pickListId?: string) {
   }
   const result = await query(
     `SELECT r.id, r.pick_list_id, r.sku, r.status, r.outcome, r.booking_id, r.created_by, r.created_at,
-            pli.item_title
+            pli.item_title, pl.pick_list_number,
+            repl.id AS replacement_id, repl.pick_list_number AS replacement_number, repl.status AS replacement_status
        FROM return_requests r
+       JOIN pick_lists pl ON pl.id = r.pick_list_id
        LEFT JOIN LATERAL (
          SELECT item_title FROM pick_list_items
           WHERE pick_list_id = r.pick_list_id AND product_sku = r.sku AND NOT COALESCE(is_archived, false)
           ORDER BY line_number LIMIT 1
        ) pli ON true
+       LEFT JOIN LATERAL (
+         SELECT c.id, c.pick_list_number, c.status
+           FROM pick_lists c
+           JOIN pick_list_items ci ON ci.pick_list_id = c.id
+            AND ci.product_sku = r.sku AND NOT COALESCE(ci.is_archived, false)
+          WHERE c.parent_pick_list_id = r.pick_list_id
+            AND COALESCE(c.is_return, false)
+            AND c.status <> 'CANCELLED'
+          ORDER BY c.created_at DESC
+          LIMIT 1
+       ) repl ON true
       WHERE ${where}
       ORDER BY r.created_at, r.sku`,
     params

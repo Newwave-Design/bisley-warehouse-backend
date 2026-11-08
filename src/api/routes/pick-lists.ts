@@ -322,6 +322,10 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.purchase_order_number,
          (SELECT parent.pick_list_number FROM pick_lists parent
            WHERE parent.id = pl.parent_pick_list_id AND pl.medusa_order_id LIKE '%-PF%') AS part_of_number,
+         (SELECT parent.id FROM pick_lists parent
+           WHERE parent.id = pl.parent_pick_list_id AND COALESCE(pl.is_return, false)) AS return_of_id,
+         (SELECT parent.pick_list_number FROM pick_lists parent
+           WHERE parent.id = pl.parent_pick_list_id AND COALESCE(pl.is_return, false)) AS return_of_number,
          (SELECT string_agg(child.pick_list_number, ', ' ORDER BY child.created_at)
             FROM pick_lists child
            WHERE child.parent_pick_list_id = pl.id AND child.medusa_order_id LIKE '%-PF%') AS part_numbers,
@@ -955,9 +959,9 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
     // Related backorder split — either the list this one was split off, or lists split off it
     const [parentResult, childrenResult] = await Promise.all([
       pickList.parent_pick_list_id
-        ? query(`SELECT id, pick_list_number, status, customer_name, medusa_order_id FROM pick_lists WHERE id = $1`, [pickList.parent_pick_list_id])
+        ? query(`SELECT id, pick_list_number, status, customer_name, medusa_order_id, is_return FROM pick_lists WHERE id = $1`, [pickList.parent_pick_list_id])
         : Promise.resolve({ rows: [] as any[] }),
-      query(`SELECT id, pick_list_number, status, customer_name, medusa_order_id FROM pick_lists WHERE parent_pick_list_id = $1`, [pickListId]),
+      query(`SELECT id, pick_list_number, status, customer_name, medusa_order_id, is_return FROM pick_lists WHERE parent_pick_list_id = $1`, [pickListId]),
     ]);
 
     const stockStatus = await getPickListStockStatus(pickListId);
