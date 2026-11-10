@@ -100,9 +100,8 @@ async function sharesOrder(orderId: string, pickListId: string): Promise<boolean
   return result.rows.length > 0;
 }
 
-async function createFulfillment(orderId: string, items: { id: string; quantity: number }[], notify: boolean): Promise<string> {
-  const metadata = notify ? undefined : { dispatch_email: 'on_shipment' };
-  const body = { items, location_id: LOCATION_ID, no_notification: !notify, ...(metadata ? { metadata } : {}) };
+async function createFulfillment(orderId: string, items: { id: string; quantity: number }[]): Promise<string> {
+  const body = { items, location_id: LOCATION_ID, no_notification: true };
   try {
     const created = await medusaPost(`/admin/orders/${encodeURIComponent(orderId)}/fulfillments`, body);
     const id = fulfillmentIdFrom(created);
@@ -113,8 +112,7 @@ async function createFulfillment(orderId: string, items: { id: string; quantity:
   }
   const created = await medusaPost(`/admin/orders/${encodeURIComponent(orderId)}/fulfillments`, {
     items,
-    no_notification: !notify,
-    ...(metadata ? { metadata } : {}),
+    no_notification: true,
   });
   const id = fulfillmentIdFrom(created);
   if (!id) throw new Error(`Medusa created a fulfillment but returned no id: ${JSON.stringify(created).slice(0, 400)}`);
@@ -233,13 +231,12 @@ export async function fulfillPickListInMedusa(pickListId: string, options?: { sh
       return { ok: true, fulfillment_id: fulfillmentId };
     }
 
-    const createdNow = !fulfillmentId;
     if (!fulfillmentId) {
       const items = await resolveLineItems(pickListId, order);
       if (!items.length) {
         return { ok: false, error: `No remaining shop quantity to fulfill for ${orderId}. These lines may already be on another fulfillment.` };
       }
-      fulfillmentId = await createFulfillment(orderId, items, ship);
+      fulfillmentId = await createFulfillment(orderId, items);
     }
     await rememberFulfillment(pickListId, fulfillmentId);
 
@@ -256,7 +253,7 @@ export async function fulfillPickListInMedusa(pickListId: string, options?: { sh
         pickList.carrier,
         pickList.tracking_number,
         pickList.tracking_url,
-        !createdNow,
+        true,
       );
       await markShopSynced(pickListId);
     } catch (shipErr) {
