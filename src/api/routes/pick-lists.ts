@@ -349,7 +349,7 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          ${skuParamIndex > 0 ? `, MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_required END) as sku_quantity_required
                  , MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_picked END) as sku_quantity_picked` : ''}
        FROM pick_lists pl
-       LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id
+       LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id AND NOT COALESCE(pli.is_archived, false)
        ${lite ? '' : 'LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku'}
        ${whereClause}
        GROUP BY pl.id
@@ -426,7 +426,7 @@ router.post('/enrichment', authMiddleware, async (req: Request, res: Response) =
     const rows = await query(
       `SELECT pick_list_id, product_sku, colour_code, item_title, quantity_required, quantity_picked, line_number
        FROM pick_list_items
-       WHERE pick_list_id = ANY($1::uuid[])
+       WHERE pick_list_id = ANY($1::uuid[]) AND NOT COALESCE(is_archived, false)
        ORDER BY line_number`,
       [ids]
     );
@@ -684,7 +684,7 @@ router.get('/:pickListId/fulfilment-plan', authMiddleware, async (req: Request, 
          FROM pick_list_items pli
          LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
          LEFT JOIN product_fulfillment_profiles pfp ON pfp.product_sku = pli.product_sku
-         WHERE pli.pick_list_id = $1
+         WHERE pli.pick_list_id = $1 AND NOT COALESCE(pli.is_archived, false)
          ORDER BY pli.line_number ASC`,
         [pickListId]
       ),
@@ -938,7 +938,7 @@ router.get('/:pickListId', authMiddleware, async (req: Request, res: Response) =
        FROM pick_list_items pli
        LEFT JOIN warehouse_locations wl ON wl.id = pli.picked_from_location_id
        LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku
-       WHERE pli.pick_list_id = $1
+       WHERE pli.pick_list_id = $1 AND NOT COALESCE(pli.is_archived, false)
        ORDER BY pli.line_number`,
       [pickListId]
     );
@@ -1324,7 +1324,7 @@ export async function unblockBackorderedPickLists(skus: string[]): Promise<strin
       `SELECT pli.quantity_required, pli.quantity_picked,
               COALESCE((SELECT SUM(quantity) FROM warehouse_inventory WHERE product_sku = pli.product_sku), 0)::int AS available
        FROM pick_list_items pli
-       WHERE pli.pick_list_id = $1`,
+       WHERE pli.pick_list_id = $1 AND NOT COALESCE(pli.is_archived, false)`,
       [candidate.id]
     );
     const stillShort = itemsRow.rows.some(r => r.available < (r.quantity_required - r.quantity_picked));
