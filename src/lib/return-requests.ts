@@ -103,6 +103,27 @@ export async function cancelReturnRequests(pickListId: string, skus: string[]) {
       WHERE pick_list_id = $1 AND sku = ANY($2::text[]) AND status = 'requested' AND outcome = 'replace'`,
     [pickListId, wanted]
   );
+  const replaceSkus = replacing.rows.map((row: { sku: string }) => row.sku);
+  if (replaceSkus.length) {
+    const picked = await query(
+      `SELECT ci.product_sku
+         FROM pick_lists c
+         JOIN pick_list_items ci ON ci.pick_list_id = c.id AND NOT COALESCE(ci.is_archived, false)
+        WHERE c.parent_pick_list_id = $1
+          AND COALESCE(c.is_return, false)
+          AND c.status NOT IN ('DISPATCHED', 'CANCELLED')
+          AND ci.product_sku = ANY($2::text[])
+          AND (
+            COALESCE(ci.quantity_picked, 0) > 0
+            OR EXISTS (SELECT 1 FROM pick_scans ps WHERE ps.pick_list_item_id = ci.id)
+          )
+        LIMIT 1`,
+      [pickListId, replaceSkus]
+    );
+    if (picked.rows.length) {
+      throw new ReturnRequestError(`${picked.rows[0].product_sku} has already been picked on the replacement.`);
+    }
+  }
   await query(
     `UPDATE return_requests
         SET status = 'cancelled', updated_at = NOW()
