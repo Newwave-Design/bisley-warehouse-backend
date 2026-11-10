@@ -369,6 +369,7 @@ ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS tracking_number VARCHAR(100);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS tracking_url VARCHAR(500);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS carrier VARCHAR(50);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS synced_to_medusa_at TIMESTAMP;
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS shop_shipped_at TIMESTAMP;
 -- Cached Medusa order value (net = gross less VAT) for sales reporting
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_gross_gbp DECIMAL(10,2);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_net_gbp DECIMAL(10,2);

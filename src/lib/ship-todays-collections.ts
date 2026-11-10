@@ -77,7 +77,7 @@ export async function shipCollectionsDueToday(): Promise<string[]> {
     if (tracking.filled || tracking.waiting) {
       console.log(`[tracking] Saved ${tracking.filled} shipment link(s), ${tracking.waiting} still waiting`);
     }
-    await syncCollectionOrdersToMedusa(ids).catch((error) => {
+    await syncCollectionOrdersToMedusa().catch((error) => {
       console.warn('[medusa] Updating booked and shipped orders failed', error instanceof Error ? error.message : 'failed');
     });
     if (!ids.length) return [];

@@ -255,6 +255,7 @@ export async function ensurePackagingSchema() {
       UNIQUE (entity, field_key)
     )`,
     `ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_return BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS shop_shipped_at TIMESTAMP`,
     `CREATE TABLE IF NOT EXISTS stock_preempts (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       pick_list_item_id UUID NOT NULL REFERENCES pick_list_items(id) ON DELETE CASCADE,

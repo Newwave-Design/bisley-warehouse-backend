@@ -188,13 +188,18 @@ async function markShopSynced(pickListId: string) {
   await query(`UPDATE pick_lists SET synced_to_medusa_at = NOW() WHERE id = $1`, [pickListId]);
 }
 
+async function markShopShipped(pickListId: string) {
+  await query(
+    `UPDATE pick_lists SET shop_shipped_at = COALESCE(shop_shipped_at, NOW()), synced_to_medusa_at = NOW() WHERE id = $1`,
+    [pickListId]
+  );
+}
+
 /**
  * Push one warehouse order to the shop.
- * Booked for collection creates the fulfillment, so the shop shows Fulfilled.
- * Shipped creates the shipment, so the shop shows Shipped. Return collections are skipped.
+ * A tracking link marks the shop order Shipped straight away. Return collections are skipped.
  */
 export async function fulfillPickListInMedusa(pickListId: string, options?: { ship?: boolean }): Promise<MedusaFulfillResult> {
-  const ship = options?.ship !== false;
   const pl = await query(
     `SELECT id, medusa_order_id, medusa_fulfillment_id, tracking_number, tracking_url, carrier, is_sandbox, status, is_return
      FROM pick_lists WHERE id = $1`,
@@ -207,6 +212,8 @@ export async function fulfillPickListInMedusa(pickListId: string, options?: { sh
     return { ok: true, skipped: true };
   }
 
+  const hasLink = String(pickList.tracking_number || '').trim() !== '' && String(pickList.tracking_url || '').trim() !== '';
+  const ship = hasLink || options?.ship !== false;
   const orderId = rootMedusaOrderId(pickList.medusa_order_id);
 
   try {
@@ -219,15 +226,16 @@ export async function fulfillPickListInMedusa(pickListId: string, options?: { sh
 
     const shipped = alreadyShipped(order.fulfillment_status);
     if (fulfillmentId && (shipped || !ship)) {
+      await rememberFulfillment(pickListId, fulfillmentId);
       if (!shipped) {
         await saveTrackingNote(fulfillmentId, pickList.carrier, pickList.tracking_number, pickList.tracking_url);
+        await markShopSynced(pickListId);
       } else {
         await saveShopTracking(orderId, fulfillmentId, pickList.carrier, pickList.tracking_number, pickList.tracking_url, false).catch((error) => {
           console.warn('[tracking] Medusa label was not saved', error instanceof Error ? error.message : 'failed');
         });
+        await markShopShipped(pickListId);
       }
-      await rememberFulfillment(pickListId, fulfillmentId);
-      await markShopSynced(pickListId);
       return { ok: true, fulfillment_id: fulfillmentId };
     }
 
@@ -255,7 +263,7 @@ export async function fulfillPickListInMedusa(pickListId: string, options?: { sh
         pickList.tracking_url,
         true,
       );
-      await markShopSynced(pickListId);
+      await markShopShipped(pickListId);
     } catch (shipErr) {
       console.warn(
         `[medusa-fulfillment] fulfillment ${fulfillmentId} created; shipment skipped:`,
@@ -271,10 +279,11 @@ export async function fulfillPickListInMedusa(pickListId: string, options?: { sh
   }
 }
 
-/** Booked collections become Fulfilled. Shipped ones become Shipped. Returns are left alone. */
-export async function syncCollectionOrdersToMedusa(skipIds: string[] = []): Promise<void> {
+/** An outbound tracking link marks the shop order Shipped. Returns are left alone. */
+export async function syncCollectionOrdersToMedusa(): Promise<void> {
+  await query(`ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS shop_shipped_at TIMESTAMP`);
   const found = await query(
-    `SELECT pl.id, pl.status
+    `SELECT pl.id, pl.status, pl.tracking_number, pl.tracking_url
        FROM pick_lists pl
       WHERE NOT pl.is_archived
         AND NOT COALESCE(pl.is_sandbox, false)
@@ -288,7 +297,12 @@ export async function syncCollectionOrdersToMedusa(skipIds: string[] = []): Prom
              AND COALESCE(b.direction, 'outbound') <> 'return'
         )
         AND (
-          pl.medusa_fulfillment_id IS NULL
+          (
+            COALESCE(btrim(pl.tracking_url), '') <> ''
+            AND COALESCE(btrim(pl.tracking_number), '') <> ''
+            AND pl.shop_shipped_at IS NULL
+          )
+          OR pl.medusa_fulfillment_id IS NULL
           OR (
             pl.status = 'DISPATCHED'
             AND (pl.synced_to_medusa_at IS NULL OR pl.updated_at > pl.synced_to_medusa_at)
@@ -297,10 +311,9 @@ export async function syncCollectionOrdersToMedusa(skipIds: string[] = []): Prom
       ORDER BY pl.updated_at DESC
       LIMIT 40`
   );
-  const skip = new Set(skipIds);
-  for (const row of found.rows as { id: string; status: string }[]) {
-    if (skip.has(row.id)) continue;
-    await fulfillPickListInMedusa(row.id, { ship: row.status === 'DISPATCHED' });
+  for (const row of found.rows as { id: string; status: string; tracking_number: string | null; tracking_url: string | null }[]) {
+    const hasLink = String(row.tracking_number || '').trim() !== '' && String(row.tracking_url || '').trim() !== '';
+    await fulfillPickListInMedusa(row.id, { ship: hasLink || row.status === 'DISPATCHED' });
   }
 }
 
