@@ -305,7 +305,10 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
         (SELECT string_agg(child.pick_list_number, ', ' ORDER BY child.created_at)
            FROM pick_lists child
           WHERE child.parent_pick_list_id = pl.id AND child.medusa_order_id LIKE '%-PF%') AS part_numbers,
-        CASE WHEN COALESCE(pl.is_return, false) THEN pl.created_at
+        -- The scanner sorts oldest first and does not pin replacements, so an open return is dated back to the top of To pick.
+        CASE WHEN COALESCE(pl.is_return, false) AND pl.status IN ('PENDING', 'IN_PROGRESS', 'AWAITING_STOCK')
+             THEN pl.created_at - INTERVAL '100 years'
+             WHEN COALESCE(pl.is_return, false) THEN pl.created_at
         ELSE COALESCE(
           (SELECT parent.created_at FROM pick_lists parent WHERE parent.id = pl.parent_pick_list_id),
           pl.created_at
@@ -375,8 +378,10 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
       catalogue_revised_at: revisedAt || '',
       pick_lists: result.rows.map((r: any) => {
         const lines = Array.isArray(r.sku_lines) ? r.sku_lines : [];
+        const openReturn = r.is_return && ['PENDING', 'IN_PROGRESS', 'AWAITING_STOCK'].includes(r.status);
         return {
           ...r,
+          customer_name: openReturn ? `${r.customer_name || 'Order'} · replacement` : r.customer_name,
           due: dues[r.id] ?? null,
           address_text: formatShippingAddressText(r.shipping_address, r.customer_name),
           sample_colours: sampleColourList(r.sample_lines),
