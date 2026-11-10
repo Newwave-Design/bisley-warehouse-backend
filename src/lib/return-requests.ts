@@ -79,9 +79,19 @@ export async function requestReturns(pickListId: string, skus: string[] | null, 
     throw new ReturnRequestError('A return request is for an order that has been picked or shipped.');
   }
   const onList = await skusOnList(pickListId);
+  const parts = await query(
+    `SELECT DISTINCT comp->>'sku' AS sku
+       FROM pick_list_items pli
+       JOIN wms_products wp ON wp.variant_sku = pli.product_sku AND COALESCE(wp.is_kit, false)
+       CROSS JOIN LATERAL jsonb_array_elements(wp.kit_components) comp
+      WHERE pli.pick_list_id = $1 AND NOT COALESCE(pli.is_archived, false)
+        AND comp->>'sku' <> '' AND comp->>'sku' <> pli.product_sku`,
+    [pickListId]
+  );
+  const allowed = new Set([...onList, ...parts.rows.map((row: { sku: string }) => row.sku)]);
   const wanted = skus?.length ? [...new Set(skus.map((sku) => sku.trim()).filter(Boolean))] : onList;
   if (!wanted.length) throw new ReturnRequestError('This order has no items to return.');
-  const missing = wanted.filter((sku) => !onList.includes(sku));
+  const missing = wanted.filter((sku) => !allowed.has(sku));
   if (missing.length) throw new ReturnRequestError(`${missing[0]} is not on this order.`);
 
   for (const sku of wanted) {

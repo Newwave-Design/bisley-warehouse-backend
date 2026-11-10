@@ -100,6 +100,18 @@ export async function openReturnReplacement(sourcePickListId: string, sku: strin
     pickListNumber = created.rows[0].pick_list_number;
   }
 
+  const part = item ? null : await query(
+    `SELECT (COALESCE(pli.quantity_required, 1) * COALESCE((comp->>'required_quantity')::numeric, 1))::int AS quantity_required,
+            wp.product_title, wp.colour_code
+       FROM pick_list_items pli
+       JOIN wms_products parent ON parent.variant_sku = pli.product_sku AND COALESCE(parent.is_kit, false)
+       CROSS JOIN LATERAL jsonb_array_elements(parent.kit_components) comp
+       LEFT JOIN wms_products wp ON wp.variant_sku = comp->>'sku' AND NOT COALESCE(wp.is_archived, false)
+      WHERE pli.pick_list_id = $1 AND NOT COALESCE(pli.is_archived, false) AND comp->>'sku' = $2
+      LIMIT 1`,
+    [sourcePickListId, productSku]
+  );
+  const piece = part?.rows[0];
   const already = await query(
     `SELECT id FROM pick_list_items
       WHERE pick_list_id = $1 AND product_sku = $2 AND NOT COALESCE(is_archived, false)
@@ -115,13 +127,14 @@ export async function openReturnReplacement(sourcePickListId: string, sku: strin
       `INSERT INTO pick_list_items (
          pick_list_id, line_number, product_sku, colour_code, item_title, quantity_required, status, is_sandbox,
          medusa_order_line_item_id, medusa_variant_id, medusa_product_id, created_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, 1, 'PENDING', $6, $7, $8, $9, NOW(), NOW())`,
+       ) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', $7, $8, $9, $10, NOW(), NOW())`,
       [
         pickListId,
         nextLine.rows[0].line_number,
         productSku,
-        item?.colour_code || null,
-        item?.item_title || null,
+        item?.colour_code || piece?.colour_code || null,
+        item?.item_title || piece?.product_title || null,
+        Number(item?.quantity_required) || Number(piece?.quantity_required) || 1,
         item?.is_sandbox || source.is_sandbox || false,
         item?.medusa_order_line_item_id || null,
         item?.medusa_variant_id || null,
@@ -129,6 +142,22 @@ export async function openReturnReplacement(sourcePickListId: string, sku: strin
       ]
     );
   }
+
+  const active = await query(
+    `SELECT sku FROM return_requests
+      WHERE pick_list_id = $1 AND status <> 'cancelled' AND outcome = 'replace'`,
+    [sourcePickListId]
+  );
+  const keep = [...new Set([productSku, ...active.rows.map((row: { sku: string }) => row.sku)])];
+  await query(
+    `DELETE FROM pick_list_items pli
+      WHERE pli.pick_list_id = $1
+        AND NOT COALESCE(pli.is_archived, false)
+        AND NOT (pli.product_sku = ANY($2::text[]))
+        AND COALESCE(pli.quantity_picked, 0) = 0
+        AND NOT EXISTS (SELECT 1 FROM pick_scans ps WHERE ps.pick_list_item_id = pli.id)`,
+    [pickListId, keep]
+  );
 
   scheduleStockHolds();
   return { id: pickListId!, pick_list_number: pickListNumber! };
