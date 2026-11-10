@@ -134,27 +134,46 @@ export async function openReturnReplacement(sourcePickListId: string, sku: strin
   return { id: pickListId!, pick_list_number: pickListNumber! };
 }
 
-/** Drop an unpicked replacement line when its return collection is cancelled. */
-export async function releaseReturnReplacement(sourcePickListId: string, sku: string): Promise<void> {
+async function unpickedSkus(sku: string): Promise<string[]> {
   const productSku = sku.trim();
-  if (!productSku) return;
+  if (!productSku) return [];
+  const found = await query(
+    `SELECT kit_components FROM wms_products
+      WHERE variant_sku = $1 AND COALESCE(is_kit, false) = true
+      ORDER BY is_archived
+      LIMIT 1`,
+    [productSku]
+  );
+  const parts = Array.isArray(found.rows[0]?.kit_components) ? found.rows[0].kit_components : [];
+  const componentSkus = parts
+    .map((part: { sku?: string }) => String(part?.sku || '').trim())
+    .filter((partSku: string) => partSku && partSku !== productSku);
+  return [productSku, ...componentSkus];
+}
+
+/** Drop an unpicked replacement line when its return is cancelled. A kit also drops its pieces. */
+export async function releaseReturnReplacement(sourcePickListId: string, sku: string): Promise<void> {
+  const skus = await unpickedSkus(sku);
+  if (!skus.length) return;
   const lists = await query(
     `SELECT id FROM pick_lists
       WHERE parent_pick_list_id = $1 AND COALESCE(is_return, false) = true AND status NOT IN ('DISPATCHED', 'CANCELLED')`,
     [sourcePickListId]
   );
   for (const list of lists.rows) {
-    const line = await query(
-      `SELECT id, quantity_picked FROM pick_list_items
-        WHERE pick_list_id = $1 AND product_sku = $2 AND NOT COALESCE(is_archived, false)
-        LIMIT 1`,
-      [list.id, productSku]
-    );
-    const row = line.rows[0];
-    if (!row || Number(row.quantity_picked) > 0) continue;
-    const scans = await query(`SELECT 1 FROM pick_scans WHERE pick_list_item_id = $1 LIMIT 1`, [row.id]);
-    if (scans.rows.length) continue;
-    await query(`DELETE FROM pick_list_items WHERE id = $1`, [row.id]);
+    for (const productSku of skus) {
+      const line = await query(
+        `SELECT id, quantity_picked FROM pick_list_items
+          WHERE pick_list_id = $1 AND product_sku = $2 AND NOT COALESCE(is_archived, false)
+          LIMIT 1`,
+        [list.id, productSku]
+      );
+      const row = line.rows[0];
+      if (!row || Number(row.quantity_picked) > 0) continue;
+      const scans = await query(`SELECT 1 FROM pick_scans WHERE pick_list_item_id = $1 LIMIT 1`, [row.id]);
+      if (scans.rows.length) continue;
+      await query(`DELETE FROM pick_list_items WHERE id = $1`, [row.id]);
+    }
     const left = await query(
       `SELECT 1 FROM pick_list_items WHERE pick_list_id = $1 AND NOT COALESCE(is_archived, false) LIMIT 1`,
       [list.id]

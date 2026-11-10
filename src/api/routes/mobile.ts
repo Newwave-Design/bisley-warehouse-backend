@@ -428,7 +428,7 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
   try {
     const pl = await query(`
       SELECT pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at, pl.is_return,
-             pl.customer_name, pl.customer_email, pl.shipping_address,
+             pl.parent_pick_list_id, pl.customer_name, pl.customer_email, pl.shipping_address,
              (SELECT parent.pick_list_number FROM pick_lists parent
                WHERE parent.id = pl.parent_pick_list_id AND pl.medusa_order_id LIKE '%-PF%') AS part_of_number,
              (SELECT string_agg(child.pick_list_number, ', ' ORDER BY child.created_at)
@@ -541,11 +541,28 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
     );
     enrichSampleItems(items.rows);
     const header = pl.rows[0];
+    let return_of_number = '';
+    let original_items: { sku: string; title: string | null; quantity_required: number }[] = [];
+    if (header.is_return && header.parent_pick_list_id) {
+      const parent = await query(`SELECT pick_list_number FROM pick_lists WHERE id = $1`, [header.parent_pick_list_id]);
+      return_of_number = parent.rows[0]?.pick_list_number || '';
+      const lines = await query(
+        `SELECT pli.product_sku AS sku, COALESCE(wp.product_title, pli.item_title) AS title, pli.quantity_required
+           FROM pick_list_items pli
+           LEFT JOIN wms_products wp ON wp.variant_sku = pli.product_sku AND NOT COALESCE(wp.is_archived, false)
+          WHERE pli.pick_list_id = $1 AND NOT COALESCE(pli.is_archived, false)
+          ORDER BY pli.line_number`,
+        [header.parent_pick_list_id]
+      );
+      original_items = lines.rows;
+    }
     res.json({
       ...header,
       due,
       items: items.rows,
       flag_notes: flagNotes.rows,
+      return_of_number,
+      original_items,
       address_text: formatShippingAddressText(header.shipping_address, header.customer_name),
     });
   } catch (err) {
