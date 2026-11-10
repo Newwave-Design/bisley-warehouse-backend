@@ -527,6 +527,10 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     }
 
     const delivery = deliveryFrom(list);
+    if (returning) {
+      const given = text(req.body?.phone).trim();
+      if (given) delivery.phone = given;
+    }
     if (!['GB', 'UK'].includes(delivery.country)) {
       return res.status(400).json({ error: returning ? 'A return can only be collected from a UK address' : `${courier} collections are only booked to a UK address` });
     }
