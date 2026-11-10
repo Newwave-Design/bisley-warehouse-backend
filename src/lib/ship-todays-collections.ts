@@ -1,7 +1,7 @@
 import { query } from '../db/index.js';
 import { takeStockForOpenCollections } from './collection-stock.js';
 import { consumeOutstandingShipmentBoxes } from './packaging-usage.js';
-import { fulfillPickListsInMedusa } from './medusa-fulfillment.js';
+import { fulfillPickListsInMedusa, syncCollectionOrdersToMedusa } from './medusa-fulfillment.js';
 import { recordPickListEvents } from './pick-list-events.js';
 import { rememberShipmentTracking } from './shipment-tracking.js';
 
@@ -77,6 +77,9 @@ export async function shipCollectionsDueToday(): Promise<string[]> {
     if (tracking.filled || tracking.waiting) {
       console.log(`[tracking] Saved ${tracking.filled} shipment link(s), ${tracking.waiting} still waiting`);
     }
+    await syncCollectionOrdersToMedusa(ids).catch((error) => {
+      console.warn('[medusa] Updating booked and shipped orders failed', error instanceof Error ? error.message : 'failed');
+    });
     if (!ids.length) return [];
     await recordPickListEvents({
       ids,

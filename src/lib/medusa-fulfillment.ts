@@ -17,8 +17,16 @@ function fulfillmentIdFrom(data: any): string | undefined {
     || data?.fulfillments?.slice(-1)[0]?.id;
 }
 
-function alreadyDone(status: string | null | undefined): boolean {
-  return ['fulfilled', 'shipped', 'delivered'].includes(String(status || '').toLowerCase());
+function shopStatus(status: string | null | undefined): string {
+  return String(status || '').toLowerCase();
+}
+
+function alreadyFulfilled(status: string | null | undefined): boolean {
+  return ['fulfilled', 'partially_fulfilled', 'shipped', 'partially_shipped', 'delivered', 'partially_delivered'].includes(shopStatus(status));
+}
+
+function alreadyShipped(status: string | null | undefined): boolean {
+  return ['shipped', 'partially_shipped', 'delivered', 'partially_delivered'].includes(shopStatus(status));
 }
 
 async function loadMedusaOrder(orderId: string): Promise<any> {
@@ -92,8 +100,9 @@ async function sharesOrder(orderId: string, pickListId: string): Promise<boolean
   return result.rows.length > 0;
 }
 
-async function createFulfillment(orderId: string, items: { id: string; quantity: number }[]): Promise<string> {
-  const body = { items, location_id: LOCATION_ID, no_notification: false };
+async function createFulfillment(orderId: string, items: { id: string; quantity: number }[], notify: boolean): Promise<string> {
+  const metadata = notify ? undefined : { dispatch_email: 'on_shipment' };
+  const body = { items, location_id: LOCATION_ID, no_notification: !notify, ...(metadata ? { metadata } : {}) };
   try {
     const created = await medusaPost(`/admin/orders/${encodeURIComponent(orderId)}/fulfillments`, body);
     const id = fulfillmentIdFrom(created);
@@ -104,31 +113,45 @@ async function createFulfillment(orderId: string, items: { id: string; quantity:
   }
   const created = await medusaPost(`/admin/orders/${encodeURIComponent(orderId)}/fulfillments`, {
     items,
-    no_notification: false,
+    no_notification: !notify,
+    ...(metadata ? { metadata } : {}),
   });
   const id = fulfillmentIdFrom(created);
   if (!id) throw new Error(`Medusa created a fulfillment but returned no id: ${JSON.stringify(created).slice(0, 400)}`);
   return id;
 }
 
-export async function saveMedusaShipment(orderId: string, fulfillmentId: string, trackingNumber?: string | null, trackingUrl?: string | null) {
+async function loadFulfillment(orderId: string, fulfillmentId: string) {
   const loaded = await medusaGet(
     `/admin/orders/${encodeURIComponent(orderId)}?fields=*fulfillments,*fulfillments.items,*fulfillments.labels`
   );
-  const source = (loaded?.order?.fulfillments || []).find((entry: { id?: string }) => entry.id === fulfillmentId);
-  if (!source) return;
-  const labels = Array.isArray(source.labels) ? source.labels : [];
-  if (trackingNumber && labels.some((label: { tracking_number?: string }) => label.tracking_number === trackingNumber)) return;
-  const items = (Array.isArray(source.items) ? source.items : [])
-    .map((item: { line_item_id?: string; id?: string; quantity?: number }) => ({
+  return (loaded?.order?.fulfillments || []).find((entry: { id?: string }) => entry.id === fulfillmentId);
+}
+
+function shipmentItems(source: { items?: { line_item_id?: string; id?: string; quantity?: number }[] } | undefined) {
+  return (Array.isArray(source?.items) ? source.items : [])
+    .map((item) => ({
       id: item.line_item_id || item.id,
       quantity: Number(item.quantity) || 1,
     }))
-    .filter((item: { id?: string }) => item.id);
+    .filter((item) => item.id);
+}
+
+export async function saveMedusaShipment(orderId: string, fulfillmentId: string, trackingNumber?: string | null, trackingUrl?: string | null, notify = false) {
+  let source = await loadFulfillment(orderId, fulfillmentId);
+  let items = shipmentItems(source);
+  if (!source || !items.length) {
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    source = await loadFulfillment(orderId, fulfillmentId);
+    items = shipmentItems(source);
+  }
+  if (!source) throw new Error(`Shop fulfillment ${fulfillmentId} is not on ${orderId}`);
+  const labels = Array.isArray(source.labels) ? source.labels : [];
+  if (trackingNumber && labels.some((label: { tracking_number?: string }) => label.tracking_number === trackingNumber)) return;
   if (!items.length) throw new Error('Medusa fulfillment has no items to ship');
   const body: { items: { id: string; quantity: number }[]; no_notification: boolean; labels?: { tracking_number: string; tracking_url: string; label_url: string }[] } = {
     items,
-    no_notification: true,
+    no_notification: !notify,
   };
   if (trackingNumber && trackingUrl) {
     body.labels = [{ tracking_number: trackingNumber, tracking_url: trackingUrl, label_url: trackingUrl }];
@@ -139,14 +162,43 @@ export async function saveMedusaShipment(orderId: string, fulfillmentId: string,
   );
 }
 
-async function createShipment(orderId: string, fulfillmentId: string, trackingNumber?: string | null, trackingUrl?: string | null) {
-  await saveMedusaShipment(orderId, fulfillmentId, trackingNumber, trackingUrl);
+async function saveTrackingNote(fulfillmentId: string, carrier: string | null | undefined, trackingNumber?: string | null, trackingUrl?: string | null) {
+  if (!trackingNumber || !trackingUrl) return;
+  const note = `${String(carrier || '').trim().toUpperCase()} ${trackingNumber}\n${trackingUrl}`.trim();
+  await medusaPost(
+    `/admin/fulfillments/${encodeURIComponent(fulfillmentId)}/tracking-note`,
+    { tracking_note: note }
+  );
 }
 
-/** Create (or reuse) a Medusa fulfillment so a WMS "Shipped" order is fulfilled on the shop. */
-export async function fulfillPickListInMedusa(pickListId: string): Promise<MedusaFulfillResult> {
+/** Put the carrier link and the tracking note on the shop fulfillment. A shipment moves the shop order to Shipped. */
+export async function saveShopTracking(orderId: string, fulfillmentId: string, carrier: string | null | undefined, trackingNumber?: string | null, trackingUrl?: string | null, notify = false) {
+  await saveMedusaShipment(orderId, fulfillmentId, trackingNumber, trackingUrl, notify);
+  await saveTrackingNote(fulfillmentId, carrier, trackingNumber, trackingUrl);
+}
+
+async function rememberFulfillment(pickListId: string, fulfillmentId: string) {
+  await query(
+    `UPDATE pick_lists
+     SET medusa_fulfillment_id = $1, updated_at = NOW()
+     WHERE id = $2`,
+    [fulfillmentId, pickListId]
+  );
+}
+
+async function markShopSynced(pickListId: string) {
+  await query(`UPDATE pick_lists SET synced_to_medusa_at = NOW() WHERE id = $1`, [pickListId]);
+}
+
+/**
+ * Push one warehouse order to the shop.
+ * Booked for collection creates the fulfillment, so the shop shows Fulfilled.
+ * Shipped creates the shipment, so the shop shows Shipped. Return collections are skipped.
+ */
+export async function fulfillPickListInMedusa(pickListId: string, options?: { ship?: boolean }): Promise<MedusaFulfillResult> {
+  const ship = options?.ship !== false;
   const pl = await query(
-    `SELECT id, medusa_order_id, medusa_fulfillment_id, tracking_number, tracking_url, is_sandbox, status, is_return
+    `SELECT id, medusa_order_id, medusa_fulfillment_id, tracking_number, tracking_url, carrier, is_sandbox, status, is_return
      FROM pick_lists WHERE id = $1`,
     [pickListId]
   );
@@ -161,39 +213,52 @@ export async function fulfillPickListInMedusa(pickListId: string): Promise<Medus
 
   try {
     const order = await loadMedusaOrder(orderId);
-    if (alreadyDone(order.fulfillment_status) && pickList.medusa_fulfillment_id) {
-      await query(`UPDATE pick_lists SET synced_to_medusa_at = NOW() WHERE id = $1`, [pickListId]);
-      if (pickList.tracking_number && pickList.tracking_url) {
-        await saveMedusaShipment(orderId, pickList.medusa_fulfillment_id, pickList.tracking_number, pickList.tracking_url).catch((error) => {
-          console.warn('[tracking] Medusa label was not saved', error instanceof Error ? error.message : 'failed');
-        });
-      }
-      return { ok: true, fulfillment_id: pickList.medusa_fulfillment_id };
-    }
-
     let fulfillmentId = pickList.medusa_fulfillment_id as string | null;
     // A part fulfilment has its own fulfillment. Do not attach this list to the other part's.
-    if (!fulfillmentId && alreadyDone(order.fulfillment_status) && !(await sharesOrder(orderId, pickListId))) {
+    if (!fulfillmentId && alreadyFulfilled(order.fulfillment_status) && !(await sharesOrder(orderId, pickListId))) {
       fulfillmentId = order.fulfillments?.slice(-1)[0]?.id || null;
     }
 
+    const shipped = alreadyShipped(order.fulfillment_status);
+    if (fulfillmentId && (shipped || !ship)) {
+      if (!shipped) {
+        await saveTrackingNote(fulfillmentId, pickList.carrier, pickList.tracking_number, pickList.tracking_url);
+      } else {
+        await saveShopTracking(orderId, fulfillmentId, pickList.carrier, pickList.tracking_number, pickList.tracking_url, false).catch((error) => {
+          console.warn('[tracking] Medusa label was not saved', error instanceof Error ? error.message : 'failed');
+        });
+      }
+      await rememberFulfillment(pickListId, fulfillmentId);
+      await markShopSynced(pickListId);
+      return { ok: true, fulfillment_id: fulfillmentId };
+    }
+
+    const createdNow = !fulfillmentId;
     if (!fulfillmentId) {
       const items = await resolveLineItems(pickListId, order);
       if (!items.length) {
         return { ok: false, error: `No remaining shop quantity to fulfill for ${orderId}. These lines may already be on another fulfillment.` };
       }
-      fulfillmentId = await createFulfillment(orderId, items);
+      fulfillmentId = await createFulfillment(orderId, items, ship);
+    }
+    await rememberFulfillment(pickListId, fulfillmentId);
+
+    if (!ship) {
+      await saveTrackingNote(fulfillmentId, pickList.carrier, pickList.tracking_number, pickList.tracking_url);
+      await markShopSynced(pickListId);
+      return { ok: true, fulfillment_id: fulfillmentId };
     }
 
-    await query(
-      `UPDATE pick_lists
-       SET medusa_fulfillment_id = $1, synced_to_medusa_at = NOW(), updated_at = NOW()
-       WHERE id = $2`,
-      [fulfillmentId, pickListId]
-    );
-
     try {
-      await createShipment(orderId, fulfillmentId, pickList.tracking_number, pickList.tracking_url);
+      await saveShopTracking(
+        orderId,
+        fulfillmentId,
+        pickList.carrier,
+        pickList.tracking_number,
+        pickList.tracking_url,
+        !createdNow,
+      );
+      await markShopSynced(pickListId);
     } catch (shipErr) {
       console.warn(
         `[medusa-fulfillment] fulfillment ${fulfillmentId} created; shipment skipped:`,
@@ -206,6 +271,39 @@ export async function fulfillPickListInMedusa(pickListId: string): Promise<Medus
     const error = err instanceof Error ? err.message : String(err);
     console.error(`[medusa-fulfillment] ${pickListId} / ${orderId}:`, error);
     return { ok: false, error };
+  }
+}
+
+/** Booked collections become Fulfilled. Shipped ones become Shipped. Returns are left alone. */
+export async function syncCollectionOrdersToMedusa(skipIds: string[] = []): Promise<void> {
+  const found = await query(
+    `SELECT pl.id, pl.status
+       FROM pick_lists pl
+      WHERE NOT pl.is_archived
+        AND NOT COALESCE(pl.is_sandbox, false)
+        AND NOT COALESCE(pl.is_return, false)
+        AND pl.status <> 'CANCELLED'
+        AND pl.medusa_order_id LIKE 'order_%'
+        AND EXISTS (
+          SELECT 1 FROM collection_bookings b
+           WHERE b.pick_list_id = pl.id
+             AND b.status <> 'cancelled'
+             AND COALESCE(b.direction, 'outbound') <> 'return'
+        )
+        AND (
+          pl.medusa_fulfillment_id IS NULL
+          OR (
+            pl.status = 'DISPATCHED'
+            AND (pl.synced_to_medusa_at IS NULL OR pl.updated_at > pl.synced_to_medusa_at)
+          )
+        )
+      ORDER BY pl.updated_at DESC
+      LIMIT 40`
+  );
+  const skip = new Set(skipIds);
+  for (const row of found.rows as { id: string; status: string }[]) {
+    if (skip.has(row.id)) continue;
+    await fulfillPickListInMedusa(row.id, { ship: row.status === 'DISPATCHED' });
   }
 }
 
