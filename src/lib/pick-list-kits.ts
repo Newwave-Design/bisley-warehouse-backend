@@ -6,7 +6,7 @@ export async function expandKitPicksByList<T extends { sku: string; quantity_req
   const skus = [...new Set(groups.flat().map(i => i.sku).filter(Boolean))];
   if (!skus.length) return groups;
   const kits = await query(
-    `SELECT DISTINCT ON (variant_sku) variant_sku, is_kit, kit_components
+    `SELECT DISTINCT ON (variant_sku) variant_sku, product_title, is_kit, kit_components
      FROM wms_products WHERE variant_sku = ANY($1::text[])
      ORDER BY variant_sku, is_archived`,
     [skus]
@@ -31,11 +31,11 @@ export async function expandKitPicksByList<T extends { sku: string; quantity_req
     for (const row of found.rows) info.set(row.variant_sku, row);
   }
   const expanded = groups.map(items => items.flatMap(item => {
-    const kit = bySku.get(item.sku) as { is_kit?: boolean; kit_components?: { sku?: string; required_quantity?: number }[] } | undefined;
+    const kit = bySku.get(item.sku) as { product_title?: string; is_kit?: boolean; kit_components?: { sku?: string; required_quantity?: number }[] } | undefined;
     const parts = (kit?.is_kit && Array.isArray(kit.kit_components) ? kit.kit_components : [])
       .filter(c => c?.sku && c.sku !== item.sku);
     if (!parts.length) return [item];
-    const header = { ...item, kit_header: true };
+    const header = { ...item, kit_header: true, title: kit.product_title || (item as { title?: string }).title };
     return [header, ...parts.map(c => {
       const meta = info.get(c.sku as string) || info.get(componentDisplaySku(c.sku as string));
       const per = Number(c.required_quantity) || 1;
