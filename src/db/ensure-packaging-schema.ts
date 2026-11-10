@@ -278,6 +278,14 @@ export async function ensurePackagingSchema() {
       ON return_requests (pick_list_id, sku)
       WHERE status <> 'cancelled'`,
     `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS outcome VARCHAR(20)`,
+    `CREATE TABLE IF NOT EXISTS return_request_images (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      return_request_id UUID NOT NULL REFERENCES return_requests(id) ON DELETE CASCADE,
+      content_type VARCHAR(40) NOT NULL,
+      image BYTEA NOT NULL,
+      created_by VARCHAR(255),
+      created_at TIMESTAMP DEFAULT NOW()
+    )`,
   ];
 
   for (const sql of statements) {

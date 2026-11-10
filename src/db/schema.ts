@@ -1577,6 +1577,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_return_requests_open
   ON return_requests (pick_list_id, sku)
   WHERE status <> 'cancelled';
 
+CREATE TABLE IF NOT EXISTS return_request_images (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  return_request_id UUID NOT NULL REFERENCES return_requests(id) ON DELETE CASCADE,
+  content_type VARCHAR(40) NOT NULL,
+  image BYTEA NOT NULL,
+  created_by VARCHAR(255),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
 -- A week (Friday to Thursday) becomes fixed once locked: its statement lines are copied here and never change
 CREATE TABLE IF NOT EXISTS settlement_weeks (
   week_start DATE PRIMARY KEY,

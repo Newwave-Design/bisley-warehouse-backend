@@ -24,6 +24,11 @@ export async function listReturnRequests(pickListId?: string) {
   const result = await query(
     `SELECT r.id, r.pick_list_id, r.sku, r.status, r.outcome, r.booking_id, r.created_by, r.created_at,
             pli.item_title, pl.pick_list_number,
+            COALESCE((
+              SELECT json_agg(json_build_object('id', i.id, 'content_type', i.content_type, 'created_at', i.created_at) ORDER BY i.created_at)
+                FROM return_request_images i
+               WHERE i.return_request_id = r.id
+            ), '[]'::json) AS images,
             repl.id AS replacement_id, repl.pick_list_number AS replacement_number, repl.status AS replacement_status
        FROM return_requests r
        JOIN pick_lists pl ON pl.id = r.pick_list_id
@@ -142,6 +147,55 @@ export async function markReturnRequestsBooked(pickListId: string, sku: string, 
       WHERE pick_list_id = $1 AND sku = $2 AND status = 'requested'`,
     [pickListId, sku, bookingId]
   );
+}
+
+const PHOTO_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+
+function looksLikeImage(bytes: Buffer, contentType: string) {
+  if (contentType === 'image/png') return bytes[0] === 0x89 && bytes[1] === 0x50;
+  if (contentType === 'image/gif') return bytes.subarray(0, 3).toString() === 'GIF';
+  if (contentType === 'image/webp') return bytes.subarray(0, 4).toString() === 'RIFF' && bytes.subarray(8, 12).toString() === 'WEBP';
+  return bytes[0] === 0xff && bytes[1] === 0xd8;
+}
+
+/** Attach a photo to the open return for this item. */
+export async function addReturnRequestImage(pickListId: string, sku: string, bytes: Buffer, contentType: string, actor: string) {
+  const type = contentType.toLowerCase().split(';')[0].trim();
+  if (!PHOTO_TYPES.has(type) || !looksLikeImage(bytes, type)) {
+    throw new ReturnRequestError('Use a JPEG, PNG, WebP or GIF photo.');
+  }
+  if (bytes.length > 8 * 1024 * 1024) throw new ReturnRequestError('That photo must be under 8 MB.');
+  const found = await query(
+    `SELECT id FROM return_requests
+      WHERE pick_list_id = $1 AND sku = $2 AND status <> 'cancelled'
+      ORDER BY created_at DESC LIMIT 1`,
+    [pickListId, sku]
+  );
+  const request = found.rows[0];
+  if (!request) throw new ReturnRequestError('Mark this item as a return before adding a photo.', 404);
+  const count = await query(`SELECT COUNT(*)::int AS n FROM return_request_images WHERE return_request_id = $1`, [request.id]);
+  if (Number(count.rows[0]?.n) >= 8) throw new ReturnRequestError('This return already has 8 photos.');
+  await query(
+    `INSERT INTO return_request_images (return_request_id, content_type, image, created_by)
+     VALUES ($1, $2, $3, $4)`,
+    [request.id, type, bytes, actor.slice(0, 255)]
+  );
+  return listReturnRequests(pickListId);
+}
+
+export async function returnRequestImage(id: string) {
+  const found = await query(`SELECT content_type, image FROM return_request_images WHERE id = $1`, [id]);
+  return found.rows[0] || null;
+}
+
+export async function deleteReturnRequestImage(id: string) {
+  const removed = await query(
+    `DELETE FROM return_request_images WHERE id = $1 RETURNING return_request_id`,
+    [id]
+  );
+  if (!removed.rows[0]) throw new ReturnRequestError('Photo not found', 404);
+  const parent = await query(`SELECT pick_list_id FROM return_requests WHERE id = $1`, [removed.rows[0].return_request_id]);
+  return listReturnRequests(parent.rows[0]?.pick_list_id);
 }
 
 export async function reopenReturnRequests(pickListId: string, sku: string) {

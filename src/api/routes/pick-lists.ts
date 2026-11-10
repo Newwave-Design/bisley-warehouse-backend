@@ -26,7 +26,7 @@ import { attachPackaging } from '../../lib/pick-list-packaging.js';
 import { expandKitPicksByList } from '../../lib/pick-list-kits.js';
 import { confirmPartFulfilment, inspectPartFulfilment, PartFulfilError } from '../../lib/part-fulfilment.js';
 import { stockReservations, takeReservedItem } from '../../lib/stock-reservations.js';
-import { cancelReturnRequests, listReturnRequests, requestReturns, ReturnRequestError } from '../../lib/return-requests.js';
+import { addReturnRequestImage, cancelReturnRequests, deleteReturnRequestImage, listReturnRequests, requestReturns, returnRequestImage, ReturnRequestError } from '../../lib/return-requests.js';
 
 const router = express.Router();
 
@@ -869,6 +869,56 @@ router.post('/:pickListId/return-requests', authMiddleware, async (req: AuthRequ
     return res.status(500).json({ error: 'Could not mark this return.' });
   }
 });
+
+/** GET /api/pick-lists/return-request-images/:imageId — one photo attached to a return. */
+router.get('/return-request-images/:imageId', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const image = await returnRequestImage(req.params.imageId);
+    if (!image) return res.status(404).json({ error: 'Photo not found' });
+    res.setHeader('Content-Type', image.content_type);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    return res.end(image.image);
+  } catch (error) {
+    console.error('Return photo failed', error instanceof Error ? error.message : error);
+    return res.status(500).json({ error: 'Could not load that photo.' });
+  }
+});
+
+/** DELETE /api/pick-lists/return-request-images/:imageId — remove a photo from a return. */
+router.delete('/return-request-images/:imageId', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    return res.json({ requests: await deleteReturnRequestImage(req.params.imageId) });
+  } catch (error) {
+    if (error instanceof ReturnRequestError) return res.status(error.status).json({ error: error.message });
+    console.error('Removing a return photo failed', error instanceof Error ? error.message : error);
+    return res.status(500).json({ error: 'Could not remove that photo.' });
+  }
+});
+
+/** POST /api/pick-lists/:pickListId/return-requests/:sku/images — add a photo. Body is the image file. */
+router.post(
+  '/:pickListId/return-requests/:sku/images',
+  authMiddleware,
+  express.raw({ type: ['image/jpeg', 'image/png', 'image/webp', 'image/gif'], limit: '8mb' }),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const bytes = req.body as Buffer;
+      if (!Buffer.isBuffer(bytes) || !bytes.length) return res.status(400).json({ error: 'Choose a photo to upload.' });
+      const requests = await addReturnRequestImage(
+        req.params.pickListId,
+        decodeURIComponent(req.params.sku),
+        bytes,
+        String(req.headers['content-type'] || ''),
+        req.user?.email || '',
+      );
+      return res.status(201).json({ requests });
+    } catch (error) {
+      if (error instanceof ReturnRequestError) return res.status(error.status).json({ error: error.message });
+      console.error('Adding a return photo failed', error instanceof Error ? error.message : error);
+      return res.status(500).json({ error: 'Could not add that photo.' });
+    }
+  },
+);
 
 /** POST /api/pick-lists/:pickListId/return-requests/cancel — take an unbooked request off the list. */
 router.post('/:pickListId/return-requests/cancel', authMiddleware, async (req: Request, res: Response) => {
