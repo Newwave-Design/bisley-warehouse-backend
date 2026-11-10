@@ -36,6 +36,7 @@ async function dropReplacements(pickListId: string | undefined, waybill: string)
 const router = express.Router();
 const QUOTE_URL = 'https://apc.hypaship.com/api/3.0/ServiceAvailability.json';
 const ORDER_URL = 'https://apc.hypaship.com/api/3.0/Orders.json';
+const WAREHOUSE_PHONE = '01873900095';
 const COLLECTION = {
   CompanyName: 'OVARA PRODUCTS LIMITED',
   AddressLine1: 'Unit B7A, Brecon House',
@@ -44,6 +45,10 @@ const COLLECTION = {
   City: 'Pontypool',
   County: 'Torfaen',
   CountryCode: 'GB',
+  Contact: {
+    PersonName: 'Ovara Products',
+    PhoneNumber: WAREHOUSE_PHONE,
+  },
 };
 
 interface PieceInput {
@@ -454,15 +459,15 @@ function deliveryFrom(row: { customer_name?: string; customer_email?: string; sh
   };
 }
 
-/** APC rejects a mobile in PhoneNumber. A number starting 07 goes in MobileNumber; a landline stays on PhoneNumber. */
-function apcContactNumbers(value: string): { PhoneNumber?: string; MobileNumber?: string } {
+/** APC will not create a collection unless PhoneNumber is set. A mobile also goes in MobileNumber. */
+function apcContactNumbers(value: string): { PhoneNumber: string; MobileNumber?: string } {
   let digits = value.replace(/[^\d+]/g, '');
   if (digits.startsWith('+44')) digits = `0${digits.slice(3)}`;
   else if (digits.startsWith('0044')) digits = `0${digits.slice(4)}`;
   else if (/^44\d{10}$/.test(digits)) digits = `0${digits.slice(2)}`;
   digits = digits.replace(/\D/g, '').slice(0, 15);
-  if (!digits) return {};
-  if (digits.startsWith('07')) return { MobileNumber: digits };
+  if (digits.length < 10) return { PhoneNumber: WAREHOUSE_PHONE };
+  if (digits.startsWith('07')) return { PhoneNumber: digits, MobileNumber: digits };
   return { PhoneNumber: digits };
 }
 
