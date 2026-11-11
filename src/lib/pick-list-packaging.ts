@@ -63,6 +63,7 @@ type PackagingLine = {
   name: string
   item_type: string
   qty: number
+  stock_on_hand: number | null
   box: { code: string; length: number; width: number; height: number } | null
 };
 
@@ -93,7 +94,7 @@ export async function attachPackaging<T extends { sku: string; quantity_required
            FROM packaging_product_specs WHERE is_active`),
     query(
       `SELECT b.product_code, b.sku, b.method, b.option_rank,
-              i.code, i.name, i.item_type, l.qty,
+              i.code, i.name, i.item_type, i.stock_on_hand, l.qty,
               i.internal_length_mm, i.internal_width_mm, i.internal_height_mm,
               i.extra->>'box_size_formula' AS box_size_formula
        FROM packaging_boms b
@@ -140,6 +141,7 @@ export async function attachPackaging<T extends { sku: string; quantity_required
     code: string | null
     name: string | null
     item_type: string | null
+    stock_on_hand: number | null
     qty: string | null
     internal_length_mm: number | null
     internal_width_mm: number | null
@@ -167,6 +169,7 @@ export async function attachPackaging<T extends { sku: string; quantity_required
         name: row.name || row.code,
         item_type: row.item_type || 'other',
         qty: Number(row.qty) || 1,
+        stock_on_hand: row.stock_on_hand == null ? null : Number(row.stock_on_hand),
         box: outer ? { code: row.code, ...outer } : null,
       });
     }
@@ -198,6 +201,7 @@ export async function attachPackaging<T extends { sku: string; quantity_required
       item_type: line.item_type,
       item_label: PACKAGING_ITEM_LABEL[line.item_type] || line.item_type,
       qty: Math.round(line.qty * per * 100) / 100,
+      stock_on_hand: line.stock_on_hand,
     }));
     const box = (chosen?.lines || []).find(line => line.box)?.box || null;
     return {

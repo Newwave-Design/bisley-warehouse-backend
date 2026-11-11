@@ -324,7 +324,7 @@ router.get('/boms', async (req: Request, res: Response) => {
     const result = await query(
       `SELECT b.*, COALESCE(json_agg(json_build_object(
           'id', l.id, 'packaging_item_id', l.packaging_item_id, 'code', i.code, 'name', i.name,
-          'item_type', i.item_type, 'qty', l.qty, 'qty_confirmed', l.qty_confirmed, 'notes', l.notes
+          'item_type', i.item_type, 'stock_on_hand', i.stock_on_hand, 'qty', l.qty, 'qty_confirmed', l.qty_confirmed, 'notes', l.notes
         ) ORDER BY i.item_type, i.code) FILTER (WHERE l.id IS NOT NULL), '[]') AS lines
        FROM packaging_boms b
        LEFT JOIN packaging_bom_lines l ON l.bom_id = b.id
