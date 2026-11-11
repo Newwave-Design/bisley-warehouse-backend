@@ -1,12 +1,45 @@
 import { query } from '../db/index.js';
 import { COLOUR_NAMES, componentDisplaySku, extractColourCode } from './colour-names.js';
 
+type CatalogueProduct = {
+  variant_sku: string
+  product_title?: string
+  is_kit?: boolean
+  kit_components?: { sku?: string; required_quantity?: number }[]
+  colour_name?: string
+  colour_code?: string
+  variant_thumbnail?: string
+  product_thumbnail?: string
+}
+
+function colourLabel(sku: string, meta?: { colour_code?: string; colour_name?: string }) {
+  const code = (meta?.colour_code || extractColourCode(sku) || '').toLowerCase()
+  const colourName = meta?.colour_name || COLOUR_NAMES[code] || ''
+  const colour = code && colourName && colourName.toLowerCase() !== code
+    ? `${colourName} (${code})`
+    : (colourName || code || '')
+  return { code, colour }
+}
+
+function withCatalogue<T extends { sku: string; title?: string; thumbnail?: string | null; colour?: string; colour_code?: string | null }>(item: T, product?: CatalogueProduct): T {
+  if (!product) return item
+  const { code, colour } = colourLabel(item.sku, product)
+  return {
+    ...item,
+    title: product.product_title || item.title,
+    colour_code: code || item.colour_code || null,
+    colour: colour || item.colour,
+    thumbnail: product.variant_thumbnail || product.product_thumbnail || item.thumbnail || null,
+  }
+}
+
 /** Replace kit lines with the parent plus the pieces to pick. The same expansion Pick Lists v2 uses. */
 export async function expandKitPicksByList<T extends { sku: string; quantity_required: number; quantity_picked: number }>(groups: T[][]): Promise<T[][]> {
   const skus = [...new Set(groups.flat().map(i => i.sku).filter(Boolean))];
   if (!skus.length) return groups;
   const kits = await query(
-    `SELECT DISTINCT ON (variant_sku) variant_sku, product_title, is_kit, kit_components
+    `SELECT DISTINCT ON (variant_sku) variant_sku, product_title, is_kit, kit_components,
+            colour_name, colour_code, variant_thumbnail, product_thumbnail
      FROM wms_products WHERE variant_sku = ANY($1::text[])
      ORDER BY variant_sku, is_archived`,
     [skus]
@@ -31,19 +64,15 @@ export async function expandKitPicksByList<T extends { sku: string; quantity_req
     for (const row of found.rows) info.set(row.variant_sku, row);
   }
   const expanded = groups.map(items => items.flatMap(item => {
-    const kit = bySku.get(item.sku) as { product_title?: string; is_kit?: boolean; kit_components?: { sku?: string; required_quantity?: number }[] } | undefined;
+    const kit = bySku.get(item.sku) as CatalogueProduct | undefined;
     const parts = (kit?.is_kit && Array.isArray(kit.kit_components) ? kit.kit_components : [])
       .filter(c => c?.sku && c.sku !== item.sku);
-    if (!parts.length) return [item];
-    const header = { ...item, kit_header: true, title: kit.product_title || (item as { title?: string }).title };
+    if (!parts.length) return [withCatalogue(item, kit)];
+    const header = { ...withCatalogue(item, kit), kit_header: true, title: kit?.product_title || (item as { title?: string }).title };
     return [header, ...parts.map(c => {
       const meta = info.get(c.sku as string) || info.get(componentDisplaySku(c.sku as string));
       const per = Number(c.required_quantity) || 1;
-      const code = (meta?.colour_code || extractColourCode(c.sku as string) || '').toLowerCase();
-      const colourName = meta?.colour_name || COLOUR_NAMES[code] || '';
-      const colour = code && colourName && colourName.toLowerCase() !== code
-        ? `${colourName} (${code})`
-        : (colourName || code || '');
+      const { code, colour } = colourLabel(c.sku as string, meta);
       return {
         ...item,
         title: meta?.product_title || c.sku,

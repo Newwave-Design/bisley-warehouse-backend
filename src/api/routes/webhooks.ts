@@ -17,6 +17,7 @@ import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { medusaGet } from '../../lib/medusa-client.js';
 import { checkPaymentOnPlacement, storePaymentStatus } from '../../lib/payment-status.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
+import { adjustReserved } from '../../lib/reserved-stock.js';
 import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { logError, logWarning } from '../../lib/logger.js';
 import { createNotification, createNotificationOnce } from '../../lib/notifications.js';
@@ -391,20 +392,13 @@ export async function handleOrderPlaced(order: any) {
     client.release();
   }
 
-  // Reserve the quantity immediately across all locations holding this SKU
-  // Note: Do NOT sync to Medusa here — Medusa stock is already down from the order.placed event
-  // (stock was deducted when the customer placed the order). We just reserve here in WMS.
+  // Reserve the quantity on the bay with free stock. Medusa has already reduced its own stock
+  // for the order, so this reservation stays in the warehouse only.
   for (const item of order.items ?? []) {
     const sku = item.variant?.sku ?? item.variant_sku ?? item.sku;
     if (!sku) continue;
     const quantity = Number(item.quantity) || 1;
-
-    await query(
-      `UPDATE warehouse_inventory
-       SET quantity_reserved = quantity_reserved + $1, updated_at = NOW()
-       WHERE product_sku = $2`,
-      [quantity, sku]
-    );
+    await adjustReserved({ query }, sku, quantity);
   }
 
   console.log(`✓ Pick list ${pickListNumber} created for order ${medusaOrderId} (${order.items?.length ?? 0} lines)`);
@@ -448,18 +442,14 @@ async function handleOrderCancelled(order: any) {
 
     // Get all items and their quantities
     const itemsResult = await query(
-      `SELECT product_sku, quantity_required FROM pick_list_items WHERE pick_list_id = $1`,
+      `SELECT product_sku, quantity_required, is_archived FROM pick_list_items WHERE pick_list_id = $1`,
       [pickListId]
     );
 
     // Release reserved stock for each item
     for (const item of itemsResult.rows) {
-      await query(
-        `UPDATE warehouse_inventory
-         SET quantity_reserved = GREATEST(0, quantity_reserved - $1), updated_at = NOW()
-         WHERE product_sku = $2`,
-        [item.quantity_required, item.product_sku]
-      );
+      if (item.is_archived) continue;
+      await adjustReserved({ query }, item.product_sku, -Number(item.quantity_required || 0));
       affectedSkus.add(item.product_sku);
     }
 
@@ -526,10 +516,7 @@ export async function handleOrderEdited(order: any) {
   try {
     await client.query('BEGIN');
     const wms = (await client.query(`SELECT * FROM pick_list_items WHERE pick_list_id = $1 ORDER BY line_number FOR UPDATE`, [parent.id])).rows;
-    const reserve = (sku: string, delta: number) => client.query(
-      `UPDATE warehouse_inventory SET quantity_reserved = GREATEST(0, quantity_reserved + $1), updated_at = NOW() WHERE product_sku = $2`,
-      [delta, sku]
-    );
+    const reserve = (sku: string, delta: number) => adjustReserved(client, sku, delta);
 
     for (const w of wms) {
       if (!w.medusa_order_line_item_id || w.is_archived) continue;

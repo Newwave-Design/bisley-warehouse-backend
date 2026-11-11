@@ -7,6 +7,10 @@
 const LIVE_URL = 'https://dm6api.dxfreight.co.uk/DespatchManager.API.Service.DM6Lite/DM6LiteService.svc';
 const FALLBACK_PHONE = '01873900095';
 
+/** One person, up to 50kg, longest side up to 6 metres. Timed services are the same size. */
+const DX_MAX_WEIGHT_KG = 50;
+const DX_MAX_LENGTH_CM = 600;
+
 const SERVICES: { code: string; name: string; deliveryDays: number; saturday: boolean; preferred: boolean }[] = [
   { code: 'ON', name: 'Overnight', deliveryDays: 1, saturday: false, preferred: true },
   { code: '930', name: 'Overnight 9:30', deliveryDays: 1, saturday: false, preferred: false },
@@ -204,13 +208,26 @@ function servicesFor(day: { year: number; month: number; day: number; weekday: s
   });
 }
 
+export function dxBoxesFit(pieces: { weightKg: number; lengthCm: number; widthCm: number; heightCm: number }[]): boolean {
+  return pieces.length > 0 && pieces.every((piece) => {
+    const weight = Number(piece.weightKg);
+    const longest = Math.max(Number(piece.lengthCm), Number(piece.widthCm), Number(piece.heightCm));
+    return weight > 0 && weight <= DX_MAX_WEIGHT_KG && longest > 0 && longest <= DX_MAX_LENGTH_CM;
+  });
+}
+
 export function quoteDxCollection(input: {
-  pieces: number;
+  pieces: number | { weightKg: number; lengthCm: number; widthCm: number; heightCm: number }[];
   collectionPostcode: string;
   deliveryPostcode: string;
   collectionDate?: string;
   now?: Date;
 }) {
+  const boxes = Array.isArray(input.pieces) ? input.pieces : [];
+  if (boxes.length && !dxBoxesFit(boxes)) {
+    throw new DxError('No DX service fits this box. DX takes one-person items up to 50 kg and 6 m.');
+  }
+  const pieceCount = Array.isArray(input.pieces) ? input.pieces.length : input.pieces;
   const requested = input.collectionDate ? parseDmy(input.collectionDate) : null;
   if (input.collectionDate && !requested) throw new DxError('Choose a collection date');
   if (requested && isWeekend(requested.weekday)) throw new DxError('DX collects on a weekday');
@@ -221,7 +238,7 @@ export function quoteDxCollection(input: {
   const collectionDates = days.map((day) => ({ date: formatDmy(day), services: servicesFor(day) }));
   return {
     booked: false,
-    pieces: input.pieces,
+    pieces: pieceCount,
     collectionPostcode: input.collectionPostcode,
     deliveryPostcode: input.deliveryPostcode,
     collectionDate: collectionDates[0]?.date || '',
@@ -375,6 +392,7 @@ export async function addDxConsignment(input: {
   const today = londonParts();
   if (dateKey(day) < dateKey(today)) throw new DxError('That collection date has passed');
   if (!input.pieces.length) throw new DxError('Add at least one box');
+  if (!dxBoxesFit(input.pieces)) throw new DxError('No DX service fits this box. DX takes one-person items up to 50 kg and 6 m.');
 
   const postcode = input.delivery.postcode.toUpperCase().replace(/\s+/g, ' ').trim();
   if (/^BT/i.test(postcode)) throw new DxError('Northern Ireland needs a customs declaration before DX can book it');
@@ -488,6 +506,7 @@ export async function addDxCollection(input: {
   if (!day || isWeekend(day.weekday)) throw new DxError('DX collects on a weekday');
   if (dateKey(day) < dateKey(londonParts())) throw new DxError('That collection date has passed');
   if (!input.pieces.length) throw new DxError('Add at least one box');
+  if (!dxBoxesFit(input.pieces)) throw new DxError('No DX service fits this box. DX takes one-person items up to 50 kg and 6 m.');
 
   const postcode = input.collection.postcode.toUpperCase().replace(/\s+/g, ' ').trim();
   if (/^BT/i.test(postcode)) throw new DxError('Northern Ireland needs a customs declaration before DX can collect it');

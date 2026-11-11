@@ -19,7 +19,7 @@ import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { buildLines, type ReorderLine } from './supplier-reorders.js';
-import { orderedCover, orderedQuantity } from '../../lib/ovara-orders.js';
+import { orderedCover, orderedQuantity, volumeFilerSku } from '../../lib/ovara-orders.js';
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -70,7 +70,7 @@ async function loadState() {
   const bondedSkus = new Set<string>(bonded.rows.map((r: { product_sku: string }) => r.product_sku));
   const ordered = new Map<string, number>();
   for (const r of orderedRows.rows as { sku: string; qty: number }[]) {
-    const sku = r.sku.replace(/^aoc([23])a-/, (_, n: string) => `aoc${n}e-`);
+    const sku = volumeFilerSku(r.sku);
     ordered.set(sku, (ordered.get(sku) ?? 0) + Number(r.qty));
   }
   const saleCovers = new Map<string, number>(coverRows.rows.map((r: { pick_list_item_id: string; sku: string; units: number }) => [`${r.pick_list_item_id}|${r.sku}`, Number(r.units)]));
@@ -122,7 +122,7 @@ function presentLine(l: ReorderLine, state: Awaited<ReturnType<typeof loadState>
 function soldBySku(lines: ReorderLine[]): Map<string, number> {
   const sold = new Map<string, number>();
   for (const l of lines) {
-    const sku = l.sku.toLowerCase();
+    const sku = volumeFilerSku(l.sku);
     if (sku === 'custom' || sku.includes('sample')) continue;
     sold.set(sku, (sold.get(sku) ?? 0) + l.sold_quantity);
   }
@@ -171,14 +171,17 @@ async function runRates(lines: ReorderLine[], state: Awaited<ReturnType<typeof l
     let orderedUnits = 0;
     let still = 0;
     const soldKeys = new Set([...g.sold_skus].map(sku => sku.toLowerCase()));
+    const groupSkus = new Set([...groups.keys()].map(sku => sku.toLowerCase()));
     for (const sku of g.sold_skus) {
       if (sku.toLowerCase() === 'custom' || sku.toLowerCase().includes('sample')) continue;
-      orderedUnits += orderedQuantity(state.ordered, sku);
+      const canon = volumeFilerSku(sku);
+      if (g.sku.toLowerCase() !== canon && groupSkus.has(canon)) continue;
+      orderedUnits += orderedQuantity(state.ordered, canon);
       if (/p1-/i.test(sku)) {
         const pack = sku.replace(/p1-/i, 'p5-').toLowerCase();
         if (!soldKeys.has(pack)) orderedUnits += orderedQuantity(state.ordered, pack);
       }
-      still += Math.max(0, (sold.get(sku.toLowerCase()) ?? 0) - orderedCover(state.ordered, sold, sku));
+      still += Math.max(0, (sold.get(canon) ?? 0) - orderedCover(state.ordered, sold, canon));
     }
     return {
       sku: g.sku,
@@ -291,7 +294,7 @@ function toBuyRows(lines: ReorderLine[], state: Awaited<ReturnType<typeof loadSt
   const sold = soldBySku(lines);
   const bySku = new Map<string, ReorderLine[]>();
   for (const l of lines) {
-    const sku = l.sku.toLowerCase();
+    const sku = volumeFilerSku(l.sku);
     if (!sold.has(sku)) continue;
     const list = bySku.get(sku) ?? [];
     list.push(l);
@@ -303,7 +306,7 @@ function toBuyRows(lines: ReorderLine[], state: Awaited<ReturnType<typeof loadSt
     const oldest = [...group].sort((a, b) => new Date(a.ordered_at).getTime() - new Date(b.ordered_at).getTime());
     for (const l of oldest) {
       let open = l.sold_quantity;
-      const specific = state.saleCovers.get(`${l.pick_list_item_id}|${sku}`) ?? 0;
+      const specific = state.saleCovers.get(`${l.pick_list_item_id}|${l.sku.toLowerCase()}`) ?? 0;
       open -= Math.min(open, specific);
       const fromPool = Math.min(open, pool);
       open -= fromPool;

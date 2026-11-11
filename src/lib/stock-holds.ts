@@ -1,5 +1,5 @@
 /**
- * Assigns stock on hand to open paid orders, oldest first.
+ * Assigns stock on hand to open orders, oldest first. A purchase order counts as paid.
  * A scan may take one unit of a SKU only while this order still has some of its count left.
  * Samples are ignored. A kit is assigned its parts, and only in complete kits, so one part is not trapped.
  * Units already picked or scanned stay with that order.

@@ -25,6 +25,7 @@ import { buildSampleAddressZpl, formatSampleAddressLabel, formatShippingAddressT
 import { attachPackaging } from '../../lib/pick-list-packaging.js';
 import { expandKitPicksByList } from '../../lib/pick-list-kits.js';
 import { confirmPartFulfilment, inspectPartFulfilment, PartFulfilError } from '../../lib/part-fulfilment.js';
+import { openPartsSend, PartsSendError } from '../../lib/parts-send.js';
 import { stockReservations, takeReservedItem } from '../../lib/stock-reservations.js';
 import { addReturnRequestImage, cancelReturnRequests, deleteReturnRequestImage, listReturnRequests, requestReturns, returnRequestImage, ReturnRequestError } from '../../lib/return-requests.js';
 
@@ -321,14 +322,14 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.payment_status,
          pl.purchase_order_number,
          (SELECT parent.pick_list_number FROM pick_lists parent
-           WHERE parent.id = pl.parent_pick_list_id AND pl.medusa_order_id LIKE '%-PF%') AS part_of_number,
+           WHERE parent.id = pl.parent_pick_list_id AND (pl.medusa_order_id LIKE '%-PF%' OR pl.medusa_order_id LIKE 'manual-%' OR pl.medusa_order_id LIKE 'part-%')) AS part_of_number,
          (SELECT parent.id FROM pick_lists parent
            WHERE parent.id = pl.parent_pick_list_id AND COALESCE(pl.is_return, false)) AS return_of_id,
          (SELECT parent.pick_list_number FROM pick_lists parent
            WHERE parent.id = pl.parent_pick_list_id AND COALESCE(pl.is_return, false)) AS return_of_number,
          (SELECT string_agg(child.pick_list_number, ', ' ORDER BY child.created_at)
             FROM pick_lists child
-           WHERE child.parent_pick_list_id = pl.id AND child.medusa_order_id LIKE '%-PF%') AS part_numbers,
+           WHERE child.parent_pick_list_id = pl.id AND (child.medusa_order_id LIKE '%-PF%' OR child.medusa_order_id LIKE 'manual-%' OR child.medusa_order_id LIKE 'part-%')) AS part_numbers,
          pl.last_event_at,
          pl.last_event_by,
          pl.last_event_summary,
@@ -1122,9 +1123,29 @@ router.patch('/:pickListId/notes/:noteId', authMiddleware, async (req: AuthReque
  * With confirm, moves scanned goods onto a linked pick list and leaves the rest in To pick.
  * A normal line can split by the quantity already scanned. An inventory kit stays whole. This does not raise a reorder.
  */
+router.post('/:pickListId/parts', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const created = await openPartsSend(req.params.pickListId, {
+      sku: req.body?.sku,
+      quantity: req.body?.quantity,
+      reason: req.body?.reason,
+      byHand: req.body?.by_hand !== false,
+    });
+    return res.status(201).json(created);
+  } catch (error) {
+    if (error instanceof PartsSendError) return res.status(error.status).json({ error: error.message });
+    console.error('Parts send error:', error);
+    return res.status(500).json({ error: 'Failed to raise that part' });
+  }
+});
+
 router.post('/:pickListId/part-fulfil', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { pickListId } = req.params;
+    const manual = await query(`SELECT medusa_order_id FROM pick_lists WHERE id = $1`, [pickListId]);
+    if (String(manual.rows[0]?.medusa_order_id || '').startsWith('manual-')) {
+      return res.status(400).json({ error: 'This send is by hand. Print an address label and mark it shipped. Do not book APC or DX.' });
+    }
     if (req.body?.confirm === true) {
       const result = await confirmPartFulfilment(pickListId, actorName((req as AuthRequest).user));
       return res.json(result);
@@ -1889,6 +1910,16 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: AuthRequest, r
   }
 
   try {
+    // A refund or a replacement stays in the warehouse. Shop stock, fulfilment, and tracking are updated by hand.
+    if (pickList.is_return) {
+      return res.json({
+        success: true,
+        dispatched: itemCount,
+        skus_synced: 0,
+        short_skus: shortfalls.length > 0 ? shortfalls : undefined,
+        medusa_sync: { ok: true, skipped: true },
+      });
+    }
     // Push new WMS totals to Medusa for all affected SKUs
     const syncErrors: string[] = [];
     for (const sku of syncSkus) {
@@ -1912,11 +1943,11 @@ router.patch('/:pickListId/dispatch', authMiddleware, async (req: AuthRequest, r
     });
   } catch (error) {
     console.error('Pick list dispatch Medusa sync error:', error);
-    const medusa_sync = await fulfillPickListInMedusa(pickListId);
+    const medusa_sync = pickList.is_return ? { ok: true, skipped: true } : await fulfillPickListInMedusa(pickListId);
     res.json({
       success: true,
       dispatched: itemCount,
-      sync_errors: ['Medusa stock sync failed - run a stock sync'],
+      sync_errors: pickList.is_return ? undefined : ['Medusa stock sync failed - run a stock sync'],
       short_skus: shortfalls.length > 0 ? shortfalls : undefined,
       medusa_sync,
     });
@@ -2113,7 +2144,7 @@ router.patch('/:pickListId/dispatch', authMiddleware, requirePermission('manage_
 
     // Get pick list and all items
     const plResult = await query(
-      `SELECT id, medusa_order_id, medusa_fulfillment_id, status FROM pick_lists WHERE id = $1`,
+      `SELECT id, medusa_order_id, medusa_fulfillment_id, status, is_return FROM pick_lists WHERE id = $1`,
       [pickListId]
     );
 
@@ -2153,8 +2184,10 @@ router.patch('/:pickListId/dispatch', authMiddleware, requirePermission('manage_
 
     let medusaSync = { success: false, message: 'No Medusa fulfillment ID found' };
 
-    // If we have a fulfillment ID and Medusa auth is available, sync tracking to Medusa
-    if (pickList.medusa_fulfillment_id) {
+    // Returns are handled on the shop by hand. Do not write tracking back.
+    if (pickList.is_return) {
+      medusaSync = { success: true, message: 'Return left unchanged on the shop' };
+    } else if (pickList.medusa_fulfillment_id) {
       try {
         const { medusaPost } = await import('../../lib/medusa-client.js');
         medusaSync = await medusaPost(
@@ -2208,13 +2241,14 @@ router.post('/:pickListId/sync-to-medusa', authMiddleware, requirePermission('ma
 
     // Get pick list
     const plResult = await query(
-      `SELECT id, medusa_order_id, status FROM pick_lists WHERE id = $1`,
+      `SELECT id, medusa_order_id, status, is_return FROM pick_lists WHERE id = $1`,
       [pickListId]
     );
 
     if (!plResult.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
 
     const pickList = plResult.rows[0];
+    if (pickList.is_return) return res.status(409).json({ error: 'A return is not sent to the shop. Update Medusa by hand.' });
     if (pickList.status !== 'PACKED' && pickList.status !== 'LABEL_PRINTED') {
       return res.status(400).json({ error: `Pick list must be PACKED or LABEL_PRINTED, currently ${pickList.status}` });
     }
@@ -2286,13 +2320,14 @@ router.post('/:pickListId/shipment-to-medusa', authMiddleware, requirePermission
 
     // Get pick list
     const plResult = await query(
-      `SELECT id, medusa_fulfillment_id, status FROM pick_lists WHERE id = $1`,
+      `SELECT id, medusa_fulfillment_id, status, is_return FROM pick_lists WHERE id = $1`,
       [pickListId]
     );
 
     if (!plResult.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
 
     const pickList = plResult.rows[0];
+    if (pickList.is_return) return res.status(409).json({ error: 'A return is not sent to the shop. Update Medusa by hand.' });
     if (!pickList.medusa_fulfillment_id) {
       return res.status(400).json({ error: 'Pick list has not been synced to Medusa yet. Call /sync-to-medusa first.' });
     }

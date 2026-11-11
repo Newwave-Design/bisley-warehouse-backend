@@ -49,3 +49,29 @@ export async function recordPickListEvents(input: {
     [ids, input.actor, input.action, input.summary],
   );
 }
+
+/** A cancelled collection is not a shipment. Move the order back to Picked when nothing is still booked. */
+export async function reopenDispatchedPickList(pickListId: string, actor: string): Promise<boolean> {
+  const open = await query(
+    `SELECT 1 FROM collection_bookings
+      WHERE pick_list_id = $1
+        AND status <> 'cancelled'
+        AND COALESCE(direction, 'outbound') <> 'return'
+      LIMIT 1`,
+    [pickListId],
+  );
+  if (open.rows.length) return false;
+  const updated = await query(
+    `UPDATE pick_lists SET dispatched_at = NULL WHERE id = $1 AND status = 'DISPATCHED' RETURNING id`,
+    [pickListId],
+  );
+  if (!updated.rows.length) return false;
+  await recordPickListEvents({
+    ids: [pickListId],
+    actor,
+    action: 'status',
+    summary: 'Collection cancelled — back to picked',
+    status: 'PICKED',
+  });
+  return true;
+}

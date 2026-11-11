@@ -9,10 +9,12 @@ import { getPool, query } from '../../db/index.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { rememberShipmentTracking } from '../../lib/shipment-tracking.js';
 import { returnStockForCancelledCollection, takeStockForBookedCollection } from '../../lib/collection-stock.js';
+import { actorName, reopenDispatchedPickList } from '../../lib/pick-list-events.js';
 import { fitZpl } from '../../lib/zpl-fit.js';
 import { addDxCollection, addDxConsignment, deleteDxConsignment, dxConfigured, DxError, fetchDxLabels, quoteDxCollection } from '../../lib/dx-freight.js';
 import { openReturnReplacement, releaseReturnReplacement } from '../../lib/return-replacement.js';
 import { markReturnRequestsBooked, reopenReturnRequests } from '../../lib/return-requests.js';
+import { appropriateApcServices } from '../../lib/apc-service.js';
 
 async function dropReplacements(pickListId: string | undefined, waybill: string) {
   if (!pickListId || !waybill) return;
@@ -183,7 +185,12 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
     if (!dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
     try {
       const quoted = quoteDxCollection({
-        pieces: pieces.length,
+        pieces: pieces.map((piece) => ({
+          weightKg: Number(piece.weightKg),
+          lengthCm: Number(piece.lengthCm),
+          widthCm: Number(piece.widthCm),
+          heightCm: Number(piece.heightCm),
+        })),
         collectionPostcode,
         deliveryPostcode,
         collectionDate: returning ? agreedDate : text(req.body?.collectionDate).trim(),
@@ -229,10 +236,27 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
         byDate.set(date, list);
       }
     }
-    const collectionDates = [...byDate.entries()]
+    const boxes = items.map((item) => ({
+      weightKg: Number(item.Weight),
+      lengthCm: Number(item.Length),
+      widthCm: Number(item.Width),
+      heightCm: Number(item.Height),
+    }));
+    const offered = [...byDate.entries()]
       .sort((left, right) => dateSortKey(left[0]) - dateSortKey(right[0]))
       .map(([date, services]) => ({ date, services }));
+    const collectionDates = offered
+      .map((entry) => ({ date: entry.date, services: appropriateApcServices(entry.services, boxes) }))
+      .filter((entry) => entry.services.length);
     const services = collectionDates[0]?.services || [];
+    if (!collectionDates.length) {
+      const apcListedSomething = offered.some((entry) => entry.services.length);
+      return res.status(409).json({
+        error: apcListedSomething
+          ? 'No APC service fits this box. Check the weight and size.'
+          : 'APC cannot collect on that date. Call the customer and agree another date.',
+      });
+    }
     if (returning) {
       const exact = collectionDates.filter((entry) => entry.date === agreedDate && entry.services.length);
       if (!exact.length) {
@@ -505,12 +529,15 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
 
   try {
     const found = await query(
-      `SELECT id, pick_list_number, customer_name, customer_email, shipping_address
+      `SELECT id, pick_list_number, customer_name, customer_email, shipping_address, medusa_order_id
          FROM pick_lists WHERE id = $1`,
       [pickListId]
     );
-    const list = found.rows[0] as { pick_list_number?: string; customer_name?: string; customer_email?: string; shipping_address?: any } | undefined;
+    const list = found.rows[0] as { pick_list_number?: string; customer_name?: string; customer_email?: string; shipping_address?: any; medusa_order_id?: string } | undefined;
     if (!list) return res.status(404).json({ error: 'Unknown order' });
+    if (!returning && String(list.medusa_order_id || '').startsWith('manual-')) {
+      return res.status(400).json({ error: 'This send is by hand. Print an address label and mark it shipped. Do not book APC or DX.' });
+    }
 
     const requestedSkus = [...new Set(asList<any>(req.body?.skus).map((sku) => text(sku).trim()).filter(Boolean))];
     const skus = requestedSkus.length ? requestedSkus : [...new Set(pieces.map((piece) => piece.sku).filter(Boolean))];
@@ -918,7 +945,7 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
           WHERE pick_list_id = $1 AND waybill = $2 AND status <> 'cancelled'`,
         [booking.pick_list_id, waybill]
       );
-      if (waybill) {
+      if (waybill && booking.direction !== 'return') {
         await query(
           `UPDATE pick_lists
               SET tracking_number = NULL, carrier = NULL, updated_at = NOW()
@@ -929,6 +956,9 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
       if (booking.pick_list_id && waybill && booking.direction !== 'return') {
         await returnStockForCancelledCollection(booking.pick_list_id, waybill, text(req.user?.id)).catch((error) => {
           console.warn('Returning cancelled collection stock failed', error instanceof Error ? error.message : 'failed');
+        });
+        await reopenDispatchedPickList(booking.pick_list_id, actorName(req.user)).catch((error) => {
+          console.warn('Moving the cancelled collection back to picked failed', error instanceof Error ? error.message : 'failed');
         });
       }
       return res.json({ cancelled: true });
@@ -969,7 +999,7 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
         WHERE pick_list_id = $1 AND waybill = $2 AND status <> 'cancelled'`,
       [booking.pick_list_id, waybill]
     );
-    if (waybill) {
+    if (waybill && booking.direction !== 'return') {
       await query(
         `UPDATE pick_lists
             SET tracking_number = NULL, carrier = NULL, updated_at = NOW()
@@ -980,6 +1010,9 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
     if (booking.pick_list_id && waybill && booking.direction !== 'return') {
       await returnStockForCancelledCollection(booking.pick_list_id, waybill, text(req.user?.id)).catch((error) => {
         console.warn('Returning cancelled collection stock failed', error instanceof Error ? error.message : 'failed');
+      });
+      await reopenDispatchedPickList(booking.pick_list_id, actorName(req.user)).catch((error) => {
+        console.warn('Moving the cancelled collection back to picked failed', error instanceof Error ? error.message : 'failed');
       });
     }
     return res.json({ cancelled: true });

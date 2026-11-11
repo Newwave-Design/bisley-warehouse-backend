@@ -7,7 +7,7 @@ import express, { Response } from 'express';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { query } from '../../db/index.js';
 import { fulfillPickListsInMedusa } from '../../lib/medusa-fulfillment.js';
-import { actorName, recordPickListEvents } from '../../lib/pick-list-events.js';
+import { actorName, recordPickListEvents, reopenDispatchedPickList } from '../../lib/pick-list-events.js';
 import {
   createRoyalMailOrders,
   deleteRoyalMailOrders,
@@ -341,6 +341,9 @@ router.post('/cancel', authMiddleware, async (req: AuthRequest, res: Response) =
       `UPDATE collection_bookings SET status = 'cancelled', updated_at = NOW() WHERE id = $1`,
       [booking.id],
     );
+    await reopenDispatchedPickList(id, actorName(req.user)).catch((error) => {
+      console.warn('Moving the cancelled collection back to picked failed', error instanceof Error ? error.message : 'failed');
+    });
     return res.json({ cancelled: true });
   } catch (error) {
     if (error instanceof RoyalMailError) {

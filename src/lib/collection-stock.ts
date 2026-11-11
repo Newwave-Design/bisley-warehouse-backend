@@ -34,7 +34,7 @@ export async function takeStockForBookedCollection(pickListId: string, preferred
   const userId = await actorId(preferredActor);
   if (!userId) return;
   const found = await query(
-    `SELECT pl.id, pl.medusa_order_id, pl.is_sandbox, pl.payment_status, pl.purchase_order_number,
+    `SELECT pl.id, pl.medusa_order_id, pl.is_sandbox, pl.is_return, pl.payment_status, pl.purchase_order_number,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT cb.sku), NULL) AS skus
      FROM pick_lists pl
      JOIN collection_bookings cb ON cb.pick_list_id = pl.id AND cb.status <> 'cancelled' AND COALESCE(cb.direction, 'outbound') <> 'return'
@@ -61,7 +61,7 @@ export async function takeStockForBookedCollection(pickListId: string, preferred
     client.release();
   }
   if (!changed.length) return;
-  await pushStock(changed);
+  if (!list.is_return) await pushStock(changed);
   scheduleAllocationRun(`collection booked for pick list ${pickListId}`);
 }
 
@@ -128,7 +128,8 @@ export async function returnStockForCancelledCollection(pickListId: string, wayb
     client.release();
   }
   if (!changed.size) return;
-  await pushStock([...changed]);
+  const list = await query(`SELECT is_return FROM pick_lists WHERE id = $1`, [pickListId]);
+  if (!list.rows[0]?.is_return) await pushStock([...changed]);
   scheduleAllocationRun(`collection cancelled for pick list ${pickListId}`);
 }
 

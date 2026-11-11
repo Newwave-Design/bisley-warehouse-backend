@@ -299,12 +299,12 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
       SELECT
         pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at, pl.is_return,
         (SELECT parent.pick_list_number FROM pick_lists parent
-          WHERE parent.id = pl.parent_pick_list_id AND pl.medusa_order_id LIKE '%-PF%') AS part_of_number,
+          WHERE parent.id = pl.parent_pick_list_id AND (pl.medusa_order_id LIKE '%-PF%' OR pl.medusa_order_id LIKE 'manual-%' OR pl.medusa_order_id LIKE 'part-%')) AS part_of_number,
         (SELECT parent.pick_list_number FROM pick_lists parent
           WHERE parent.id = pl.parent_pick_list_id AND COALESCE(pl.is_return, false)) AS return_of_number,
         (SELECT string_agg(child.pick_list_number, ', ' ORDER BY child.created_at)
            FROM pick_lists child
-          WHERE child.parent_pick_list_id = pl.id AND child.medusa_order_id LIKE '%-PF%') AS part_numbers,
+          WHERE child.parent_pick_list_id = pl.id AND (child.medusa_order_id LIKE '%-PF%' OR child.medusa_order_id LIKE 'manual-%' OR child.medusa_order_id LIKE 'part-%')) AS part_numbers,
         -- The scanner sorts oldest first and does not pin replacements, so an open return is dated back to the top of To pick.
         CASE WHEN COALESCE(pl.is_return, false) AND pl.status IN ('PENDING', 'IN_PROGRESS', 'AWAITING_STOCK')
              THEN pl.created_at - INTERVAL '100 years'
@@ -430,10 +430,10 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
       SELECT pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at, pl.is_return,
              pl.parent_pick_list_id, pl.customer_name, pl.customer_email, pl.shipping_address,
              (SELECT parent.pick_list_number FROM pick_lists parent
-               WHERE parent.id = pl.parent_pick_list_id AND pl.medusa_order_id LIKE '%-PF%') AS part_of_number,
+               WHERE parent.id = pl.parent_pick_list_id AND (pl.medusa_order_id LIKE '%-PF%' OR pl.medusa_order_id LIKE 'manual-%' OR pl.medusa_order_id LIKE 'part-%')) AS part_of_number,
              (SELECT string_agg(child.pick_list_number, ', ' ORDER BY child.created_at)
                 FROM pick_lists child
-               WHERE child.parent_pick_list_id = pl.id AND child.medusa_order_id LIKE '%-PF%') AS part_numbers
+               WHERE child.parent_pick_list_id = pl.id AND (child.medusa_order_id LIKE '%-PF%' OR child.medusa_order_id LIKE 'manual-%' OR child.medusa_order_id LIKE 'part-%')) AS part_numbers
       FROM pick_lists pl WHERE pl.id = $1
     `, [req.params.id]);
     if (!pl.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
@@ -604,9 +604,8 @@ async function recomputePickItem(pickListId: string, itemId: string) {
     `SELECT quantity, scanned_barcode, component_sku FROM pick_scans WHERE pick_list_item_id = $1`,
     [itemId]
   );
-  const item = await query(`SELECT quantity_required, product_sku FROM pick_list_items WHERE id = $1`, [itemId]);
+  const item = await query(`SELECT quantity_required FROM pick_list_items WHERE id = $1`, [itemId]);
   const required = item.rows[0]?.quantity_required ?? 0;
-  const parentSku = item.rows[0]?.product_sku as string | undefined;
   const parts = await kitPartsOf(itemId);
 
   let picked: number;
@@ -618,16 +617,10 @@ async function recomputePickItem(pickListId: string, itemId: string) {
       if (!sku) continue;
       got.set(sku, (got.get(sku) ?? 0) + Number(scan.quantity));
     }
-    const parentGot = parentSku ? (got.get(parentSku) ?? 0) : 0;
-    const complete = Math.min(
-      parentGot,
-      parts.reduce((min, part) => Math.min(min, Math.floor((got.get(part.sku) ?? 0) / part.required_quantity)), required),
-    );
-    const done = required > 0
-      && parentGot >= required
-      && parts.every((part) => (got.get(part.sku) ?? 0) >= part.required_quantity * required);
-    picked = Math.max(0, Math.min(complete, required));
-    status = done ? 'PICKED' : scans.rows.length ? 'PICKING' : 'PENDING';
+    const fromParts = parts.reduce((min, part) => Math.min(min, Math.floor((got.get(part.sku) ?? 0) / part.required_quantity)), required);
+    const partsDone = required > 0 && parts.every((part) => (got.get(part.sku) ?? 0) >= part.required_quantity * required);
+    picked = Math.max(0, Math.min(fromParts, required));
+    status = partsDone ? 'PICKED' : scans.rows.length ? 'PICKING' : 'PENDING';
   } else {
     const sum = scans.rows.reduce((total: number, scan: any) => total + Number(scan.quantity), 0);
     picked = Math.min(sum, required);
@@ -640,7 +633,7 @@ async function recomputePickItem(pickListId: string, itemId: string) {
   );
 
   const remaining = await query(
-    `SELECT COUNT(*) FROM pick_list_items WHERE pick_list_id = $1 AND status != 'PICKED'`,
+    `SELECT COUNT(*) FROM pick_list_items WHERE pick_list_id = $1 AND status != 'PICKED' AND NOT COALESCE(is_archived, false)`,
     [pickListId]
   );
   const allPicked = parseInt(remaining.rows[0].count) === 0;
@@ -649,9 +642,27 @@ async function recomputePickItem(pickListId: string, itemId: string) {
     [pickListId]
   );
   const started = scansOnList.rows[0].n > 0;
+  const current = await query(`SELECT status FROM pick_lists WHERE id = $1`, [pickListId]);
+  const now = current.rows[0]?.status as string | undefined;
+  let next = allPicked ? 'PICKED' : started ? 'IN_PROGRESS' : 'PENDING';
+  if (allPicked && now && ['PACKING', 'PACKED', 'LABEL_PRINTED', 'DISPATCHED'].includes(now)) next = now;
+  if (next === 'PICKED') {
+    const booking = await query(
+      `SELECT 1 FROM collection_bookings
+        WHERE pick_list_id = $1 AND status <> 'cancelled' AND COALESCE(direction, 'outbound') <> 'return'
+        LIMIT 1`,
+      [pickListId]
+    );
+    if (booking.rows.length) next = 'LABEL_PRINTED';
+  }
   await query(
-    `UPDATE pick_lists SET status = $1, updated_at = NOW() WHERE id = $2`,
-    [allPicked ? 'PICKED' : started ? 'IN_PROGRESS' : 'PENDING', pickListId]
+    `UPDATE pick_lists
+        SET status = $1,
+            completed_at = CASE WHEN $1 IN ('PICKED', 'LABEL_PRINTED') THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
+            label_printed_at = CASE WHEN $1 = 'LABEL_PRINTED' THEN COALESCE(label_printed_at, NOW()) ELSE label_printed_at END,
+            updated_at = NOW()
+      WHERE id = $2`,
+    [next, pickListId]
   );
 
   return { item: updated.rows[0], allPicked };

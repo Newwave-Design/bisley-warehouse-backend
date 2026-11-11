@@ -24,6 +24,19 @@ export function shopSkuForOvaraCode(raw: string, known: Set<string>): string {
   return hyphenated;
 }
 
+/**
+ * IPPC and AOC are the same cabinet. A12/A13/A14 are the 2, 3 and 4 drawer,
+ * and the A and E finishes are the same product. Orders and sales share one code.
+ */
+export function volumeFilerSku(sku: string): string {
+  const key = sku.toLowerCase();
+  const ippc = key.match(/^ipcca(1[234])[ae]?-(.+)$/);
+  if (ippc) return `aoc${Number(ippc[1]) - 10}e-${ippc[2]}`;
+  const aoc = key.match(/^aoc([234])[ae]?-(.+)$/);
+  if (aoc) return `aoc${aoc[1]}e-${aoc[2]}`;
+  return key;
+}
+
 /** File quantity for this shop SKU, including a self-colour code stored with or without -000. */
 export function orderedQuantity(ordered: Map<string, number>, sku: string): number {
   const key = sku.toLowerCase();

@@ -1,6 +1,6 @@
 import { query } from '../db/index.js';
 import { fetchDxTrackingNumbers } from './dx-freight.js';
-import { saveMedusaShipment } from './medusa-fulfillment.js';
+import { saveShopTracking } from './medusa-fulfillment.js';
 import { rootMedusaOrderId } from './order-values.js';
 
 /**
@@ -28,6 +28,7 @@ type BookingRow = {
   medusa_order_id: string | null;
   medusa_fulfillment_id: string | null;
   is_sandbox: boolean;
+  is_return: boolean;
   courier: string;
   waybill: string | null;
   delivery_postcode: string | null;
@@ -139,10 +140,10 @@ async function missingNumbers(row: BookingRow): Promise<string[]> {
 async function attachMedusaLabel(row: BookingRow, tracking: StoredTracking) {
   // The shop shipment for APC and DX is sent when the carrier scan says the parcel is on its way.
   if (text(row.courier).toUpperCase() === 'APC' || text(row.courier).toUpperCase() === 'DX') return;
-  if (row.is_sandbox || row.status !== 'DISPATCHED' || !row.medusa_fulfillment_id || !row.medusa_order_id) return;
+  if (row.is_sandbox || row.is_return || row.status !== 'DISPATCHED' || !row.medusa_fulfillment_id || !row.medusa_order_id) return;
   if (!row.medusa_order_id.startsWith('order_')) return;
   try {
-    await saveMedusaShipment(rootMedusaOrderId(row.medusa_order_id), row.medusa_fulfillment_id, tracking.number, tracking.url);
+    await saveShopTracking(rootMedusaOrderId(row.medusa_order_id), row.medusa_fulfillment_id, row.courier, tracking.number, tracking.url);
   } catch (error) {
     console.warn(
       `[tracking] Medusa label for ${row.id}:`,
@@ -158,7 +159,7 @@ export async function rememberShipmentTracking(pickListId?: string): Promise<{ f
   const found = await query(
     `SELECT DISTINCT ON (pl.id)
             pl.id, pl.status, pl.tracking_number, pl.tracking_url,
-            pl.medusa_order_id, pl.medusa_fulfillment_id, pl.is_sandbox,
+            pl.medusa_order_id, pl.medusa_fulfillment_id, pl.is_sandbox, pl.is_return,
             b.courier, b.waybill, b.delivery_postcode, b.apc_order_number, b.pieces
      FROM pick_lists pl
      JOIN collection_bookings b ON b.pick_list_id = pl.id AND b.status <> 'cancelled' AND COALESCE(b.direction, 'outbound') <> 'return'

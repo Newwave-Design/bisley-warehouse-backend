@@ -61,11 +61,13 @@ export async function storePaymentStatus(orderId: string, status: string): Promi
 
 async function storePurchaseOrder(orderId: string, purchaseOrder: string): Promise<void> {
   const match = splitOrderMatch('medusa_order_id', '$1');
-  await query(
+  const updated = await query(
     `UPDATE pick_lists SET purchase_order_number = $2, updated_at = NOW()
-     WHERE ${match} AND COALESCE(purchase_order_number, '') = ''`,
+     WHERE ${match} AND COALESCE(purchase_order_number, '') = ''
+     RETURNING id`,
     [orderId, purchaseOrder],
   );
+  if (updated.rows.length) scheduleAllocationRun(`purchase order recorded for order ${orderId}`);
 }
 
 /** Look up the given Medusa orders and store their payment status on the matching pick lists (including split children). */
