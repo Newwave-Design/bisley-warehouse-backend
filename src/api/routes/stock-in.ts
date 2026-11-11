@@ -27,6 +27,7 @@ import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { getLogger } from '../../lib/logger.js';
+import { singleTrayFromFivePack } from '../../lib/insert-trays.js';
 
 /**
  * Hairpin legs are sold as one pack, and each pack is two legs.
@@ -72,6 +73,26 @@ export async function resolveColourCode(sku: string, checkinColour: string | nul
   );
   const code = result.rows[0]?.colour_code || checkinColour || '';
   return code.slice(0, 20);
+}
+
+/** A 5-pack insert tray is received as one single of the same tray. Other scans are unchanged. */
+export async function asSingleInsertTray(sku: string): Promise<{ sku: string; title: string | null; colour_code: string | null; colour_name: string | null } | null> {
+  const single = singleTrayFromFivePack(sku);
+  if (!single) return null;
+  const row = await query(
+    `SELECT variant_sku, product_title, colour_code, colour_name
+     FROM wms_products WHERE UPPER(variant_sku) = UPPER($1)
+     ORDER BY is_archived
+     LIMIT 1`,
+    [single]
+  );
+  const found = row.rows[0];
+  return {
+    sku: found?.variant_sku || single,
+    title: found?.product_title || null,
+    colour_code: found?.colour_code || null,
+    colour_name: found?.colour_name || null,
+  };
 }
 
 /** List all sessions (active + recent) */
@@ -270,6 +291,18 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
 
     if (!productInfo) {
       return res.status(404).json({ error: 'Product not found', query: q });
+    }
+
+    const tray = await asSingleInsertTray(String(productInfo.medusa_sku || productInfo.nw_code || ''));
+    if (tray) {
+      productInfo = {
+        ...productInfo,
+        nw_code: tray.sku,
+        medusa_sku: tray.sku,
+        product_name: tray.title || productInfo.product_name,
+        colour_code: productInfo.colour_code || tray.colour_code,
+        colour_name: productInfo.colour_name || tray.colour_name,
+      };
     }
 
     const nw_code = productInfo.nw_code;

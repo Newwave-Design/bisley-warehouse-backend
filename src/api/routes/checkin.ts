@@ -14,7 +14,7 @@
  */
 
 import express, { Response } from 'express';
-import { stockInUnits, getHoldingLocation, resolveColourCode } from './stock-in.js';
+import { stockInUnits, getHoldingLocation, resolveColourCode, asSingleInsertTray } from './stock-in.js';
 import { query, getPool } from '../../db/index.js';
 import { toUuidOrNull } from './mobile.js';
 import { failedScansFor } from '../../lib/failed-scans.js';
@@ -74,7 +74,20 @@ router.get('/lookup', authMiddleware, async (req: AuthRequest, res: Response) =>
       [q]
     );
     if (barcode.rows[0]) {
-      return res.json({ source: 'barcode', ...barcode.rows[0] });
+      const row = barcode.rows[0];
+      const tray = await asSingleInsertTray(row.medusa_sku || row.nw_code);
+      if (tray) {
+        return res.json({
+          source: 'barcode',
+          ...row,
+          nw_code: tray.sku,
+          medusa_sku: tray.sku,
+          product_name: tray.title || row.product_name,
+          colour: tray.colour_name || row.colour,
+          colour_code: tray.colour_code || row.colour_code,
+        });
+      }
+      return res.json({ source: 'barcode', ...row });
     }
 
     // 2. Check sku_mappings by NW code (LEGACY/PAUSED - table is expected to be empty
@@ -205,24 +218,37 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
 // Scan an item
 router.post('/sessions/:id/scan', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { nw_code, colour, quantity_scanned = 1, notes, quantity_is_units = false } = req.body;
-    const units = stockInUnits(String(nw_code || ''), null, Number(quantity_scanned), quantity_is_units === true);
+    const { nw_code, colour: bodyColour, quantity_scanned = 1, notes, quantity_is_units = false } = req.body;
 
     if (!nw_code) return res.status(400).json({ error: 'nw_code required' });
+
+    let code = String(nw_code).trim();
+    let colour = bodyColour as string | undefined;
+    const mappedBarcode = await query(
+      `SELECT product_sku FROM barcode_mappings WHERE barcode = $1 AND is_active = true LIMIT 1`,
+      [code.toUpperCase()]
+    );
+    const tray = await asSingleInsertTray(mappedBarcode.rows[0]?.product_sku || code);
+    let medusa_sku: string | null = null;
+    if (tray) {
+      code = tray.sku;
+      medusa_sku = tray.sku;
+      if (!colour && tray.colour_name) colour = tray.colour_name;
+    } else {
+      const mapping = await query(`SELECT medusa_sku FROM sku_mappings WHERE nw_code = $1`, [code]);
+      medusa_sku = mapping.rows[0]?.medusa_sku || null;
+    }
+    const units = stockInUnits(code, null, Number(quantity_scanned), quantity_is_units === true);
 
     // Check session is open
     const session = await query(`SELECT status FROM checkin_sessions WHERE id = $1`, [req.params.id]);
     if (!session.rows[0]) return res.status(404).json({ error: 'Session not found' });
     if (session.rows[0].status === 'COMPLETE') return res.status(400).json({ error: 'Session is complete' });
 
-    // Lookup medusa_sku from mappings (LEGACY/PAUSED table - usually empty, resolves to null)
-    const mapping = await query(`SELECT medusa_sku FROM sku_mappings WHERE nw_code = $1`, [nw_code]);
-    const medusa_sku = mapping.rows[0]?.medusa_sku || null;
-
     // Check if this nw_code+colour already scanned — if so, increment
     const existing = await query(
       `SELECT id, quantity_scanned FROM checkin_items WHERE session_id = $1 AND nw_code = $2 AND LOWER(colour) = LOWER($3) AND removed_at IS NULL`,
-      [req.params.id, nw_code, colour || '']
+      [req.params.id, code, colour || '']
     );
 
     let item;
@@ -236,7 +262,7 @@ router.post('/sessions/:id/scan', authMiddleware, async (req: AuthRequest, res: 
       const result = await query(
         `INSERT INTO checkin_items (session_id, nw_code, colour, medusa_sku, quantity_scanned, notes, scanned_at, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW()) RETURNING *`,
-        [req.params.id, nw_code, colour || null, medusa_sku, units, notes || null]
+        [req.params.id, code, colour || null, medusa_sku, units, notes || null]
       );
       item = result.rows[0];
     }

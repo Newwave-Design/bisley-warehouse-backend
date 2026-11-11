@@ -26,6 +26,9 @@ import XLSX from 'xlsx';
 import { query, getPool } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { medusaPost } from '../../lib/medusa-client.js';
+import { fivePackTraySku } from '../../lib/insert-trays.js';
+
+export { fivePackTraySku };
 
 const router = express.Router();
 
@@ -51,18 +54,6 @@ export interface ReorderLine {
   ordered_at: string;
   /** Set when a single tray is ordered on its 1-pack code because the 5-pack has no supplier code. */
   note: string;
-}
-
-/**
- * Insert trays the supplier sells in packs of 5. A single (`…P1-…`) is re-ordered as the
- * matching 5-pack (`…P5-…`). Not every P1 code is a tray — DUBLINP1 is a hinge pack — so the
- * bases are listed. Colour suffix is kept (`225P1-000` → `225P5-000`).
- */
-const SINGLE_TRAY = /^(?:22[1-7]|NCS22[2-7]|PIT45[01]|PIT522|PIT580)P1-/;
-
-export function fivePackTraySku(sku: string): string | null {
-  if (!SINGLE_TRAY.test(sku)) return null;
-  return sku.replace(/P1-/, 'P5-');
 }
 
 /** Singles become whole packs of 5 (1–5 sold → 1 pack, 6–10 → 2). Anything else is unchanged. */
