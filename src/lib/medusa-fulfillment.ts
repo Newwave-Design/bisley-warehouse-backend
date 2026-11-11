@@ -1,4 +1,5 @@
 import { query } from '../db/index.js';
+import { parcelOnItsWay } from './carrier-progress.js';
 import { medusaGet, medusaPost } from './medusa-client.js';
 import { rootMedusaOrderId } from './order-values.js';
 
@@ -197,12 +198,25 @@ async function markShopShipped(pickListId: string) {
 
 /**
  * Push one warehouse order to the shop.
- * A tracking link marks the shop order Shipped straight away. Return collections are skipped.
+ * APC and DX stay off the shop until the carrier shows the parcel is on its way.
+ * Return collections are skipped.
  */
 export async function fulfillPickListInMedusa(pickListId: string, options?: { ship?: boolean }): Promise<MedusaFulfillResult> {
   const pl = await query(
-    `SELECT id, medusa_order_id, medusa_fulfillment_id, tracking_number, tracking_url, carrier, is_sandbox, status, is_return
-     FROM pick_lists WHERE id = $1`,
+    `SELECT pl.id, pl.medusa_order_id, pl.medusa_fulfillment_id, pl.tracking_number, pl.tracking_url,
+            pl.carrier, pl.is_sandbox, pl.status, pl.is_return, pl.shop_shipped_at,
+            b.courier AS booking_courier, b.waybill, b.delivery_postcode
+       FROM pick_lists pl
+       LEFT JOIN LATERAL (
+         SELECT courier, waybill, delivery_postcode
+           FROM collection_bookings
+          WHERE pick_list_id = pl.id
+            AND status <> 'cancelled'
+            AND COALESCE(direction, 'outbound') <> 'return'
+          ORDER BY created_at DESC
+          LIMIT 1
+       ) b ON true
+      WHERE pl.id = $1`,
     [pickListId]
   );
   const pickList = pl.rows[0];
@@ -213,7 +227,16 @@ export async function fulfillPickListInMedusa(pickListId: string, options?: { sh
   }
 
   const hasLink = String(pickList.tracking_number || '').trim() !== '' && String(pickList.tracking_url || '').trim() !== '';
-  const ship = hasLink || options?.ship !== false;
+  const courier = String(pickList.booking_courier || pickList.carrier || '').trim().toUpperCase();
+  const waitsForCarrier = (courier === 'APC' || courier === 'DX') && !pickList.shop_shipped_at;
+  let ship = hasLink || options?.ship !== false;
+  if (waitsForCarrier) {
+    const waybill = String(pickList.waybill || pickList.tracking_number || '').trim();
+    const postcode = String(pickList.delivery_postcode || '').trim();
+    const ready = hasLink && await parcelOnItsWay(courier, waybill, postcode);
+    if (!ready) return { ok: true, skipped: true };
+    ship = true;
+  }
   const orderId = rootMedusaOrderId(pickList.medusa_order_id);
 
   try {
@@ -279,7 +302,7 @@ export async function fulfillPickListInMedusa(pickListId: string, options?: { sh
   }
 }
 
-/** An outbound tracking link marks the shop order Shipped. Returns are left alone. */
+/** Mark shop orders shipped once APC or DX shows the parcel is on its way. Returns are left alone. */
 export async function syncCollectionOrdersToMedusa(): Promise<void> {
   await query(`ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS shop_shipped_at TIMESTAMP`);
   const found = await query(
@@ -311,10 +334,13 @@ export async function syncCollectionOrdersToMedusa(): Promise<void> {
       ORDER BY pl.updated_at DESC
       LIMIT 40`
   );
+  let waiting = 0;
   for (const row of found.rows as { id: string; status: string; tracking_number: string | null; tracking_url: string | null }[]) {
     const hasLink = String(row.tracking_number || '').trim() !== '' && String(row.tracking_url || '').trim() !== '';
-    await fulfillPickListInMedusa(row.id, { ship: hasLink || row.status === 'DISPATCHED' });
+    const result = await fulfillPickListInMedusa(row.id, { ship: hasLink || row.status === 'DISPATCHED' });
+    if (result.skipped && hasLink) waiting += 1;
   }
+  if (waiting) console.log(`[medusa] ${waiting} order(s) are booked and waiting for the carrier to take the parcel`);
 }
 
 export async function fulfillPickListsInMedusa(ids: string[]): Promise<MedusaFulfillResult[]> {

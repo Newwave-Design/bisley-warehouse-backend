@@ -137,6 +137,8 @@ async function missingNumbers(row: BookingRow): Promise<string[]> {
 }
 
 async function attachMedusaLabel(row: BookingRow, tracking: StoredTracking) {
+  // The shop shipment for APC and DX is sent when the carrier scan says the parcel is on its way.
+  if (text(row.courier).toUpperCase() === 'APC' || text(row.courier).toUpperCase() === 'DX') return;
   if (row.is_sandbox || row.status !== 'DISPATCHED' || !row.medusa_fulfillment_id || !row.medusa_order_id) return;
   if (!row.medusa_order_id.startsWith('order_')) return;
   try {
