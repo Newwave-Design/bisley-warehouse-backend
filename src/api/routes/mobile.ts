@@ -297,7 +297,8 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
 
     const result = await query(`
       SELECT
-        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at, pl.is_return,
+        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at,
+        to_char(pl.named_delivery_on, 'YYYY-MM-DD') AS named_delivery_on, pl.is_return,
         (SELECT parent.pick_list_number FROM pick_lists parent
           WHERE parent.id = pl.parent_pick_list_id AND (pl.medusa_order_id LIKE '%-PF%' OR pl.medusa_order_id LIKE 'manual-%' OR pl.medusa_order_id LIKE 'part-%')) AS part_of_number,
         (SELECT parent.pick_list_number FROM pick_lists parent
@@ -427,7 +428,8 @@ async function attachMobilePackaging(rows: any[]) {
 router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const pl = await query(`
-      SELECT pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at, pl.is_return,
+      SELECT pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at,
+             to_char(pl.named_delivery_on, 'YYYY-MM-DD') AS named_delivery_on, pl.is_return,
              pl.parent_pick_list_id, pl.customer_name, pl.customer_email, pl.shipping_address,
              (SELECT parent.pick_list_number FROM pick_lists parent
                WHERE parent.id = pl.parent_pick_list_id AND (pl.medusa_order_id LIKE '%-PF%' OR pl.medusa_order_id LIKE 'manual-%' OR pl.medusa_order_id LIKE 'part-%')) AS part_of_number,

@@ -365,6 +365,8 @@ ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS medusa_fulfillment_id VARCHAR(10
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS deferred_at TIMESTAMP;
+-- A delivery day chosen for this order. Collection is the day before. Shared by every desk and the scanner.
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS named_delivery_on DATE;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS tracking_number VARCHAR(100);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS tracking_url VARCHAR(500);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS carrier VARCHAR(50);

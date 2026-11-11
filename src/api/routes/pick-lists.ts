@@ -319,6 +319,7 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.is_archived,
          pl.archived_at,
          pl.deferred_at,
+         to_char(pl.named_delivery_on, 'YYYY-MM-DD') AS named_delivery_on,
          pl.payment_status,
          pl.purchase_order_number,
          (SELECT parent.pick_list_number FROM pick_lists parent
@@ -576,6 +577,40 @@ router.post('/bulk-status', authMiddleware, async (req: AuthRequest, res: Respon
  * PATCH /api/pick-lists/:pickListId/status
  * Body: { status: string }
  */
+/**
+ * PATCH /api/pick-lists/:pickListId/named-delivery
+ * Body: { date: 'YYYY-MM-DD' | null }
+ * The delivery day for this order. Collection is the day before. Empty clears it.
+ */
+router.patch('/:pickListId/named-delivery', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const raw = req.body?.date
+    const clearing = raw == null || String(raw).trim() === ''
+    const day = clearing ? null : String(raw).slice(0, 10)
+    if (day && (!/^\d{4}-\d{2}-\d{2}$/.test(day) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day)) {
+      return res.status(400).json({ error: 'Named delivery must be a date' })
+    }
+    const result = await query(
+      `UPDATE pick_lists
+          SET named_delivery_on = $2::date, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, to_char(named_delivery_on, 'YYYY-MM-DD') AS named_delivery_on`,
+      [req.params.pickListId, day],
+    )
+    if (!result.rows.length) return res.status(404).json({ error: 'Pick list not found' })
+    const shown = (result.rows[0].named_delivery_on as string | null) || null
+    await recordPickListEvents({
+      ids: [req.params.pickListId],
+      actor: actorName(req.user),
+      action: 'named-delivery',
+      summary: shown ? `Named delivery ${shown}` : 'Cleared the named delivery',
+    })
+    return res.json({ named_delivery_on: shown })
+  } catch (error: any) {
+    return res.status(500).json({ error: 'Failed to save the named delivery', details: error.message })
+  }
+})
+
 router.patch('/:pickListId/defer', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const deferred = req.body?.deferred !== false
