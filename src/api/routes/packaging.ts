@@ -9,6 +9,7 @@ import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { toUuidOrNull } from './mobile.js';
 import { importPackagingSnapshot } from '../../lib/packaging-import.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
+import { loadPackagingReorder } from '../../lib/packaging-reorder.js';
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -554,6 +555,15 @@ router.post('/movements', requirePermission('manage_settings'), async (req: Requ
     res.status(201).json(move.rows[0]);
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to record movement', details: err.message });
+  }
+});
+
+router.get('/reorder', async (req: Request, res: Response) => {
+  try {
+    const report = await loadPackagingReorder({ query }, new Date(), String(req.query.q || ''));
+    res.json(report);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to build packaging re-order', details: err.message });
   }
 });
 
