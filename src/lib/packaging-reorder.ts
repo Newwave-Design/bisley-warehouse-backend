@@ -1,8 +1,9 @@
 /**
  * Packaging re-order.
  * A pack is due when the stock on hand will not cover the 4 weeks it takes to arrive.
- * Weekly use comes from orders that have shipped. Orders that have not shipped are counted
- * separately, and only when their packaging has not already been taken off.
+ * Weekly use comes from orders that have shipped. Intake is what was booked in.
+ * Orders is what shipped orders have taken off so far. On hand is intake minus those orders.
+ * Orders that have not shipped are counted separately, and only when their packaging has not already been taken off.
  */
 import type { PoolClient } from 'pg';
 import { query } from '../db/index.js';
@@ -248,7 +249,7 @@ function addDays(now: Date, days: number): string {
 }
 
 export async function loadPackagingReorder(db: Sql = { query }, now = new Date(), search = '') {
-  const [items, usage, waiting, boms, specs, families] = await Promise.all([
+  const [items, usage, movements, waiting, boms, specs, families] = await Promise.all([
     db.query(
       `SELECT id, code, name, item_type, stock_on_hand, stocked,
               COALESCE(NULLIF(extra->>'units_month', ''), '0')::numeric AS units_month
@@ -262,6 +263,15 @@ export async function loadPackagingReorder(db: Sql = { query }, now = new Date()
        JOIN pick_lists pl ON pl.id = m.pick_list_id AND pl.status = 'DISPATCHED'
        WHERE m.movement_type = 'pack_usage' AND m.extra->>'source' = 'shipment'
        GROUP BY m.packaging_item_id`,
+    ),
+    db.query(
+      `SELECT packaging_item_id AS id,
+              COALESCE(SUM(qty) FILTER (WHERE movement_type = 'receipt'), 0)::int AS intake,
+              COALESCE(SUM(-qty) FILTER (
+                WHERE movement_type = 'pack_usage' AND extra->>'source' = 'shipment'
+              ), 0)::int AS on_orders
+       FROM packaging_stock_movements
+       GROUP BY packaging_item_id`,
     ),
     db.query(WAITING),
     db.query(
@@ -288,6 +298,10 @@ export async function loadPackagingReorder(db: Sql = { query }, now = new Date()
     usedById.set(row.id, { used: Number(row.used) || 0, firstAt });
     if (firstAt && (!earliest || firstAt < earliest)) earliest = firstAt;
   }
+  const movedById = new Map<string, { intake: number; onOrders: number }>();
+  for (const row of movements.rows) {
+    movedById.set(row.id, { intake: Number(row.intake) || 0, onOrders: Number(row.on_orders) || 0 });
+  }
   const waitingById = new Map<string, number>();
   for (const row of waiting.rows) waitingById.set(row.packaging_item_id, Number(row.qty) || 0);
 
@@ -303,6 +317,7 @@ export async function loadPackagingReorder(db: Sql = { query }, now = new Date()
       waiting: waitingById.get(item.id) || 0,
     });
     const stock = Number(item.stock_on_hand) || 0;
+    const moved = movedById.get(item.id) || { intake: 0, onOrders: 0 };
     const waitingQty = waitingById.get(item.id) || 0;
     const tracked = ['box', 'sleeve', 'tray', 'foam'].includes(String(item.item_type || ''));
     if (!tracked && !(used && used.used > 0)) continue;
@@ -312,6 +327,8 @@ export async function loadPackagingReorder(db: Sql = { query }, now = new Date()
       code: item.code,
       name: item.name || item.code,
       item_type: item.item_type,
+      intake: moved.intake,
+      on_orders: moved.onOrders,
       stock_on_hand: stock,
       per_week: Math.round(weekly * 10) / 10,
       rate_from: shippedWeekly > 0 ? 'shipped' : planned > 0 ? 'planned' : 'none',
