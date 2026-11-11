@@ -3,6 +3,7 @@
  *
  * GET  /api/products              — live fetch from Medusa (5-min memory cache)
  * GET  /api/products/wms-cache    — read from local wms_products table
+ * GET  /api/products/kit-parts   — inventory-kit component SKUs, for the packaging filter
  * POST /api/products/sync         — pull all Medusa products into wms_products + barcode_mappings
  * GET  /api/products/:id          — single product from memory cache
  */
@@ -644,6 +645,34 @@ async function runSyncJob() {
     syncState.progress = syncState.error ? 'failed' : 'complete';
   }
 }
+
+/** Component SKUs of inventory kits. The pick list uses this to treat a kit as packaged when any row has a solution. */
+router.get('/kit-parts', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT variant_sku, kit_components
+         FROM wms_products
+        WHERE is_kit
+          AND NOT COALESCE(is_archived, false)
+          AND jsonb_typeof(kit_components) = 'array'
+          AND jsonb_array_length(kit_components) > 0`
+    );
+    const kits: Record<string, string[]> = {};
+    for (const row of result.rows) {
+      const parent = String(row.variant_sku || '').trim();
+      const raw = row.kit_components;
+      const list = Array.isArray(raw) ? raw : [];
+      const parts = [...new Set(list
+        .map((part: { sku?: string }) => String(part?.sku || '').trim())
+        .filter((sku: string) => sku && sku.toUpperCase() !== parent.toUpperCase()))];
+      if (parent && parts.length) kits[parent.toUpperCase()] = parts;
+    }
+    res.json({ kits });
+  } catch (err) {
+    console.error('Kit parts failed', err);
+    res.status(500).json({ error: 'Failed to load kit parts' });
+  }
+});
 
 // ── POST /api/products/sync — responds immediately, runs in background ─────────
 // Idempotent read-only-from-Medusa + upsert — safe for MANAGER, unlike destructive purge/wipe routes.
