@@ -646,8 +646,11 @@ async function recomputePickItem(pickListId: string, itemId: string) {
   const started = scansOnList.rows[0].n > 0;
   const current = await query(`SELECT status FROM pick_lists WHERE id = $1`, [pickListId]);
   const now = current.rows[0]?.status as string | undefined;
-  let next = allPicked ? 'PICKED' : started ? 'IN_PROGRESS' : 'PENDING';
-  if (allPicked && now && ['PACKING', 'PACKED', 'LABEL_PRINTED', 'DISPATCHED'].includes(now)) next = now;
+  // A scan must not pull a picked, booked or shipped order back into Picking.
+  const settled = ['PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED', 'DISPATCHED', 'CANCELLED'];
+  let next = now && settled.includes(now)
+    ? now
+    : allPicked ? 'PICKED' : started ? 'IN_PROGRESS' : 'PENDING';
   if (next === 'PICKED') {
     const booking = await query(
       `SELECT 1 FROM collection_bookings

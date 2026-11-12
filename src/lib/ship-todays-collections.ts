@@ -5,7 +5,7 @@ import { fulfillPickListsInMedusa, syncCollectionOrdersToMedusa } from './medusa
 import { recordPickListEvents } from './pick-list-events.js';
 import { rememberShipmentTracking } from './shipment-tracking.js';
 
-const PICKED = ['PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED'];
+const PICKED = ['IN_PROGRESS', 'PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED'];
 
 function londonToday(): string {
   return new Intl.DateTimeFormat('en-CA', {
