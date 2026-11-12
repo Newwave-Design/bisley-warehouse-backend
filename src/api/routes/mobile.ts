@@ -17,6 +17,7 @@ import { paidSql } from '../../lib/payment-status.js';
 import { COLOUR_NAMES, componentDisplaySku, enrichSampleItems, extractColourCode, sampleColourList } from '../../lib/colour-names.js';
 import { formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
+import { promotePickList } from '../../lib/pick-progress.js';
 import { refuseUnassignedPick, scheduleStockHolds } from '../../lib/stock-holds.js';
 import { attachPackaging, shippingTypeForLines } from '../../lib/pick-list-packaging.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
@@ -640,43 +641,7 @@ async function recomputePickItem(pickListId: string, itemId: string) {
     `UPDATE pick_list_items SET quantity_picked = $1, status = $2, updated_at = NOW() WHERE id = $3 RETURNING *`,
     [picked, status, itemId]
   );
-
-  const remaining = await query(
-    `SELECT COUNT(*) FROM pick_list_items WHERE pick_list_id = $1 AND status != 'PICKED' AND NOT COALESCE(is_archived, false)`,
-    [pickListId]
-  );
-  const allPicked = parseInt(remaining.rows[0].count) === 0;
-  const scansOnList = await query(
-    `SELECT COUNT(*)::int AS n FROM pick_scans WHERE pick_list_id = $1`,
-    [pickListId]
-  );
-  const started = scansOnList.rows[0].n > 0;
-  const current = await query(`SELECT status FROM pick_lists WHERE id = $1`, [pickListId]);
-  const now = current.rows[0]?.status as string | undefined;
-  // A scan must not pull a picked, booked or shipped order back into Picking.
-  const settled = ['PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED', 'DISPATCHED', 'CANCELLED'];
-  let next = now && settled.includes(now)
-    ? now
-    : allPicked ? 'PICKED' : started ? 'IN_PROGRESS' : 'PENDING';
-  if (next === 'PICKED') {
-    const booking = await query(
-      `SELECT 1 FROM collection_bookings
-        WHERE pick_list_id = $1 AND status <> 'cancelled' AND COALESCE(direction, 'outbound') <> 'return'
-        LIMIT 1`,
-      [pickListId]
-    );
-    if (booking.rows.length) next = 'LABEL_PRINTED';
-  }
-  await query(
-    `UPDATE pick_lists
-        SET status = $1,
-            completed_at = CASE WHEN $1 IN ('PICKED', 'LABEL_PRINTED') THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
-            label_printed_at = CASE WHEN $1 = 'LABEL_PRINTED' THEN COALESCE(label_printed_at, NOW()) ELSE label_printed_at END,
-            updated_at = NOW()
-      WHERE id = $2`,
-    [next, pickListId]
-  );
-
+  const { allPicked } = await promotePickList(pickListId);
   return { item: updated.rows[0], allPicked };
 }
 
@@ -755,7 +720,10 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
     }
 
     const item = candidates[0];
-    if (item.status === 'PICKED') return res.status(400).json({ error: 'Already picked' });
+    if (item.status === 'PICKED') {
+      await promotePickList(pickListId);
+      return res.status(400).json({ error: 'Already picked' });
+    }
     if (/SAMPLE/i.test(item.product_sku || '')) {
       return res.status(400).json({ error: 'Colour samples are marked picked — they are not scanned' });
     }
@@ -775,7 +743,10 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
         if (sku === scannedSku) got += Number(scan.quantity);
       }
       const left = need - got;
-      if (left <= 0) return res.status(400).json({ error: `${scannedSku} is already scanned` });
+      if (left <= 0) {
+        await promotePickList(pickListId);
+        return res.status(400).json({ error: `${scannedSku} is already scanned` });
+      }
       const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
       if (qty > left) {
         return res.status(400).json({ error: `Only ${left} remaining — reduce the quantity` });
@@ -818,7 +789,10 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
         if (sku === scannedSku) got += Number(scan.quantity);
       }
       const left = required - got;
-      if (left <= 0) return res.status(400).json({ error: `${scannedSku} is already scanned` });
+      if (left <= 0) {
+        await promotePickList(pickListId);
+        return res.status(400).json({ error: `${scannedSku} is already scanned` });
+      }
       const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
       if (qty > left) return res.status(400).json({ error: `Only ${left} remaining — reduce the quantity` });
 
@@ -894,7 +868,10 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
       [itemId, pickListId]
     );
     if (!item.rows[0]) return res.status(404).json({ error: 'Item not found' });
-    if (item.rows[0].status === 'PICKED') return res.status(400).json({ error: 'Already picked' });
+    if (item.rows[0].status === 'PICKED') {
+      await promotePickList(pickListId);
+      return res.status(400).json({ error: 'Already picked' });
+    }
     if ((await kitPartsOf(itemId)).length) {
       return res.status(400).json({ error: 'Scan the body and the handles separately' });
     }

@@ -11,6 +11,7 @@ import { consumeBoxesForShipments } from '../../lib/packaging-usage.js';
 import { paidSql, isPaid } from '../../lib/payment-status.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { kitParts, refuseUnassignedPick } from '../../lib/stock-holds.js';
+import { promotePickList } from '../../lib/pick-progress.js';
 import { toUuidOrNull } from './mobile.js';
 import { v4 as uuidv4 } from 'uuid';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
@@ -1643,6 +1644,7 @@ router.patch('/:pickListId/items/:itemId/pick', authMiddleware, async (req: Requ
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: 'Pick item not found' });
+    await promotePickList(pickListId);
 
     // Reserve inventory — skip for sandbox lists to protect real stock
     if (!isSandbox && locationId && quantityPicked) {
