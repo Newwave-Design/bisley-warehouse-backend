@@ -1177,10 +1177,6 @@ router.post('/:pickListId/parts', authMiddleware, async (req: AuthRequest, res: 
 router.post('/:pickListId/part-fulfil', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { pickListId } = req.params;
-    const manual = await query(`SELECT medusa_order_id FROM pick_lists WHERE id = $1`, [pickListId]);
-    if (String(manual.rows[0]?.medusa_order_id || '').startsWith('manual-')) {
-      return res.status(400).json({ error: 'This send is by hand. Print an address label and mark it shipped. Do not book APC or DX.' });
-    }
     if (req.body?.confirm === true) {
       const result = await confirmPartFulfilment(pickListId, actorName((req as AuthRequest).user));
       return res.json(result);

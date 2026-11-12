@@ -16,6 +16,7 @@ import { addDxCollection, addDxConsignment, deleteDxConsignment, dxConfigured, D
 import { openReturnReplacement, releaseReturnReplacement } from '../../lib/return-replacement.js';
 import { markReturnRequestsBooked, reopenReturnRequests } from '../../lib/return-requests.js';
 import { appropriateApcServices } from '../../lib/apc-service.js';
+import { createRoyalMailParcel, deleteRoyalMailOrders, fetchRoyalMailLabelPdf, quoteRoyalMailParcels, RoyalMailError, royalMailConfigured, type RoyalMailParcelFormat } from '../../lib/royal-mail.js';
 
 async function dropReplacements(pickListId: string | undefined, waybill: string) {
   if (!pickListId || !waybill) return;
@@ -177,10 +178,30 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
   const returning = text(req.body?.direction).trim().toLowerCase() === 'return';
   const agreedDate = returning ? agreedCollectionDate(req.body?.collectionDate) : '';
   const pickListId = text(req.body?.pickListId).trim();
-  let courier: 'APC' | 'DX' = text(req.body?.courier).trim().toUpperCase() === 'DX' ? 'DX' : 'APC';
+  const askedCourier = text(req.body?.courier).trim().toUpperCase();
+  let courier: 'APC' | 'DX' | 'RM' = askedCourier === 'DX' ? 'DX' : askedCourier === 'RM' ? 'RM' : 'APC';
   if (returning && /^[0-9a-f-]{36}$/i.test(pickListId)) courier = await deliveredCourier(pickListId);
   if (returning && !agreedDate) {
     return res.status(400).json({ error: 'Enter the collection date agreed with the customer. It has to be a weekday that has not passed.' });
+  }
+  if (courier === 'RM') {
+    if (returning) return res.status(400).json({ error: 'A return is collected by the courier that delivered it.' });
+    if (!royalMailConfigured()) return res.status(500).json({ error: 'Royal Mail is not connected. Add the Click & Drop API key.' });
+    try {
+      const quoted = await quoteRoyalMailParcels({
+        postcode: deliveryPostcode,
+        pieces: pieces.map((piece) => ({
+          weightKg: Number(piece.weightKg),
+          lengthCm: Number(piece.lengthCm),
+          widthCm: Number(piece.widthCm),
+          heightCm: Number(piece.heightCm),
+        })),
+      });
+      return res.json({ ...quoted, courier, booked: false, pieces: pieces.length, collectionPostcode, deliveryPostcode });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Royal Mail did not return a service list';
+      return res.status(error instanceof RoyalMailError ? 409 : 502).json({ error: message });
+    }
   }
   if (courier === 'DX') {
     if (!dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
@@ -501,7 +522,8 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   const outcome = text(req.body?.outcome).trim().toLowerCase();
   const agreedDate = returning ? agreedCollectionDate(req.body?.collectionDate) : '';
   const pickListId = text(req.body?.pickListId).trim();
-  let courier: 'APC' | 'DX' = text(req.body?.courier).trim().toUpperCase() === 'DX' ? 'DX' : 'APC';
+  const askedCourier = text(req.body?.courier).trim().toUpperCase();
+  let courier: 'APC' | 'DX' | 'RM' = askedCourier === 'DX' ? 'DX' : askedCourier === 'RM' ? 'RM' : 'APC';
   if (returning && /^[0-9a-f-]{36}$/i.test(pickListId)) courier = await deliveredCourier(pickListId);
   if (returning && outcome !== 'refund' && outcome !== 'replace') {
     return res.status(400).json({ error: 'Choose whether this return is a refund or a replacement.' });
@@ -512,6 +534,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   const remoteUser = courier === 'APC' ? authHeader() : null;
   if (courier === 'APC' && !remoteUser) return res.status(500).json({ error: 'APC login is not configured' });
   if (courier === 'DX' && !dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
+  if (courier === 'RM' && !royalMailConfigured()) return res.status(500).json({ error: 'Royal Mail is not connected. Add the Click & Drop API key.' });
 
   if (!/^[0-9a-f-]{36}$/i.test(pickListId)) return res.status(400).json({ error: 'Choose an order to book' });
   const serviceCode = text(req.body?.serviceCode).trim();
@@ -536,9 +559,6 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     );
     const list = found.rows[0] as { pick_list_number?: string; customer_name?: string; customer_email?: string; shipping_address?: any; medusa_order_id?: string } | undefined;
     if (!list) return res.status(404).json({ error: 'Unknown order' });
-    if (!returning && String(list.medusa_order_id || '').startsWith('manual-')) {
-      return res.status(400).json({ error: 'This send is by hand. Print an address label and mark it shipped. Do not book APC or DX.' });
-    }
 
     const requestedSkus = [...new Set(asList<any>(req.body?.skus).map((sku) => text(sku).trim()).filter(Boolean))];
     const skus = requestedSkus.length ? requestedSkus : [...new Set(pieces.map((piece) => piece.sku).filter(Boolean))];
@@ -582,7 +602,56 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     let collectionDate = (returning ? agreedDate : text(req.body?.collectionDate).trim()).slice(0, 40) || null;
     let savedPieces: { reference: string; trackingNumber: string; title: string; weightKg: string; lengthCm: string; widthCm: string; heightCm: string }[] = [];
 
-    if (courier === 'DX') {
+    if (courier === 'RM') {
+      if (returning) return res.status(400).json({ error: 'A return is collected by the courier that delivered it.' });
+      const [mailCode, mailFormat] = serviceCode.split('|');
+      const packageFormat = (text(req.body?.packageFormat).trim() || mailFormat) as RoyalMailParcelFormat;
+      try {
+        const booked = await createRoyalMailParcel({
+          orderReference: text(list.pick_list_number).trim(),
+          serviceCode: mailCode,
+          packageFormat,
+          recipient: {
+            address: {
+              fullName: delivery.person.slice(0, 210),
+              ...(delivery.company && delivery.company !== delivery.person ? { companyName: delivery.company.slice(0, 100) } : {}),
+              addressLine1: delivery.line1.slice(0, 100),
+              ...(delivery.line2 ? { addressLine2: delivery.line2.slice(0, 100) } : {}),
+              city: (delivery.city || delivery.county).slice(0, 100),
+              ...(delivery.county ? { county: delivery.county.slice(0, 100) } : {}),
+              postcode: delivery.postcode.slice(0, 20),
+              countryCode: (delivery.country || 'GB').slice(0, 3),
+            },
+            ...(delivery.phone ? { phoneNumber: delivery.phone.slice(0, 25) } : {}),
+            ...(delivery.email ? { emailAddress: delivery.email.slice(0, 254) } : {}),
+          },
+          pieces: pieces.map((piece) => ({
+            title: piece.title,
+            weightKg: Number(piece.weightKg),
+            lengthCm: Number(piece.lengthCm),
+            widthCm: Number(piece.widthCm),
+            heightCm: Number(piece.heightCm),
+          })),
+        });
+        waybill = booked.trackingNumber;
+        orderNumber = String(booked.orderIdentifier);
+        bookedService = mailCode;
+        collectionDate = text(req.body?.collectionDate).trim().slice(0, 40) || collectionDate;
+        savedPieces = pieces.map((piece, index) => ({
+          reference: (piece.sku || piece.title || 'Box').slice(0, 30),
+          trackingNumber: index === 0 ? booked.trackingNumber : '',
+          title: piece.title,
+          weightKg: piece.weightKg,
+          lengthCm: piece.lengthCm,
+          widthCm: piece.widthCm,
+          heightCm: piece.heightCm,
+        }));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Royal Mail did not accept the parcel. Nothing was saved.';
+        console.error('Royal Mail rejected the parcel', message);
+        return res.status(502).json({ error: message });
+      }
+    } else if (courier === 'DX') {
       try {
         const booked = returning
           ? await addDxCollection({
@@ -761,8 +830,16 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
+      if (courier === 'RM') {
+        const orderId = Number(orderNumber);
+        if (Number.isFinite(orderId) && orderId > 0) {
+          await deleteRoyalMailOrders([orderId]).catch((cancelError) => {
+            console.error('Royal Mail cleanup failed', cancelError instanceof Error ? cancelError.message : 'cancel failed');
+          });
+        }
+      }
       console.error('Saving collection failed', error instanceof Error ? error.message : 'query failed');
-      return res.status(500).json({ error: `${courier} created tracking ${waybill}, but it could not be saved here. Do not book it again.` });
+      return res.status(500).json({ error: `${courier === 'RM' ? 'Royal Mail' : courier} created tracking ${waybill}, but it could not be saved here. Do not book it again.` });
     } finally {
       client.release();
     }
@@ -872,6 +949,12 @@ router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res:
     }
 
     const format = text(req.query.format).toUpperCase() === 'ZPL' ? 'ZPL' : 'PDF';
+    if (booking.courier === 'RM') {
+      const orderId = Number(text(booking.apc_order_number));
+      if (!Number.isFinite(orderId) || orderId <= 0) return res.status(409).json({ error: 'This booking has no Royal Mail postage to print.' });
+      const pdf = await fetchRoyalMailLabelPdf([orderId]);
+      return res.json({ labels: [{ trackingNumber: waybill, format: 'PDF', content: pdf.toString('base64') }] });
+    }
     if (booking.courier === 'DX') {
       if (!dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
       const tracking = (Array.isArray(booking.pieces) ? booking.pieces : []).map((piece) => text(piece?.trackingNumber)).filter(Boolean);
@@ -937,6 +1020,39 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
     if (!booking) return res.status(404).json({ error: 'Unknown booking' });
     if (booking.status === 'cancelled') return res.json({ cancelled: true });
     const waybill = text(booking.waybill).trim();
+    if (booking.courier === 'RM') {
+      const orderId = Number(text(booking.apc_order_number));
+      if (!Number.isFinite(orderId) || orderId <= 0) return res.status(409).json({ error: 'This booking has no Royal Mail postage to cancel.' });
+      try {
+        await deleteRoyalMailOrders([orderId]);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Royal Mail did not cancel the postage. It is still booked here.';
+        return res.status(502).json({ error: message });
+      }
+      await query(
+        `UPDATE collection_bookings
+            SET status = 'cancelled', updated_at = NOW()
+          WHERE pick_list_id = $1 AND apc_order_number = $2 AND status <> 'cancelled'`,
+        [booking.pick_list_id, String(orderId)]
+      );
+      if (waybill && booking.direction !== 'return') {
+        await query(
+          `UPDATE pick_lists
+              SET tracking_number = NULL, carrier = NULL, updated_at = NOW()
+            WHERE id = $1 AND tracking_number = $2`,
+          [booking.pick_list_id, waybill]
+        );
+      }
+      if (booking.pick_list_id && booking.direction !== 'return') {
+        await returnStockForCancelledCollection(booking.pick_list_id, waybill, text(req.user?.id)).catch((error) => {
+          console.warn('Returning cancelled collection stock failed', error instanceof Error ? error.message : 'failed');
+        });
+        await reopenDispatchedPickList(booking.pick_list_id, actorName(req.user)).catch((error) => {
+          console.warn('Moving the cancelled collection back to picked failed', error instanceof Error ? error.message : 'failed');
+        });
+      }
+      return res.json({ cancelled: true });
+    }
     if (booking.courier === 'DX') {
       if (!dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
       try {
