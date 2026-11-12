@@ -537,6 +537,7 @@ export async function handleOrderEdited(order: any) {
       if (m.sku) await reserve(m.sku, m.qty);
       changed++;
     }
+    if (changed) await client.query(`UPDATE pick_lists SET updated_at = NOW() WHERE id = $1`, [parent.id]);
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);

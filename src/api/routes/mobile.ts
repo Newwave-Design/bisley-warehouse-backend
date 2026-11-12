@@ -333,6 +333,9 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
           pl.updated_at,
           pl.deferred_at,
           MAX(pli.updated_at),
+          -- Removed lines are archived, so they are not in the join above. A Medusa edit that
+          -- takes a line off the order still has to move this time or the scanner keeps it.
+          (SELECT MAX(removed.updated_at) FROM pick_list_items removed WHERE removed.pick_list_id = pl.id),
           (SELECT MAX(ps.updated_at) FROM pick_scans ps WHERE ps.pick_list_id = pl.id),
           (SELECT MAX(GREATEST(n.created_at, n.resolved_at)) FROM pick_list_notes n WHERE n.pick_list_id = pl.id)
         ) AS updated_at
