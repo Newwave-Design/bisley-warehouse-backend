@@ -16,7 +16,7 @@ import { addDxCollection, addDxConsignment, deleteDxConsignment, dxConfigured, D
 import { openReturnReplacement, releaseReturnReplacement } from '../../lib/return-replacement.js';
 import { markReturnRequestsBooked, reopenReturnRequests } from '../../lib/return-requests.js';
 import { appropriateApcServices } from '../../lib/apc-service.js';
-import { createRoyalMailParcel, deleteRoyalMailOrders, fetchRoyalMailLabelPdf, quoteRoyalMailParcels, RoyalMailError, royalMailConfigured, type RoyalMailParcelFormat } from '../../lib/royal-mail.js';
+import { createRoyalMailParcel, deleteRoyalMailOrders, fetchRoyalMailLabelPdf, quoteRoyalMailParcels, readRoyalMailTracking, RoyalMailError, royalMailConfigured, type RoyalMailParcelFormat } from '../../lib/royal-mail.js';
 
 async function dropReplacements(pickListId: string | undefined, waybill: string) {
   if (!pickListId || !waybill) return;
@@ -986,16 +986,31 @@ async function loadBookingLabels(id: string, format: 'ZPL' | 'PDF'): Promise<Pri
     throw Object.assign(new Error('Unknown booking'), { status: 404 });
   }
   const waybill = text(booking.waybill).trim();
-  if (!waybill) {
-    throw Object.assign(new Error('This booking has no tracking number yet.'), { status: 409 });
-  }
   if (booking.courier === 'RM') {
     const orderId = Number(text(booking.apc_order_number));
     if (!Number.isFinite(orderId) || orderId <= 0) {
       throw Object.assign(new Error('This booking has no Royal Mail postage to print.'), { status: 409 });
     }
     const pdf = await fetchRoyalMailLabelPdf([orderId]);
-    return [{ trackingNumber: waybill, format: 'PDF', content: pdf.toString('base64') }];
+    let tracking = waybill || await readRoyalMailTracking(orderId);
+    if (tracking && !waybill) {
+      await query(
+        `UPDATE collection_bookings
+            SET waybill = $1,
+                pieces = CASE
+                  WHEN jsonb_typeof(pieces) = 'array' AND jsonb_array_length(pieces) > 0
+                    THEN jsonb_set(pieces, '{0,trackingNumber}', to_jsonb($1::text), true)
+                  ELSE pieces
+                END,
+                updated_at = NOW()
+          WHERE id = $2 AND COALESCE(btrim(waybill), '') = ''`,
+        [tracking, id]
+      );
+    }
+    return [{ trackingNumber: tracking || String(orderId), format: 'PDF', content: pdf.toString('base64') }];
+  }
+  if (!waybill) {
+    throw Object.assign(new Error('This booking has no tracking number yet.'), { status: 409 });
   }
   if (booking.courier === 'DX') {
     if (!dxConfigured()) throw Object.assign(new Error('DX login is not configured'), { status: 500 });

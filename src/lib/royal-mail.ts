@@ -156,10 +156,33 @@ export async function createRoyalMailOrders(orders: RoyalMailOrderInput[]): Prom
   return { created, failed };
 }
 
+const rememberedLabels = new Map<number, Buffer>();
+
+function rememberRoyalMailLabel(orderIdentifier: number, pdf: Buffer) {
+  rememberedLabels.set(orderIdentifier, pdf);
+  setTimeout(() => rememberedLabels.delete(orderIdentifier), 10 * 60 * 1000);
+}
+
+function trackingFrom(row: any): string {
+  const packages = Array.isArray(row?.packages) ? row.packages : [];
+  return String(row?.trackingNumber || packages.find((piece: any) => piece?.trackingNumber)?.trackingNumber || '').trim();
+}
+
+/** Tracking is allocated when the label is created, so a new order can still be empty. */
+export async function readRoyalMailTracking(orderIdentifier: number): Promise<string> {
+  if (!Number.isFinite(orderIdentifier) || orderIdentifier <= 0) return '';
+  const response = await royalMail(`/orders/${orderIdentifier}`);
+  const payload: any = await response.json().catch(() => null);
+  const rows = Array.isArray(payload?.orders) ? payload.orders : Array.isArray(payload) ? payload : [];
+  return trackingFrom(rows[0]);
+}
+
 export async function fetchRoyalMailLabelPdf(orderIdentifiers: number[]): Promise<Buffer> {
   const ids = [...new Set(orderIdentifiers.filter((id) => Number.isFinite(id) && id > 0))];
   if (!ids.length) throw new RoyalMailError('There is no Royal Mail postage to print.');
   if (ids.length > 100) throw new RoyalMailError('Print at most 100 Royal Mail labels at a time.');
+  const remembered = ids.length === 1 ? rememberedLabels.get(ids[0]) : undefined;
+  if (remembered) return remembered;
   const response = await royalMail(
     `/orders/${ids.join(';')}/label?documentType=postageLabel&includeReturnsLabel=false`,
     { headers: { Accept: 'application/pdf' } },
@@ -413,7 +436,7 @@ export async function createRoyalMailParcel(input: {
           receiveEmailNotification: false,
           receiveSmsNotification: false,
         },
-        label: { includeLabelInResponse: false },
+        label: { includeLabelInResponse: true, includeReturnsLabel: false },
       }],
     }),
   });
@@ -425,8 +448,15 @@ export async function createRoyalMailParcel(input: {
   const created = {
     orderReference: String(row?.orderReference || '').trim(),
     orderIdentifier: Number(row?.orderIdentifier),
-    trackingNumber: String(row?.trackingNumber || row?.packages?.[0]?.trackingNumber || '').trim(),
+    trackingNumber: trackingFrom(row),
   };
+  const label = typeof row?.label === 'string' ? row.label.replace(/\s+/g, '') : '';
+  if (label.startsWith('JVBERi') && Number.isFinite(created.orderIdentifier)) {
+    rememberRoyalMailLabel(created.orderIdentifier, Buffer.from(label, 'base64'));
+  }
+  if (!created.trackingNumber && Number.isFinite(created.orderIdentifier)) {
+    created.trackingNumber = await readRoyalMailTracking(created.orderIdentifier);
+  }
   if (!created.orderReference || !Number.isFinite(created.orderIdentifier)) {
     const reason = (Array.isArray(payload.failedOrders) ? payload.failedOrders : [])
       .flatMap((failed: any) => (Array.isArray(failed?.errors) ? failed.errors : []).map((error: any) => String(error?.errorMessage || '').trim()))
