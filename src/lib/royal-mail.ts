@@ -188,6 +188,9 @@ export async function fetchRoyalMailLabelPdf(orderIdentifiers: number[]): Promis
     { headers: { Accept: 'application/pdf' } },
   );
   if (!response.ok) {
+    if (response.status === 403) {
+      throw new RoyalMailError('This Royal Mail account cannot send the label to the printer. Print it from Click & Drop.');
+    }
     const payload = await response.json().catch(() => null);
     throw new RoyalMailError(errorText(payload, `Royal Mail did not return the labels (${response.status}).`));
   }
@@ -436,7 +439,7 @@ export async function createRoyalMailParcel(input: {
           receiveEmailNotification: false,
           receiveSmsNotification: false,
         },
-        label: { includeLabelInResponse: true, includeReturnsLabel: false },
+        label: { includeLabelInResponse: false },
       }],
     }),
   });
