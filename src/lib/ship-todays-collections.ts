@@ -26,7 +26,23 @@ function collectionDay(raw: string | null): string {
 
 let running = false;
 
-/** Picked orders whose APC collection day is today (or already past) become shipped. */
+/**
+ * A collection ships on its own once its day has passed.
+ * A collection booked for today stays on the status the desk or scanner set,
+ * so booking it does not move the order to Shipped while it is still being packed.
+ * A status set after the booking is left as it was set.
+ */
+export function collectionShipsAutomatically(
+  collectionDate: string | null,
+  today: string,
+  personChoseStatusAfterBooking: boolean,
+): boolean {
+  if (personChoseStatusAfterBooking) return false;
+  const day = collectionDay(collectionDate);
+  return day !== '' && day < today;
+}
+
+/** Picked orders whose collection day has passed become shipped. */
 export async function shipCollectionsDueToday(): Promise<string[]> {
   if (running) return [];
   running = true;
@@ -39,7 +55,14 @@ export async function shipCollectionsDueToday(): Promise<string[]> {
     });
     const today = londonToday();
     const found = await query(
-      `SELECT pl.id, cb.collection_date
+      `SELECT pl.id, cb.collection_date,
+              EXISTS (
+                SELECT 1 FROM pick_list_events e
+                WHERE e.pick_list_id = pl.id
+                  AND e.action = 'status'
+                  AND e.created_at >= cb.created_at
+                  AND e.summary NOT IN ('Shipped — collection is today', 'Shipped — collection day has passed')
+              ) AS chosen
        FROM pick_lists pl
        JOIN collection_bookings cb ON cb.pick_list_id = pl.id AND cb.status <> 'cancelled' AND COALESCE(cb.direction, 'outbound') <> 'return'
        WHERE pl.status = ANY($1::text[])
@@ -47,11 +70,8 @@ export async function shipCollectionsDueToday(): Promise<string[]> {
       [PICKED],
     );
     const ids = [...new Set(
-      (found.rows as { id: string; collection_date: string | null }[])
-        .filter((row) => {
-          const day = collectionDay(row.collection_date);
-          return day !== '' && day <= today;
-        })
+      (found.rows as { id: string; collection_date: string | null; chosen: boolean }[])
+        .filter((row) => collectionShipsAutomatically(row.collection_date, today, row.chosen))
         .map((row) => row.id),
     )];
     if (ids.length) {
@@ -85,14 +105,14 @@ export async function shipCollectionsDueToday(): Promise<string[]> {
       ids,
       actor: 'system',
       action: 'status',
-      summary: 'Shipped — collection is today',
+      summary: 'Shipped — collection day has passed',
       status: 'DISPATCHED',
     });
     await consumeOutstandingShipmentBoxes().catch((error) => {
       console.warn('Taking shipped box stock failed', error instanceof Error ? error.message : 'failed');
     });
     await fulfillPickListsInMedusa(ids);
-    console.log(`[collections] Shipped ${ids.length} order(s) booked for collection today`);
+    console.log(`[collections] Shipped ${ids.length} order(s) whose collection day has passed`);
     return ids;
   } finally {
     running = false;

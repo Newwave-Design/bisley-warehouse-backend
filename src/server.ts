@@ -325,7 +325,7 @@ async function start() {
       };
       setInterval(runTodaysCollections, 5 * 60 * 1000);
       setTimeout(runTodaysCollections, 15 * 1000);
-      console.log('✓ Today\'s collections ship themselves (every 5 min)');
+      console.log('✓ Collections ship the day after they are booked (every 5 min)');
       setTimeout(() => scheduleAllocationRun('startup run', 0), 45 * 1000);
       console.log('✓ Stock Sold V2 allocation safety run scheduled (every 5 min)');
     }
