@@ -845,6 +845,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     }
 
     console.log(`${courier} ${returning ? 'return ' : ''}collection booked ${waybill} for pick list ${pickListId}`);
+    const bookedBy = actorName((req as AuthRequest).user);
     let replacement: { id: string; pick_list_number: string } | null = null;
     if (returning && outcome === 'replace') {
       for (const sku of rowSkus) {
@@ -869,23 +870,28 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       }
     }
     if (!returning) {
-      await shipBookedPickList(pickListId, actorName((req as AuthRequest).user)).catch((error) => {
+      await shipBookedPickList(pickListId, bookedBy).catch((error) => {
         console.warn('Marking the booked order shipped failed', error instanceof Error ? error.message : 'failed');
       });
-      await fulfillPickListInMedusa(pickListId).catch((error) => {
+    }
+    res.status(201).json({ booked: true, waybill, bookings: saved, replacement });
+    if (!returning) {
+      const bookedFor = pickListId;
+      const bookedUser = text(req.user?.id);
+      void fulfillPickListInMedusa(bookedFor).catch((error) => {
         console.warn('Fulfilling the booked order failed', error instanceof Error ? error.message : 'failed');
       });
-      await rememberShipmentTracking(pickListId).catch((error) => {
+      void rememberShipmentTracking(bookedFor).catch((error) => {
         console.warn('Saving shipment tracking failed', error instanceof Error ? error.message : 'failed');
       });
-      await takeStockForBookedCollection(pickListId, text(req.user?.id)).catch((error) => {
+      void takeStockForBookedCollection(bookedFor, bookedUser).catch((error) => {
         console.warn('Removing booked collection stock failed', error instanceof Error ? error.message : 'failed');
       });
-      await shipCollectionsDueToday().catch((error) => {
+      void shipCollectionsDueToday().catch((error) => {
         console.warn('Shipping today\'s collections failed', error instanceof Error ? error.message : 'failed');
       });
     }
-    return res.status(201).json({ booked: true, waybill, bookings: saved, replacement });
+    return;
   } catch (error) {
     console.error('Collection booking failed', error instanceof Error ? error.message : 'request failed');
     return res.status(502).json({ error: `Could not reach ${courier}. Nothing was saved.` });
