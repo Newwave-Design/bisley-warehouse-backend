@@ -32,7 +32,7 @@ function alreadyShipped(status: string | null | undefined): boolean {
 
 async function loadMedusaOrder(orderId: string): Promise<any> {
   const data = await medusaGet(
-    `/admin/orders/${encodeURIComponent(orderId)}?fields=*items,*items.variant,*fulfillments,*fulfillments.items,fulfillment_status`
+    `/admin/orders/${encodeURIComponent(orderId)}?fields=*items,*items.variant,*items.variant.inventory_items,*fulfillments,*fulfillments.items,fulfillment_status,*shipping_methods`
   );
   if (data?.type === 'not_allowed' || data?.message || data?.code) {
     if (!data?.order && !data?.id) {
@@ -40,6 +40,17 @@ async function loadMedusaOrder(orderId: string): Promise<any> {
     }
   }
   return data.order || data;
+}
+
+function units(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) return Number(value) || 0
+  if (value && typeof value === 'object') {
+    const raw = value as { numeric?: unknown; value?: unknown }
+    if (typeof raw.numeric === 'number') return raw.numeric
+    if (raw.value != null) return Number(raw.value) || 0
+  }
+  return 0
 }
 
 async function resolveLineItems(pickListId: string, order: any): Promise<{ id: string; quantity: number }[]> {
@@ -51,7 +62,7 @@ async function resolveLineItems(pickListId: string, order: any): Promise<{ id: s
   }>(
     `SELECT medusa_order_line_item_id, quantity_required, quantity_picked, product_sku
      FROM pick_list_items
-     WHERE pick_list_id = $1
+     WHERE pick_list_id = $1 AND NOT COALESCE(is_archived, false)
      ORDER BY line_number`,
     [pickListId]
   );
@@ -70,7 +81,8 @@ async function resolveLineItems(pickListId: string, order: any): Promise<{ id: s
     const line = (row.medusa_order_line_item_id && byId.get(row.medusa_order_line_item_id))
       || bySku.get(row.product_sku);
     if (!line?.id) continue;
-    const remaining = (Number(line.quantity) || wanted) - fulfilledQuantity(order, line.id);
+    const ordered = units(line.quantity)
+    const remaining = (ordered || wanted) - fulfilledQuantity(order, line.id);
     const qty = Math.min(wanted, remaining);
     if (qty <= 0) continue;
     payload.push({ id: line.id, quantity: qty });
@@ -101,23 +113,65 @@ async function sharesOrder(orderId: string, pickListId: string): Promise<boolean
   return result.rows.length > 0;
 }
 
-async function createFulfillment(orderId: string, items: { id: string; quantity: number }[]): Promise<string> {
-  const body = { items, location_id: LOCATION_ID, no_notification: true };
+let liveShippingOptions: { id: string; name: string }[] | null = null
+
+/** The order's shipping option when it still exists, otherwise the current option of the same name. */
+async function shippingOptionFor(order: any): Promise<string | undefined> {
+  const method = (order.shipping_methods || [])[0]
+  const current = method?.shipping_option_id as string | undefined
+  if (!current) return undefined
+  const found = await medusaGet(`/admin/shipping-options/${encodeURIComponent(current)}?fields=id`)
+  if (found?.shipping_option?.id) return current
+  if (!liveShippingOptions) {
+    const list = await medusaGet('/admin/shipping-options?limit=50&fields=id,name')
+    liveShippingOptions = list.shipping_options || []
+  }
+  const name = String(method.name || '').trim()
+  return liveShippingOptions.find((option) => option.name === name)?.id
+}
+
+async function ensureReservations(order: any, items: { id: string; quantity: number }[]): Promise<void> {
+  const byId = new Map<string, any>((order.items || []).map((item: any) => [item.id, item]))
+  for (const item of items) {
+    const line = byId.get(item.id)
+    const variant = line?.variant
+    if (!variant?.manage_inventory) continue
+    for (const link of variant.inventory_items || []) {
+      const inventoryItemId = link?.inventory_item_id || link?.inventory?.id
+      if (!inventoryItemId) continue
+      const existing = await medusaGet(`/admin/reservations?inventory_item_id=${encodeURIComponent(inventoryItemId)}&line_item_id=${encodeURIComponent(item.id)}&limit=20&fields=id,line_item_id,inventory_item_id`)
+      const rows = existing.reservations || []
+      if (rows.some((reservation: { line_item_id?: string; inventory_item_id?: string }) => reservation.line_item_id === item.id && reservation.inventory_item_id === inventoryItemId)) continue
+      const required = Number(link.required_quantity) || 1
+      await medusaPost('/admin/reservations', {
+        line_item_id: item.id,
+        inventory_item_id: inventoryItemId,
+        location_id: LOCATION_ID,
+        quantity: item.quantity * required,
+      })
+    }
+  }
+}
+
+async function createFulfillment(orderId: string, items: { id: string; quantity: number }[], shippingOptionId?: string): Promise<string> {
+  const option = shippingOptionId ? { shipping_option_id: shippingOptionId } : {}
+  const body = { items, location_id: LOCATION_ID, no_notification: true, ...option }
   try {
-    const created = await medusaPost(`/admin/orders/${encodeURIComponent(orderId)}/fulfillments`, body);
-    const id = fulfillmentIdFrom(created);
-    if (id) return id;
+    const created = await medusaPost(`/admin/orders/${encodeURIComponent(orderId)}/fulfillments`, body)
+    const id = fulfillmentIdFrom(created)
+    if (id) return id
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (!/location/i.test(message)) throw err;
+    const message = err instanceof Error ? err.message : String(err)
+    if (!/location/i.test(message)) throw err
   }
   const created = await medusaPost(`/admin/orders/${encodeURIComponent(orderId)}/fulfillments`, {
     items,
     no_notification: true,
-  });
-  const id = fulfillmentIdFrom(created);
-  if (!id) throw new Error(`Medusa created a fulfillment but returned no id: ${JSON.stringify(created).slice(0, 400)}`);
-  return id;
+    ...option,
+  })
+  const id = fulfillmentIdFrom(created)
+  if (!id) throw new Error(`Medusa created a fulfillment but returned no id: ${JSON.stringify(created).slice(0, 400)}`)
+  return id
 }
 
 async function loadFulfillment(orderId: string, fulfillmentId: string) {
@@ -267,7 +321,8 @@ export async function fulfillPickListInMedusa(pickListId: string, options?: { sh
       if (!items.length) {
         return { ok: false, error: `No remaining shop quantity to fulfill for ${orderId}. These lines may already be on another fulfillment.` };
       }
-      fulfillmentId = await createFulfillment(orderId, items);
+      await ensureReservations(order, items);
+      fulfillmentId = await createFulfillment(orderId, items, await shippingOptionFor(order));
     }
     await rememberFulfillment(pickListId, fulfillmentId);
 
