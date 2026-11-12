@@ -273,29 +273,49 @@ export type RoyalMailQuotedService = {
   packageFormat: RoyalMailParcelFormat;
 };
 
-async function servicesForFormat(postcode: string, format: (typeof PARCEL_FORMATS)[number], weightGrams: number) {
-  const query = new URLSearchParams({
-    destinationCountryCode: 'GBR',
-    destinationPostcode: postcode,
-    packagingFormat: format.query,
-    packageWeight: String(weightGrams),
-  });
-  const response = await royalMail(`/services?${query.toString()}`);
-  const payload = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new RoyalMailError(errorText(payload, `Royal Mail did not return services for this box (${response.status}).`));
-  }
+function listedServices(payload: any): { code: string; name: string }[] {
   const groups = Array.isArray(payload) ? payload : payload ? [payload] : [];
   return groups.flatMap((group: any) => {
     const carrier = String(group?.carrierName || '');
     if (carrier && !/royal mail/i.test(carrier)) return [];
-    return (Array.isArray(group?.services) ? group.services : [])
+    const rows = Array.isArray(group?.services) ? group.services : [];
+    return rows
+      .filter((service: any) => {
+        const dropOff = service?.dropOffOptions;
+        return !Array.isArray(dropOff) || dropOff.includes('Collection');
+      })
       .map((service: any) => ({
         code: String(service?.serviceCode || '').trim(),
         name: String(service?.serviceName || '').trim(),
       }))
-      .filter((service: { code: string; name: string }) => service.code && service.name && !/return/i.test(service.name));
+      .filter((service: { code: string; name: string }) => service.code && service.name && !/return|age verification/i.test(service.name));
   });
+}
+
+async function servicesForFormat(postcode: string, format: (typeof PARCEL_FORMATS)[number], weightGrams: number) {
+  const olpFormat = format.id === 'parcel' ? 'LargeParcel' : format.query;
+  const olp = new URLSearchParams({
+    country: 'GBR',
+    postcode,
+    weight: String(weightGrams),
+    packageFormat: olpFormat,
+  });
+  let response = await royalMail(`/services/olp?${olp.toString()}`);
+  let payload: any = await response.json().catch(() => null);
+  if (response.status === 403 || response.status === 404) {
+    const account = new URLSearchParams({
+      destinationCountryCode: 'GBR',
+      destinationPostcode: postcode,
+      packagingFormat: format.query,
+      packageWeight: String(weightGrams),
+    });
+    response = await royalMail(`/services?${account.toString()}`);
+    payload = await response.json().catch(() => null);
+  }
+  if (!response.ok) {
+    throw new RoyalMailError(errorText(payload, `Royal Mail did not return services for this box (${response.status}).`));
+  }
+  return listedServices(payload);
 }
 
 /** Asks Click & Drop which services can take these boxes. Letter is not the only answer. */
