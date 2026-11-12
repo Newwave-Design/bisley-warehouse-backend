@@ -9,7 +9,8 @@ import { getPool, query } from '../../db/index.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { rememberShipmentTracking } from '../../lib/shipment-tracking.js';
 import { returnStockForCancelledCollection, takeStockForBookedCollection } from '../../lib/collection-stock.js';
-import { actorName, reopenDispatchedPickList } from '../../lib/pick-list-events.js';
+import { actorName, reopenDispatchedPickList, shipBookedPickList } from '../../lib/pick-list-events.js';
+import { fulfillPickListInMedusa } from '../../lib/medusa-fulfillment.js';
 import { fitZpl } from '../../lib/zpl-fit.js';
 import { addDxCollection, addDxConsignment, deleteDxConsignment, dxConfigured, DxError, fetchDxLabels, quoteDxCollection } from '../../lib/dx-freight.js';
 import { openReturnReplacement, releaseReturnReplacement } from '../../lib/return-replacement.js';
@@ -791,6 +792,12 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       }
     }
     if (!returning) {
+      await shipBookedPickList(pickListId, actorName((req as AuthRequest).user)).catch((error) => {
+        console.warn('Marking the booked order shipped failed', error instanceof Error ? error.message : 'failed');
+      });
+      await fulfillPickListInMedusa(pickListId).catch((error) => {
+        console.warn('Fulfilling the booked order failed', error instanceof Error ? error.message : 'failed');
+      });
       await rememberShipmentTracking(pickListId).catch((error) => {
         console.warn('Saving shipment tracking failed', error instanceof Error ? error.message : 'failed');
       });

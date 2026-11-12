@@ -18,6 +18,20 @@ export function actorName(user?: { email?: string; id?: string } | null): string
   return user?.email || user?.id || 'unknown';
 }
 
+/** An outbound collection is a shipment. The order leaves To pick, Picking and Picked. */
+export async function shipBookedPickList(pickListId: string, actor: string): Promise<void> {
+  const current = await query(`SELECT status FROM pick_lists WHERE id = $1`, [pickListId]);
+  const status = current.rows[0]?.status as string | undefined;
+  if (!status || status === 'DISPATCHED' || status === 'CANCELLED') return;
+  await recordPickListEvents({
+    ids: [pickListId],
+    actor,
+    action: 'status',
+    summary: 'Shipped — collection booked',
+    status: 'DISPATCHED',
+  });
+}
+
 export async function recordPickListEvents(input: {
   ids: string[];
   actor: string;

@@ -7,7 +7,7 @@ import express, { Response } from 'express';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { query } from '../../db/index.js';
 import { fulfillPickListsInMedusa } from '../../lib/medusa-fulfillment.js';
-import { actorName, recordPickListEvents, reopenDispatchedPickList } from '../../lib/pick-list-events.js';
+import { actorName, recordPickListEvents, reopenDispatchedPickList, shipBookedPickList } from '../../lib/pick-list-events.js';
 import {
   createRoyalMailOrders,
   deleteRoyalMailOrders,
@@ -183,6 +183,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         ],
       );
       saved.push(inserted.rows[0]);
+      await shipBookedPickList(row.id, actorName((req as AuthRequest).user));
       if (url) {
         await query(
           `UPDATE pick_lists
