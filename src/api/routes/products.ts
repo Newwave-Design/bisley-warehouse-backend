@@ -25,7 +25,7 @@ const router = express.Router();
 
 // Medusa has 2 stock locations (European Warehouse + an unused legacy "Ovara" location with
 // no sales channel). Every inventory lookup MUST filter to this one or quantities double-count.
-const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY792H831KT3TKH4CYPF7FT9';
+const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY7PZB8JRYF31JPJ6EYQD8DJ';
 
 // Floor stock for a variant. Kits have no bin of their own — buildable qty is the minimum
 // of component on-hand divided by required quantity. Missing bin rows are 0, not Medusa's number.

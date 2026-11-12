@@ -3,7 +3,7 @@ import { parcelOnItsWay } from './carrier-progress.js';
 import { medusaGet, medusaPost } from './medusa-client.js';
 import { rootMedusaOrderId } from './order-values.js';
 
-const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY792H831KT3TKH4CYPF7FT9';
+const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY7PZB8JRYF31JPJ6EYQD8DJ';
 
 export type MedusaFulfillResult = {
   ok: boolean;

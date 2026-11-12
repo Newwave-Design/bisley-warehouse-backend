@@ -11,7 +11,7 @@ import { getMedusaToken } from './medusa-inventory.js';
 import { logWarning } from './logger.js';
 
 const MEDUSA_URL = process.env.MEDUSA_API_BASE_URL || 'https://bisley-shop.medusajs.app';
-const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY792H831KT3TKH4CYPF7FT9';
+const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY7PZB8JRYF31JPJ6EYQD8DJ';
 
 async function fetchMedusaQuantities(): Promise<Map<string, number>> {
   const token = await getMedusaToken();

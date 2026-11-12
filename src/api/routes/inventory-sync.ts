@@ -14,7 +14,7 @@ const MEDUSA_URL = process.env.MEDUSA_API_BASE_URL || 'https://bisley-shop.medus
 const MEDUSA_API_KEY = process.env.MEDUSA_SECRET_API_KEY;
 // Medusa has 2 stock locations (European Warehouse + an unused legacy "Ovara" location with
 // no sales channel). Every inventory lookup MUST filter to this one or quantities double-count.
-const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY792H831KT3TKH4CYPF7FT9';
+const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY7PZB8JRYF31JPJ6EYQD8DJ';
 
 function getMedusaHeaders(): Record<string, string> {
   if (!MEDUSA_API_KEY) throw new Error('MEDUSA_SECRET_API_KEY env var is not set');

@@ -5,12 +5,12 @@
  * Env vars:
  *   MEDUSA_API_BASE_URL      — defaults to https://bisley-shop.medusajs.app
  *   MEDUSA_SECRET_API_KEY    — API token for authenticated requests
- *   MEDUSA_LOCATION_ID       — stocking location, defaults to European Warehouse
+ *   MEDUSA_LOCATION_ID       — stocking location, defaults to Ovara
  */
 
 const MEDUSA_URL = process.env.MEDUSA_API_BASE_URL || 'https://bisley-shop.medusajs.app';
 const MEDUSA_API_KEY = process.env.MEDUSA_SECRET_API_KEY;
-const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY792H831KT3TKH4CYPF7FT9';
+const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY7PZB8JRYF31JPJ6EYQD8DJ';
 
 function getMedusaHeaders(): Record<string, string> {
   if (!MEDUSA_API_KEY) throw new Error('MEDUSA_SECRET_API_KEY env var is not set');
