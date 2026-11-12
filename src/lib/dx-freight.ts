@@ -535,7 +535,8 @@ export async function addDxCollection(input: {
     CollectionPostcode: postcode,
     CollectionReference: dxReference(input.reference),
     DXAccountNumber: accountNumber,
-    DeliverTo: WAREHOUSE_DELIVERY.company,
+    // CF delivers this collection to the warehouse address below. CT would send it to the DX depot instead.
+    DeliverTo: 'CF',
     DeliveryAddress1: to[0],
     DeliveryAddress2: to[1] || '',
     DeliveryAddress3: to[2] || '',
