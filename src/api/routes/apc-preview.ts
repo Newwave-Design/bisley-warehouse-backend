@@ -874,6 +874,12 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         console.warn('Marking the booked order shipped failed', error instanceof Error ? error.message : 'failed');
       });
     }
+    for (const row of saved) {
+      if (row?.id) {
+        warmLabel(row.id, 'ZPL');
+        warmLabel(row.id, 'PDF');
+      }
+    }
     res.status(201).json({ booked: true, waybill, bookings: saved, replacement });
     if (!returning) {
       const bookedFor = pickListId;
@@ -934,77 +940,120 @@ router.get('/bookings', authMiddleware, async (_req: AuthRequest, res: Response)
   }
 });
 
-router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res: Response) => {
-  const id = text(req.params.id);
-  if (!/^[0-9a-f-]{36}$/i.test(id)) {
-    return res.status(400).json({ error: 'Unknown booking' });
+type PrintedLabel = { trackingNumber: string; format: string; content: string };
+const labelReady = new Map<string, PrintedLabel[]>();
+const labelWait = new Map<string, Promise<PrintedLabel[] | null>>();
+
+/** Fetch the label as soon as the collection is saved, so printing does not wait on the courier again. */
+function warmLabel(bookingId: string, format: 'ZPL' | 'PDF') {
+  const key = `${bookingId}:${format}`;
+  if (labelReady.has(key) || labelWait.has(key)) return;
+  const job = loadBookingLabels(bookingId, format)
+    .then((labels) => {
+      if (labels.length) labelReady.set(key, labels);
+      return labels.length ? labels : null;
+    })
+    .catch((error) => {
+      console.warn('Preparing the label failed', error instanceof Error ? error.message : 'failed');
+      return null;
+    })
+    .finally(() => labelWait.delete(key));
+  labelWait.set(key, job);
+  setTimeout(() => labelReady.delete(key), 10 * 60 * 1000);
+}
+
+async function labelsForPrint(bookingId: string, format: 'ZPL' | 'PDF'): Promise<PrintedLabel[]> {
+  const key = `${bookingId}:${format}`;
+  const ready = labelReady.get(key);
+  if (ready?.length) return ready;
+  const waiting = labelWait.get(key);
+  if (waiting) {
+    const labels = await waiting;
+    if (labels?.length) return labels;
   }
+  const labels = await loadBookingLabels(bookingId, format);
+  if (labels.length) labelReady.set(key, labels);
+  return labels;
+}
 
-  try {
-    const found = await query(
-      `SELECT id, waybill, apc_order_number, pieces, courier, status FROM collection_bookings WHERE id = $1`,
-      [id]
-    );
-    const booking = found.rows[0] as { waybill?: string; apc_order_number?: string; pieces?: { trackingNumber?: string }[]; courier?: string; status?: string } | undefined;
-    if (!booking || booking.status === 'cancelled') {
-      return res.status(404).json({ error: 'Unknown booking' });
+async function loadBookingLabels(id: string, format: 'ZPL' | 'PDF'): Promise<PrintedLabel[]> {
+  const found = await query(
+    `SELECT id, waybill, apc_order_number, pieces, courier, status FROM collection_bookings WHERE id = $1`,
+    [id]
+  );
+  const booking = found.rows[0] as { waybill?: string; apc_order_number?: string; pieces?: { trackingNumber?: string }[]; courier?: string; status?: string } | undefined;
+  if (!booking || booking.status === 'cancelled') {
+    throw Object.assign(new Error('Unknown booking'), { status: 404 });
+  }
+  const waybill = text(booking.waybill).trim();
+  if (!waybill) {
+    throw Object.assign(new Error('This booking has no tracking number yet.'), { status: 409 });
+  }
+  if (booking.courier === 'RM') {
+    const orderId = Number(text(booking.apc_order_number));
+    if (!Number.isFinite(orderId) || orderId <= 0) {
+      throw Object.assign(new Error('This booking has no Royal Mail postage to print.'), { status: 409 });
     }
-    const waybill = text(booking.waybill).trim();
-    if (!waybill) {
-      return res.status(409).json({ error: 'This booking has no tracking number yet.' });
-    }
-
-    const format = text(req.query.format).toUpperCase() === 'ZPL' ? 'ZPL' : 'PDF';
-    if (booking.courier === 'RM') {
-      const orderId = Number(text(booking.apc_order_number));
-      if (!Number.isFinite(orderId) || orderId <= 0) return res.status(409).json({ error: 'This booking has no Royal Mail postage to print.' });
-      const pdf = await fetchRoyalMailLabelPdf([orderId]);
-      return res.json({ labels: [{ trackingNumber: waybill, format: 'PDF', content: pdf.toString('base64') }] });
-    }
-    if (booking.courier === 'DX') {
-      if (!dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
-      const tracking = (Array.isArray(booking.pieces) ? booking.pieces : []).map((piece) => text(piece?.trackingNumber)).filter(Boolean);
-      const labels = await fetchDxLabels(waybill, text(booking.apc_order_number) || 'F', format, tracking);
-      if (format === 'ZPL') {
-        for (const label of labels) {
-          const zpl = Buffer.from(label.content, 'base64').toString('latin1');
-          if (zpl.includes('^XA')) label.content = Buffer.from(fitZpl(zpl), 'latin1').toString('base64');
-        }
-      }
-      return res.json({ labels });
-    }
-    if (booking.courier !== 'APC') {
-      return res.status(409).json({ error: 'This courier cannot print a label here.' });
-    }
-    const remoteUser = authHeader();
-    if (!remoteUser) {
-      return res.status(500).json({ error: 'APC login is not configured on this computer' });
-    }
-    const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(waybill)}.json?labelformat=${format}&markprinted=True&searchtype=CarrierWaybill&labels=True`;
-    const response = await fetch(url, {
-      headers: {
-        'remote-user': remoteUser,
-        Accept: 'application/json',
-      },
-    });
-    const raw = await response.text();
-    let payload: any = null;
-    try { payload = JSON.parse(raw); } catch { payload = null; }
-    const labels = payload ? collectLabels(payload) : [];
-    if (!response.ok || !labels.length) {
-      return res.status(502).json({ error: 'APC did not return the label. Print it again in a few seconds.' });
-    }
+    const pdf = await fetchRoyalMailLabelPdf([orderId]);
+    return [{ trackingNumber: waybill, format: 'PDF', content: pdf.toString('base64') }];
+  }
+  if (booking.courier === 'DX') {
+    if (!dxConfigured()) throw Object.assign(new Error('DX login is not configured'), { status: 500 });
+    const tracking = (Array.isArray(booking.pieces) ? booking.pieces : []).map((piece) => text(piece?.trackingNumber)).filter(Boolean);
+    const labels = await fetchDxLabels(waybill, text(booking.apc_order_number) || 'F', format, tracking);
     if (format === 'ZPL') {
       for (const label of labels) {
         const zpl = Buffer.from(label.content, 'base64').toString('latin1');
         if (zpl.includes('^XA')) label.content = Buffer.from(fitZpl(zpl), 'latin1').toString('base64');
       }
     }
+    return labels;
+  }
+  if (booking.courier !== 'APC') {
+    throw Object.assign(new Error('This courier cannot print a label here.'), { status: 409 });
+  }
+  const remoteUser = authHeader();
+  if (!remoteUser) {
+    throw Object.assign(new Error('APC login is not configured on this computer'), { status: 500 });
+  }
+  const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(waybill)}.json?labelformat=${format}&markprinted=True&searchtype=CarrierWaybill&labels=True`;
+  const response = await fetch(url, {
+    headers: {
+      'remote-user': remoteUser,
+      Accept: 'application/json',
+    },
+  });
+  const raw = await response.text();
+  let payload: any = null;
+  try { payload = JSON.parse(raw); } catch { payload = null; }
+  const labels = payload ? collectLabels(payload) : [];
+  if (!response.ok || !labels.length) {
+    throw Object.assign(new Error('APC did not return the label. Print it again in a few seconds.'), { status: 502 });
+  }
+  if (format === 'ZPL') {
+    for (const label of labels) {
+      const zpl = Buffer.from(label.content, 'base64').toString('latin1');
+      if (zpl.includes('^XA')) label.content = Buffer.from(fitZpl(zpl), 'latin1').toString('base64');
+    }
+  }
+  return labels;
+}
+
+router.post('/bookings/:id/label', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const id = text(req.params.id);
+  if (!/^[0-9a-f-]{36}$/i.test(id)) {
+    return res.status(400).json({ error: 'Unknown booking' });
+  }
+  const format = text(req.query.format).toUpperCase() === 'ZPL' ? 'ZPL' : 'PDF';
+  try {
+    const labels = await labelsForPrint(id, format);
+    if (!labels.length) return res.status(502).json({ error: 'The courier did not return the label. Print it again in a few seconds.' });
     return res.json({ labels });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Could not reach the courier';
+    const status = Number((error as { status?: number }).status) || (error instanceof DxError ? error.status : 502);
     console.error('Label reprint failed', message);
-    return res.status(error instanceof DxError ? error.status : 502).json({ error: message });
+    return res.status(status).json({ error: message });
   }
 });
 
