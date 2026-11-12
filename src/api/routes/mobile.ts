@@ -534,7 +534,11 @@ router.get('/pick-lists/:id', authMiddleware, async (req: AuthRequest, res: Resp
 
     await attachMobilePackaging(items.rows);
 
-    const due = (await getDeliveryDues([req.params.id]))[req.params.id] ?? null;
+    // A sync refresh only needs the current lines. The list call already worked out the due date,
+    // and this lookup rewrites every order's stock holds.
+    const due = req.query.lines === '1'
+      ? null
+      : (await getDeliveryDues([req.params.id]))[req.params.id] ?? null;
     // Unresolved flags, full text, so the picker can read them before handling the order
     const flagNotes = await query(
       `SELECT id, note_text, created_by, created_at FROM pick_list_notes
