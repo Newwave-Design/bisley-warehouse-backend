@@ -259,17 +259,26 @@ export function dxReference(value: string): string {
  * "MultiDesk" word so the SKU and finish stay on the label.
  * The PDF line stays "Carton (KG)", which is the package type.
  */
-export function dxContentDescription(title: string): string {
-  const clean = title
+function dxAscii(value: string): string {
+  return value
     .replace(/\u00b7/g, ' ')
     .replace(/[^\x20-\x7E]/g, ' ')
     .replace(/[\^~]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
+}
+
+export function dxContentDescription(title: string): string {
+  const clean = dxAscii(title)
   if (!clean) return 'Carton'
   if (clean.length <= 32) return clean
   const withoutDesk = clean.replace(/^MultiDesk(?: \d+)? /, '')
   return (withoutDesk || clean).slice(0, 32)
+}
+
+/** AddCollection rejects DescriptionOfGoods over 30 characters. The label line allows 32. */
+export function dxGoodsDescription(title: string): string {
+  return dxContentDescription(title || 'Furniture').slice(0, 30)
 }
 
 export function dxPhone(value: string): string {
@@ -521,35 +530,35 @@ export async function addDxCollection(input: {
   const weight = input.pieces.reduce((sum, piece) => sum + kg(piece.weightKg), 0);
   const json = await authed('AddCollection', {
     CloseTime: dxInstant(input.collectionDate, 17),
-    CollectionAddress1: from[0],
-    CollectionAddress2: from[1] || '',
-    CollectionAddress3: from[2] || '',
-    CollectionAddress4: from[3] || '',
-    CollectionAddress5: from[4] || '',
-    CollectionContact: contact,
+    CollectionAddress1: dxAscii(from[0] || '').slice(0, 25),
+    CollectionAddress2: dxAscii(from[1] || '').slice(0, 30),
+    CollectionAddress3: dxAscii(from[2] || '').slice(0, 30),
+    CollectionAddress4: dxAscii(from[3] || '').slice(0, 30),
+    CollectionAddress5: dxAscii(from[4] || '').slice(0, 30),
+    CollectionContact: dxAscii(contact).slice(0, 25),
     CollectionCountry: 'GB',
     CollectionDate: dxInstant(input.collectionDate, 12),
-    CollectionEmail: input.collection.email.slice(0, 100),
-    CollectionName: name,
+    CollectionEmail: dxAscii(input.collection.email).slice(0, 50),
+    CollectionName: dxAscii(name).slice(0, 25),
     CollectionPhoneNumber: dxPhone(input.collection.phone),
     CollectionPostcode: postcode,
     CollectionReference: dxReference(input.reference),
     DXAccountNumber: accountNumber,
     // CF delivers this collection to the warehouse address below. CT would send it to the DX depot instead.
     DeliverTo: 'CF',
-    DeliveryAddress1: to[0],
-    DeliveryAddress2: to[1] || '',
-    DeliveryAddress3: to[2] || '',
-    DeliveryAddress4: to[3] || '',
-    DeliveryAddress5: to[4] || '',
-    DeliveryContact: WAREHOUSE_DELIVERY.name,
+    DeliveryAddress1: dxAscii(to[0] || '').slice(0, 25),
+    DeliveryAddress2: dxAscii(to[1] || '').slice(0, 30),
+    DeliveryAddress3: dxAscii(to[2] || '').slice(0, 30),
+    DeliveryAddress4: dxAscii(to[3] || '').slice(0, 30),
+    DeliveryAddress5: dxAscii(to[4] || '').slice(0, 30),
+    DeliveryContact: dxAscii(WAREHOUSE_DELIVERY.name).slice(0, 25),
     DeliveryCountry: 'GB',
     DeliveryEmail: '',
-    DeliveryName: clipWords(WAREHOUSE_DELIVERY.company, 25)[0],
+    DeliveryName: dxAscii(clipWords(WAREHOUSE_DELIVERY.company, 25)[0] || '').slice(0, 25),
     DeliveryPhoneNumber: FALLBACK_PHONE,
     DeliveryPostcode: WAREHOUSE_DELIVERY.postcode,
     DeliveryType: 2,
-    DescriptionOfGoods: dxContentDescription(input.pieces[0]?.title || 'Return'),
+    DescriptionOfGoods: dxGoodsDescription(input.pieces.map((piece) => piece.title).filter(Boolean).join(', ') || 'Furniture'),
     FreightType: 'F',
     HowPackaged: 'Carton',
     ItemCount: input.pieces.length,
