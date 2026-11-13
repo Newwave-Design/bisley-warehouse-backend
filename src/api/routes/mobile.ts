@@ -115,8 +115,8 @@ export async function getStock(sku: string, colourCode: string | null) {
      JOIN warehouse_locations l ON l.id = wi.location_id
      WHERE wi.product_sku = $1 AND wi.quantity > 0
        AND (
-         $2 IS NULL OR btrim(COALESCE(wi.colour_code, '')) = ''
-         OR lower(wi.colour_code) = lower($2)
+         $2::text IS NULL OR btrim(COALESCE(wi.colour_code, '')) = ''
+         OR lower(wi.colour_code) = lower($2::text)
          OR wi.colour_code !~ '^[a-z0-9]{2,4}$'
        )
      ORDER BY wi.quantity DESC`,
