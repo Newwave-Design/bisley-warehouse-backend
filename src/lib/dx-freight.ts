@@ -559,7 +559,8 @@ export async function addDxCollection(input: {
     DeliveryPostcode: WAREHOUSE_DELIVERY.postcode,
     DeliveryType: 2,
     DescriptionOfGoods: dxGoodsDescription(input.pieces.map((piece) => piece.title).filter(Boolean).join(', ') || 'Furniture'),
-    FreightType: 'F',
+    // DX rejects the routing stream "F" here. Kilos is the carton charged by weight; CartonKG is not enabled on this account.
+    FreightType: 'Kilos',
     HowPackaged: 'Carton',
     ItemCount: input.pieces.length,
     OrigServiceCentre: depot,
