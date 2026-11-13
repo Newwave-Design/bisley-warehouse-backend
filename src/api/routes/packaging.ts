@@ -64,7 +64,7 @@ router.get('/items', async (req: Request, res: Response) => {
 
 router.get('/items/:id', async (req: Request, res: Response) => {
   try {
-    const item = await query(`SELECT * FROM packaging_items WHERE id = $1 OR code = $1`, [req.params.id]);
+    const item = await query(`SELECT * FROM packaging_items WHERE id::text = $1 OR code = $1`, [req.params.id]);
     if (!item.rows[0]) return res.status(404).json({ error: 'Item not found' });
     const id = item.rows[0].id;
     const [used, moves, links] = await Promise.all([
@@ -121,7 +121,7 @@ router.patch('/items/:id', requirePermission('manage_settings'), async (req: Req
     body.updated_at = new Date();
     const { sets, values, next } = setClause(body);
     const result = await query(
-      `UPDATE packaging_items SET ${sets.join(', ')} WHERE id = $${next} OR code = $${next} RETURNING *`,
+      `UPDATE packaging_items SET ${sets.join(', ')} WHERE id::text = $${next} OR code = $${next} RETURNING *`,
       [...values, req.params.id]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Item not found' });
@@ -134,7 +134,7 @@ router.patch('/items/:id', requirePermission('manage_settings'), async (req: Req
 router.delete('/items/:id', requirePermission('manage_settings'), async (req: Request, res: Response) => {
   try {
     const result = await query(
-      `UPDATE packaging_items SET is_active = false, updated_at = NOW() WHERE id = $1 OR code = $1 RETURNING *`,
+      `UPDATE packaging_items SET is_active = false, updated_at = NOW() WHERE id::text = $1 OR code = $1 RETURNING *`,
       [req.params.id]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Item not found' });
