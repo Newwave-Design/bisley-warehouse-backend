@@ -5,7 +5,7 @@
 
 export const WAREHOUSE_SCHEMA = `
 -- ================================================================================
--- WAREHOUSE LOCATIONS (Aisles, Rows and Bays)
+-- WAREHOUSE LOCATIONS (rows and pallets, plus the holding row)
 -- ================================================================================
 CREATE TABLE IF NOT EXISTS warehouse_locations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1728,5 +1728,26 @@ CREATE TABLE IF NOT EXISTS reorder_v2_sale_covers (
   updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
   PRIMARY KEY (pick_list_item_id, sku)
 );
+
+UPDATE warehouse_locations
+SET is_active = false,
+    bay_code = LEFT(REPLACE(id::text, '-', ''), 8),
+    bin_code = RIGHT(REPLACE(id::text, '-', ''), 8),
+    updated_at = NOW()
+WHERE location_code <> 'HOLDING'
+  AND location_code !~ '^[1-9]-[0-9]{2}$'
+  AND NOT EXISTS (
+    SELECT 1 FROM warehouse_inventory i
+    WHERE i.location_id = warehouse_locations.id AND i.quantity <> 0
+  );
+
+INSERT INTO warehouse_locations (aisle_code, bay_code, bin_code, location_code, description, is_active, created_at, updated_at)
+SELECT NULL, r.n::text, LPAD(p.n::text, 2, '0'),
+       r.n::text || '-' || LPAD(p.n::text, 2, '0'),
+       'Row ' || r.n::text || ', pallet ' || LPAD(p.n::text, 2, '0'),
+       true, NOW(), NOW()
+FROM generate_series(1, 9) AS r(n)
+CROSS JOIN generate_series(1, 25) AS p(n)
+ON CONFLICT (location_code) DO NOTHING;
 
 `;

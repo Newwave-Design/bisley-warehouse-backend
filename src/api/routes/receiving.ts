@@ -464,23 +464,24 @@ router.get('/locations', authMiddleware, async (req: AuthRequest, res: Response)
 
 router.post('/locations', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { aisle_code, bay_code, bin_code, description } = req.body;
-    if (!bay_code || !bin_code) return res.status(400).json({ error: 'bay_code and bin_code required' });
-
-    const aisle = aisle_code ? String(aisle_code).toUpperCase() : null;
-    const row   = String(bay_code).toUpperCase();
-    const bay   = String(bin_code).toUpperCase();
-    const location_code = aisle ? `${aisle}-${row}-${bay}` : `${row}-${bay}`;
-
+    const row = String(req.body?.bay_code ?? '').trim();
+    const pallet = String(req.body?.bin_code ?? '').trim().padStart(2, '0');
+    const palletNumber = Number(pallet);
+    if (!/^[1-9]$/.test(row)) return res.status(400).json({ error: 'Choose a row from 1 to 9' });
+    if (!Number.isInteger(palletNumber) || palletNumber < 1 || palletNumber > 25) {
+      return res.status(400).json({ error: 'Choose a pallet from 1 to 25' });
+    }
+    const location_code = `${row}-${pallet}`;
     const result = await query(
       `INSERT INTO warehouse_locations (aisle_code, bay_code, bin_code, location_code, description, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+       VALUES (NULL, $1, $2, $3, $4, NOW(), NOW())
        ON CONFLICT (location_code) DO UPDATE SET is_active = true, updated_at = NOW()
          WHERE warehouse_locations.is_active = false
+           AND warehouse_locations.location_code <> 'HOLDING'
        RETURNING *`,
-      [aisle, row, bay, location_code, description || (aisle ? `Aisle ${aisle}, Row ${row}, Bay ${bay}` : `Row ${row}, Bay ${bay}`)]
+      [row, pallet, location_code, req.body?.description || `Row ${row}, pallet ${pallet}`]
     );
-    if (!result.rows[0]) return res.status(409).json({ error: 'Location already exists' });
+    if (!result.rows[0]) return res.status(409).json({ error: 'That pallet already exists' });
     res.status(201).json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'Failed to create location' });
@@ -641,45 +642,37 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
   }
 });
 
-// Bulk-generate bay locations (e.g. rows A-C, bins 1-10 = 30 bays)
+// Rows 1 to 9, pallets 1 to 25. The holding row is never created or changed here.
 router.post('/locations/generate', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
   try {
-    const { aisles = ['A'], rows_per_aisle = 5, bays_per_row = 10 } = req.body;
-    if (!Array.isArray(aisles) || aisles.length === 0 || aisles.length > 10) {
-      return res.status(400).json({ error: 'aisles must be a non-empty array of at most 10' });
+    const rows = Number(req.body?.rows ?? 9);
+    const palletsPerRow = Number(req.body?.pallets_per_row ?? 25);
+    if (!Number.isInteger(rows) || rows < 1 || rows > 9) {
+      return res.status(400).json({ error: 'rows must be a whole number from 1 to 9' });
     }
-    if (!Number.isInteger(rows_per_aisle) || rows_per_aisle < 1 || rows_per_aisle > 100) {
-      return res.status(400).json({ error: 'rows_per_aisle must be an integer between 1 and 100' });
-    }
-    if (!Number.isInteger(bays_per_row) || bays_per_row < 1 || bays_per_row > 100) {
-      return res.status(400).json({ error: 'bays_per_row must be an integer between 1 and 100' });
+    if (!Number.isInteger(palletsPerRow) || palletsPerRow < 1 || palletsPerRow > 25) {
+      return res.status(400).json({ error: 'pallets_per_row must be a whole number from 1 to 25' });
     }
     let created = 0, skipped = 0;
-
-    for (const aisle of aisles) {
-      const aisle_code = String(aisle).toUpperCase();
-      for (let row = 1; row <= rows_per_aisle; row++) {
-        const bay_code = String(row);
-        for (let bay = 1; bay <= bays_per_row; bay++) {
-          const bin_code = String(bay).padStart(2, '0');
-          const location_code = `${aisle_code}-${bay_code}-${bin_code}`;
-          const result = await query(
-            `INSERT INTO warehouse_locations (aisle_code, bay_code, bin_code, location_code, description, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-             ON CONFLICT (location_code) DO UPDATE SET is_active = true, updated_at = NOW()
-               WHERE warehouse_locations.is_active = false`,
-            [aisle_code, bay_code, bin_code, location_code, `Aisle ${aisle_code}, Row ${bay_code}, Bay ${bin_code}`]
-          );
-          if (result.rowCount && result.rowCount > 0) created++;
-          else skipped++;
-        }
+    for (let row = 1; row <= rows; row++) {
+      for (let pallet = 1; pallet <= palletsPerRow; pallet++) {
+        const bin = String(pallet).padStart(2, '0');
+        const location_code = `${row}-${bin}`;
+        const result = await query(
+          `INSERT INTO warehouse_locations (aisle_code, bay_code, bin_code, location_code, description, created_at, updated_at)
+           VALUES (NULL, $1, $2, $3, $4, NOW(), NOW())
+           ON CONFLICT (location_code) DO UPDATE SET is_active = true, updated_at = NOW()
+             WHERE warehouse_locations.is_active = false
+               AND warehouse_locations.location_code <> 'HOLDING'`,
+          [String(row), bin, location_code, `Row ${row}, pallet ${bin}`]
+        );
+        if (result.rowCount && result.rowCount > 0) created++;
+        else skipped++;
       }
     }
-
-    const total = aisles.length * rows_per_aisle * bays_per_row;
-    res.json({ success: true, created, skipped, total });
+    res.json({ success: true, created, skipped, total: rows * palletsPerRow });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to generate bays' });
+    res.status(500).json({ error: 'Failed to generate pallets' });
   }
 });
 
@@ -704,6 +697,10 @@ router.get('/locations/:id/inventory', authMiddleware, async (req: AuthRequest, 
 /** PATCH /api/receiving/locations/:id — edit a bay's description / max weight */
 router.patch('/locations/:id', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
   try {
+    const found = await query(`SELECT location_code FROM warehouse_locations WHERE id = $1`, [req.params.id]);
+    if (String(found.rows[0]?.location_code || '').toUpperCase() === 'HOLDING') {
+      return res.status(400).json({ error: 'The holding row stays as it is' });
+    }
     const { description, max_weight_kg } = req.body;
     const weight = max_weight_kg === '' || max_weight_kg === undefined || max_weight_kg === null ? null : Number(max_weight_kg);
     if (weight !== null && (!Number.isFinite(weight) || weight < 0)) {
@@ -723,6 +720,10 @@ router.patch('/locations/:id', authMiddleware, requirePermission('system_admin')
 /** DELETE /api/receiving/locations/:id — remove an empty, unused bay (soft delete) */
 router.delete('/locations/:id', authMiddleware, requirePermission('system_admin'), async (req: AuthRequest, res: Response) => {
   try {
+    const found = await query(`SELECT location_code FROM warehouse_locations WHERE id = $1`, [req.params.id]);
+    if (String(found.rows[0]?.location_code || '').toUpperCase() === 'HOLDING') {
+      return res.status(400).json({ error: 'The holding row stays as it is' });
+    }
     const stock = await query(`SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE location_id = $1`, [req.params.id]);
     if (stock.rows[0].qty > 0) {
       return res.status(400).json({ error: 'Cannot remove a bay that still has stock — clear or move it first' });
