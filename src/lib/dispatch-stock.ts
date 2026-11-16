@@ -54,7 +54,13 @@ export async function applyDispatchStock(
   for (const item of items) {
     const picked = parseInt(item.quantity_picked, 10);
     if (!item.product_sku || !picked) continue;
-    if (wanted && !wanted.has(item.product_sku)) continue;
+    if (wanted && !wanted.has(item.product_sku)) {
+      const componentSkus = Array.isArray(item.kit_components)
+        ? item.kit_components.map((part) => part?.sku).filter((sku): sku is string => Boolean(sku))
+        : [];
+      // A wooden-handle Home Filer is booked as the cabinet and the handles, not the parent kit code.
+      if (!componentSkus.some((sku) => wanted.has(sku))) continue;
+    }
     if (alreadyTaken.has(item.id)) continue;
 
     // Custom (no SKU) lines carry no stock: record the sale so Stock Sold can list it

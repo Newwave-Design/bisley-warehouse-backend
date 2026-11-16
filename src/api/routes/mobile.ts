@@ -668,6 +668,18 @@ async function recomputePickItem(pickListId: string, itemId: string) {
   return { item: updated.rows[0], allPicked };
 }
 
+/**
+ * The cabinet and handles are already on the order. Work out the kit again before answering,
+ * so a repeat upload marks the Home Filer picked instead of leaving the line at zero.
+ */
+async function answerIfRecorded(res: Response, pickListId: string, itemId: string, sku: string) {
+  const { item, allPicked } = await recomputePickItem(pickListId, itemId);
+  if (item?.status === 'PICKED' || await collectionBooked(pickListId)) {
+    return res.json({ success: true, all_picked: allPicked, item, note: 'Already recorded' });
+  }
+  return res.status(400).json({ error: `${sku} is already scanned` });
+}
+
 /** True when this order already has an outbound collection, or has been marked shipped. */
 async function collectionBooked(pickListId: string): Promise<boolean> {
   const found = await query(
@@ -811,13 +823,7 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
         if (sku === scannedSku) got += Number(scan.quantity);
       }
       const left = need - got;
-      if (left <= 0) {
-        await promotePickList(pickListId);
-        if (await collectionBooked(pickListId)) {
-          return res.json({ success: true, all_picked: true, item, note: 'Already recorded' });
-        }
-        return res.status(400).json({ error: `${scannedSku} is already scanned` });
-      }
+      if (left <= 0) return answerIfRecorded(res, pickListId, item.id, scannedSku);
       const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
       if (qty > left) {
         return res.status(400).json({ error: `Only ${left} remaining — reduce the quantity` });
@@ -860,13 +866,7 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
         if (sku === scannedSku) got += Number(scan.quantity);
       }
       const left = required - got;
-      if (left <= 0) {
-        await promotePickList(pickListId);
-        if (await collectionBooked(pickListId)) {
-          return res.json({ success: true, all_picked: true, item, note: 'Already recorded' });
-        }
-        return res.status(400).json({ error: `${scannedSku} is already scanned` });
-      }
+      if (left <= 0) return answerIfRecorded(res, pickListId, item.id, scannedSku);
       const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
       if (qty > left) return res.status(400).json({ error: `Only ${left} remaining — reduce the quantity` });
 
