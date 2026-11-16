@@ -109,8 +109,9 @@ router.post('/barcodes', authMiddleware, async (req: AuthRequest, res: Response)
     );
     res.json({ success: true, barcode, sku: p.variant_sku });
   } catch (err) {
-    console.error('Barcode assignment error:', err);
-    res.status(500).json({ error: 'Failed to assign barcode' });
+    const message = err instanceof Error ? err.message : 'Failed to assign barcode';
+    console.error('Barcode assignment error:', message);
+    res.status(409).json({ error: message });
   }
 });
 

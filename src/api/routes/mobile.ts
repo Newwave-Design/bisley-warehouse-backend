@@ -42,6 +42,24 @@ export function toUuidOrNull(id: unknown): string | null {
   return typeof id === 'string' && UUID_RE.test(id) ? id : null;
 }
 
+/**
+ * The handheld sends the queue one item at a time and stops on a server error.
+ * A local id that was never given a server uuid has to be a normal rejection, or every later pick stays waiting.
+ */
+function rejectBadId(res: Response, value: string | undefined, what: string): boolean {
+  if (value && UUID_RE.test(value)) return false;
+  console.warn(`[mobile] skipped ${what}: ${JSON.stringify(value ?? '')}`);
+  res.status(400).json({ error: `This ${what} was never saved on the server, so it was skipped` });
+  return true;
+}
+
+/** A database fault must not freeze the rest of the handheld queue. The row stays rejected and can be retried. */
+function rejectPickFault(res: Response, where: string, err: unknown) {
+  const message = err instanceof Error ? err.message : 'Pick failed';
+  console.error(`[mobile] ${where} failed:`, message);
+  res.status(409).json({ error: message || 'Pick failed' });
+}
+
 /** Resolve any scan (EAN/supercode, NW code, SKU) to product info + stock; shared with move sessions */
 export async function lookupProduct(q: string): Promise<any> {
     // 1. Exact barcode match (EAN, supercode like H2910NL-av1)
@@ -588,7 +606,7 @@ async function kitPartsOf(itemId: string): Promise<{ sku: string; required_quant
   if (!sku) return [];
   const kit = await query(
     `SELECT kit_components FROM wms_products
-      WHERE variant_sku = $1 AND kit_components IS NOT NULL AND jsonb_array_length(kit_components) > 0
+      WHERE variant_sku = $1 AND jsonb_typeof(kit_components) = 'array' AND jsonb_array_length(kit_components) > 0
       ORDER BY jsonb_array_length(kit_components) DESC
       LIMIT 1`,
     [sku]
@@ -697,8 +715,9 @@ async function bookedLineForSku(pickListId: string, sku: string): Promise<any | 
  */
 router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { scanned_barcode, location_code, quantity, scanned_component_sku } = req.body;
+    const { scanned_barcode, location_code, quantity, scanned_component_sku } = req.body ?? {};
     const { id: pickListId } = req.params;
+    if (rejectBadId(res, pickListId, 'pick')) return;
     if (!scanned_barcode) return res.status(400).json({ error: 'scanned_barcode required' });
 
     // Resolve barcode -> SKU. Fall back to treating the scan as a literal SKU
@@ -717,14 +736,14 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
     const allItems = await query(
       `SELECT pli.id, pli.product_sku, pli.quantity_required, pli.quantity_picked, pli.status,
               wp.kit_components,
-              CASE WHEN wp.kit_components IS NOT NULL AND jsonb_array_length(wp.kit_components) > 0
+              CASE WHEN jsonb_typeof(wp.kit_components) = 'array' AND jsonb_array_length(wp.kit_components) > 0
                 THEN true ELSE false END AS is_kit
        FROM pick_list_items pli
        LEFT JOIN LATERAL (
          SELECT kit_components FROM wms_products
          WHERE variant_sku = pli.product_sku
          ORDER BY is_archived ASC,
-                  CASE WHEN kit_components IS NOT NULL AND jsonb_array_length(kit_components) > 0 THEN 0 ELSE 1 END
+                  CASE WHEN jsonb_typeof(kit_components) = 'array' AND jsonb_array_length(kit_components) > 0 THEN 0 ELSE 1 END
          LIMIT 1
        ) wp ON true
        WHERE pli.pick_list_id = $1 AND pli.status != 'PICKED'
@@ -910,16 +929,17 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
 
       res.json({ success: true, all_picked: allPicked, item: updatedItem });
     }
-  } catch (err: any) {
-    res.status(500).json({ error: err.message ?? 'Pick failed' });
+  } catch (err) {
+    rejectPickFault(res, `scan ${req.params.id}`, err);
   }
 });
 
 /** POST /api/mobile/pick-lists/:id/items/:itemId/pick — scan to pick a quantity (defaults to all remaining) */
 router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { location_code, scanned_barcode, quantity } = req.body;
+    const { location_code, scanned_barcode, quantity } = req.body ?? {};
     const { id: pickListId, itemId } = req.params;
+    if (rejectBadId(res, pickListId, 'pick') || rejectBadId(res, itemId, 'line')) return;
 
     const item = await query(
       `SELECT * FROM pick_list_items WHERE id = $1 AND pick_list_id = $2`,
@@ -982,8 +1002,8 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
     const { item: updatedItem, allPicked } = await recomputePickItem(pickListId, itemId);
 
     res.json({ success: true, all_picked: allPicked, item: updatedItem });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message ?? 'Pick failed' });
+  } catch (err) {
+    rejectPickFault(res, `manual pick ${req.params.id}`, err);
   }
 });
 
@@ -1011,7 +1031,8 @@ router.get('/pick-lists/:id/scans', authMiddleware, async (req: AuthRequest, res
 /** PATCH /api/mobile/pick-lists/:id/scans/:scanId — correct a scan's quantity */
 router.patch('/pick-lists/:id/scans/:scanId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { quantity } = req.body;
+    const { quantity } = req.body ?? {};
+    if (rejectBadId(res, req.params.id, 'pick') || rejectBadId(res, req.params.scanId, 'scan change')) return;
     if (!Number.isInteger(quantity) || quantity <= 0) {
       return res.status(400).json({ error: 'quantity must be a positive integer' });
     }
@@ -1044,14 +1065,15 @@ router.patch('/pick-lists/:id/scans/:scanId', authMiddleware, async (req: AuthRe
     await query(`UPDATE pick_scans SET quantity = $1, updated_at = NOW() WHERE id = $2`, [quantity, req.params.scanId]);
     const { item: updatedItem, allPicked } = await recomputePickItem(req.params.id, scan.rows[0].pick_list_item_id);
     res.json({ success: true, item: updatedItem, all_picked: allPicked });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message ?? 'Failed to update scan' });
+  } catch (err) {
+    rejectPickFault(res, `update scan ${req.params.scanId}`, err);
   }
 });
 
 /** DELETE /api/mobile/pick-lists/:id/scans/:scanId — remove a single scan */
 router.delete('/pick-lists/:id/scans/:scanId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
+    if (rejectBadId(res, req.params.id, 'pick') || rejectBadId(res, req.params.scanId, 'scan change')) return;
     const scan = await query(
       `SELECT * FROM pick_scans WHERE id = $1 AND pick_list_id = $2`,
       [req.params.scanId, req.params.id]
@@ -1062,14 +1084,15 @@ router.delete('/pick-lists/:id/scans/:scanId', authMiddleware, async (req: AuthR
     scheduleStockHolds();
     const { item: updatedItem, allPicked } = await recomputePickItem(req.params.id, scan.rows[0].pick_list_item_id);
     res.json({ success: true, item: updatedItem, all_picked: allPicked });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message ?? 'Failed to delete scan' });
+  } catch (err) {
+    rejectPickFault(res, `delete scan ${req.params.scanId}`, err);
   }
 });
 
 /** POST /api/mobile/pick-lists/:id/reset — clear all scans and start the list again */
 router.post('/pick-lists/:id/reset', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
+    if (rejectBadId(res, req.params.id, 'pick')) return;
     const pl = await query(`SELECT id, status FROM pick_lists WHERE id = $1`, [req.params.id]);
     if (!pl.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
     if (pl.rows[0].status === 'DISPATCHED' || pl.rows[0].status === 'CANCELLED') {
@@ -1092,8 +1115,8 @@ router.post('/pick-lists/:id/reset', authMiddleware, async (req: AuthRequest, re
     scheduleStockHolds();
 
     res.json({ success: true });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message ?? 'Failed to reset pick list' });
+  } catch (err) {
+    rejectPickFault(res, `reset ${req.params.id}`, err);
   }
 });
 
