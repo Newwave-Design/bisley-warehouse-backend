@@ -208,15 +208,24 @@ async function computeHolds(): Promise<void> {
   }
 
   const holds = planHolds(lines, onHand, claims);
+  const unique = new Map<string, PlannedHold>();
+  for (const hold of holds) {
+    const key = `${hold.itemId}\0${hold.sku}`;
+    const existing = unique.get(key);
+    if (!existing || hold.qty > existing.qty) unique.set(key, hold);
+  }
+  const rows = [...unique.values()];
   const client = await getPool().connect();
   try {
     await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(842461)');
     await client.query('DELETE FROM order_stock_holds');
-    if (holds.length) {
+    if (rows.length) {
       await client.query(
         `INSERT INTO order_stock_holds (pick_list_item_id, sku, qty)
-         SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::int[])`,
-        [holds.map((hold) => hold.itemId), holds.map((hold) => hold.sku), holds.map((hold) => hold.qty)]
+         SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::int[])
+         ON CONFLICT (pick_list_item_id, sku) DO UPDATE SET qty = EXCLUDED.qty`,
+        [rows.map((hold) => hold.itemId), rows.map((hold) => hold.sku), rows.map((hold) => hold.qty)]
       );
     }
     await client.query('COMMIT');
@@ -238,7 +247,8 @@ export function ensureStockHolds(force = false): Promise<void> {
   chain = run.catch((err) => {
     console.warn('[stock-holds]', err instanceof Error ? err.message : err);
   });
-  return run;
+  // A failed rebuild must not fail the scan. The phone stops the whole queue on a server error.
+  return chain;
 }
 
 /** Rebuild shortly after stock or an order changes. Repeated calls collapse into one rebuild. */
@@ -263,7 +273,13 @@ export interface PickRefusal {
 export async function refuseUnassignedPick(input: PickRefusal): Promise<string | null> {
   if (input.take <= 0) return null;
   const list = await query(
-    `SELECT pl.is_sandbox, pl.status, pli.product_sku, pli.is_custom, wp.kit_components
+    `SELECT pl.is_sandbox, pl.status, pli.product_sku, pli.is_custom, wp.kit_components,
+            EXISTS (
+              SELECT 1 FROM collection_bookings cb
+               WHERE cb.pick_list_id = pl.id
+                 AND cb.status <> 'cancelled'
+                 AND COALESCE(cb.direction, 'outbound') <> 'return'
+            ) AS booked
        FROM pick_lists pl
        JOIN pick_list_items pli ON pli.pick_list_id = pl.id AND pli.id = $2
        LEFT JOIN LATERAL (
@@ -274,6 +290,9 @@ export async function refuseUnassignedPick(input: PickRefusal): Promise<string |
   );
   const row = list.rows[0];
   if (!row || row.is_sandbox || row.is_custom || SAMPLE.test(row.product_sku || '')) return null;
+  // Booking marks the order shipped before the scanner has uploaded its picks, which drops it out of
+  // the assignment. The picks were already made. Record them instead of refusing them.
+  if (row.booked || row.status === 'DISPATCHED') return null;
   const parts = kitParts(row.product_sku, row.kit_components);
   if (parts.length && !parts.some((part) => part.sku === input.sku)) return null;
 

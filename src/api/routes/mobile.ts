@@ -19,6 +19,7 @@ import { formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
 import { promotePickList } from '../../lib/pick-progress.js';
 import { refuseUnassignedPick, scheduleStockHolds } from '../../lib/stock-holds.js';
+import { takeStockForBookedCollection } from '../../lib/collection-stock.js';
 import { attachPackaging, shippingTypeForLines } from '../../lib/pick-list-packaging.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { catalogueRevisedAt } from './mobile-sync.js';
@@ -642,7 +643,50 @@ async function recomputePickItem(pickListId: string, itemId: string) {
     [picked, status, itemId]
   );
   const { allPicked } = await promotePickList(pickListId);
+  // A collection booked before these scans uploaded took no stock, because nothing was picked yet.
+  void takeStockForBookedCollection(pickListId).catch((error) => {
+    console.warn('Removing booked collection stock failed', error instanceof Error ? error.message : 'failed');
+  });
   return { item: updated.rows[0], allPicked };
+}
+
+/** True when this order already has an outbound collection, or has been marked shipped. */
+async function collectionBooked(pickListId: string): Promise<boolean> {
+  const found = await query(
+    `SELECT pl.status,
+            EXISTS (
+              SELECT 1 FROM collection_bookings cb
+               WHERE cb.pick_list_id = pl.id
+                 AND cb.status <> 'cancelled'
+                 AND COALESCE(cb.direction, 'outbound') <> 'return'
+            ) AS booked
+       FROM pick_lists pl WHERE pl.id = $1`,
+    [pickListId],
+  );
+  const row = found.rows[0];
+  return !!(row?.booked || row?.status === 'DISPATCHED');
+}
+
+/** A picked line on a booked order whose SKU, or one of its parts, is [sku]. */
+async function bookedLineForSku(pickListId: string, sku: string): Promise<any | null> {
+  if (!(await collectionBooked(pickListId))) return null;
+  const found = await query(
+    `SELECT pli.*, wp.kit_components
+       FROM pick_list_items pli
+       LEFT JOIN LATERAL (
+         SELECT kit_components FROM wms_products
+          WHERE variant_sku = pli.product_sku
+          ORDER BY is_archived ASC
+          LIMIT 1
+       ) wp ON true
+      WHERE pli.pick_list_id = $1 AND pli.status = 'PICKED'`,
+    [pickListId],
+  );
+  return found.rows.find((row) => {
+    if (row.product_sku === sku) return true;
+    const parts = Array.isArray(row.kit_components) ? row.kit_components : [];
+    return parts.some((part: any) => part?.sku === sku);
+  }) || null;
 }
 
 /**
@@ -712,6 +756,8 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
     }
 
     if (!candidates.length) {
+      const recorded = await bookedLineForSku(pickListId, scannedSku);
+      if (recorded) return res.json({ success: true, all_picked: true, item: recorded, note: 'Already recorded' });
       return res.status(404).json({ 
         error: `${scannedSku} is not part of this order`,
         scannedSku,
@@ -722,6 +768,9 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
     const item = candidates[0];
     if (item.status === 'PICKED') {
       await promotePickList(pickListId);
+      if (await collectionBooked(pickListId)) {
+        return res.json({ success: true, all_picked: true, item, note: 'Already recorded' });
+      }
       return res.status(400).json({ error: 'Already picked' });
     }
     if (/SAMPLE/i.test(item.product_sku || '')) {
@@ -745,6 +794,9 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
       const left = need - got;
       if (left <= 0) {
         await promotePickList(pickListId);
+        if (await collectionBooked(pickListId)) {
+          return res.json({ success: true, all_picked: true, item, note: 'Already recorded' });
+        }
         return res.status(400).json({ error: `${scannedSku} is already scanned` });
       }
       const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
@@ -791,6 +843,9 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
       const left = required - got;
       if (left <= 0) {
         await promotePickList(pickListId);
+        if (await collectionBooked(pickListId)) {
+          return res.json({ success: true, all_picked: true, item, note: 'Already recorded' });
+        }
         return res.status(400).json({ error: `${scannedSku} is already scanned` });
       }
       const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
@@ -826,6 +881,9 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
       const remainingQty = item.quantity_required - item.quantity_picked;
       const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : remainingQty;
       if (qty > remainingQty) {
+        if (remainingQty <= 0 && await collectionBooked(pickListId)) {
+          return res.json({ success: true, all_picked: true, item, note: 'Already recorded' });
+        }
         return res.status(400).json({ error: `Only ${remainingQty} remaining — reduce the quantity` });
       }
       const held = await refuseUnassignedPick({
@@ -870,6 +928,9 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
     if (!item.rows[0]) return res.status(404).json({ error: 'Item not found' });
     if (item.rows[0].status === 'PICKED') {
       await promotePickList(pickListId);
+      if (await collectionBooked(pickListId)) {
+        return res.json({ success: true, all_picked: true, item: item.rows[0], note: 'Already recorded' });
+      }
       return res.status(400).json({ error: 'Already picked' });
     }
     if ((await kitPartsOf(itemId)).length) {
@@ -1009,8 +1070,18 @@ router.delete('/pick-lists/:id/scans/:scanId', authMiddleware, async (req: AuthR
 /** POST /api/mobile/pick-lists/:id/reset — clear all scans and start the list again */
 router.post('/pick-lists/:id/reset', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const pl = await query(`SELECT id FROM pick_lists WHERE id = $1`, [req.params.id]);
+    const pl = await query(`SELECT id, status FROM pick_lists WHERE id = $1`, [req.params.id]);
     if (!pl.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+    if (pl.rows[0].status === 'DISPATCHED' || pl.rows[0].status === 'CANCELLED') {
+      return res.status(409).json({ error: 'A shipped order stays as it is' });
+    }
+    const booking = await query(
+      `SELECT 1 FROM collection_bookings
+        WHERE pick_list_id = $1 AND status <> 'cancelled' AND COALESCE(direction, 'outbound') <> 'return'
+        LIMIT 1`,
+      [req.params.id],
+    );
+    if (booking.rows.length) return res.status(409).json({ error: 'This order has a collection' });
 
     await query(`DELETE FROM pick_scans WHERE pick_list_id = $1`, [req.params.id]);
     await query(
