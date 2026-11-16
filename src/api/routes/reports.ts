@@ -14,9 +14,6 @@ import { COLOUR_NAMES, extractColourCode, sampleColourLabel } from '../../lib/co
 /** Monthly net sales target in GBP (ex VAT). */
 export const MONTHLY_NET_TARGET_GBP = 90_000;
 
-/** UK standard VAT. RRP (`wms_products.price_gbp`) is the price charged, which includes VAT. */
-const UK_VAT_RATE = 0.2;
-
 const router = express.Router();
 
 router.get('/', authMiddleware, async (_req: AuthRequest, res: Response) => {
@@ -567,15 +564,15 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
         console.warn('[reports/sales] conversion query failed:', err instanceof Error ? err.message : err);
         return { rows: [{ sample_customers: '0', converted: '0' }] };
       }),
-      // On-hand units × RRP. Kits have no bin of their own, so this is physical stock only.
-      // Some bays are labelled with the Medusa SKU (PLINTH-bx6) while the catalogue price
-      // sits on the supplier code (MDHP-bx6); sku_mappings bridges those.
+      // On-hand units × net cost (wms_products.unit_cost_gbp), not the shop price.
+      // Kits have no bin of their own, so this is physical stock only.
+      // Some bays are labelled with the Medusa SKU while the cost sits on the supplier code;
+      // sku_mappings bridges those.
       query(
         `SELECT
-           COALESCE(ROUND(SUM(s.qty * COALESCE(p.price_gbp, m.price_gbp, 0))::numeric, 2), 0)::float8 AS inc_vat_gbp,
-           COALESCE(ROUND((SUM(s.qty * COALESCE(p.price_gbp, m.price_gbp, 0)) / $1)::numeric, 2), 0)::float8 AS exc_vat_gbp,
+           COALESCE(ROUND(SUM(s.qty * COALESCE(p.unit_cost_gbp, m.unit_cost_gbp, 0))::numeric, 2), 0)::float8 AS net_cost_gbp,
            COALESCE(SUM(s.qty), 0)::int AS units,
-           COALESCE(SUM(s.qty) FILTER (WHERE p.price_gbp IS NULL AND m.price_gbp IS NULL), 0)::int AS unpriced_units
+           COALESCE(SUM(s.qty) FILTER (WHERE p.unit_cost_gbp IS NULL AND m.unit_cost_gbp IS NULL), 0)::int AS uncosted_units
          FROM (
            SELECT product_sku, SUM(quantity)::numeric AS qty
            FROM warehouse_inventory
@@ -583,21 +580,20 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
            GROUP BY product_sku
          ) s
          LEFT JOIN (
-           SELECT variant_sku, MAX(price_gbp) AS price_gbp
+           SELECT variant_sku, MAX(unit_cost_gbp) AS unit_cost_gbp
            FROM wms_products
            GROUP BY variant_sku
          ) p ON p.variant_sku = s.product_sku
          LEFT JOIN (
-           SELECT sm.medusa_sku, MAX(wp.price_gbp) AS price_gbp
+           SELECT sm.medusa_sku, MAX(wp.unit_cost_gbp) AS unit_cost_gbp
            FROM sku_mappings sm
            JOIN wms_products wp ON wp.variant_sku = sm.nw_code
            WHERE sm.nw_code IS NOT NULL AND sm.nw_code <> ''
            GROUP BY sm.medusa_sku
-         ) m ON m.medusa_sku = s.product_sku AND p.price_gbp IS NULL`,
-        [1 + UK_VAT_RATE]
+         ) m ON m.medusa_sku = s.product_sku AND p.unit_cost_gbp IS NULL`
       ).catch((err) => {
         console.warn('[reports/sales] inventory value query failed:', err instanceof Error ? err.message : err);
-        return { rows: [{ inc_vat_gbp: 0, exc_vat_gbp: 0, units: 0, unpriced_units: 0 }] };
+        return { rows: [{ net_cost_gbp: 0, units: 0, uncosted_units: 0 }] };
       }),
     ]);
 
@@ -674,11 +670,10 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
         converted,
         rate: sampleCustomers ? Math.round((converted / sampleCustomers) * 1000) / 10 : 0,
       },
-      inventory_sale_value: {
-        inc_vat_gbp: round2(Number(stockValue?.inc_vat_gbp) || 0),
-        exc_vat_gbp: round2(Number(stockValue?.exc_vat_gbp) || 0),
+      inventory_value: {
+        net_cost_gbp: round2(Number(stockValue?.net_cost_gbp) || 0),
         units: Number(stockValue?.units) || 0,
-        unpriced_units: Number(stockValue?.unpriced_units) || 0,
+        uncosted_units: Number(stockValue?.uncosted_units) || 0,
       },
     });
   } catch (err) {
