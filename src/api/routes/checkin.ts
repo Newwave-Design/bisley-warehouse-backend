@@ -23,6 +23,7 @@ import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { deliveryNoteForSession, openDeliveryNote } from '../../lib/delivery-notes.js';
+import { resolveScan } from '../../lib/resolve-scan.js';
 
 async function enrichCheckinItems(items: any[]) {
   const keys = [...new Set(items.flatMap((i) => [i.medusa_sku, i.nw_code].filter(Boolean)))]
@@ -50,6 +51,7 @@ async function enrichCheckinItems(items: any[]) {
       colour_code: code || null,
       colour_name: colourName,
       description: p?.product_title || i.nw_code || sku,
+      unmatched: !p,
     }
   })
 }
@@ -307,6 +309,76 @@ router.delete('/sessions/:id/items/:itemId', authMiddleware, async (req: AuthReq
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to remove item' });
+  }
+});
+
+// Point an unknown scan at a real product. Works after the goods are already scanned, including a saved session.
+router.post('/sessions/:id/items/:itemId/reconcile', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const code = String(req.body?.code || '').trim();
+    if (!code) return res.status(400).json({ error: 'Enter the product code' });
+    const resolved = await resolveScan(code);
+    if (!resolved?.matched) {
+      return res.status(400).json({ error: 'That code is not a product yet. The scan stays as it is.' });
+    }
+
+    const found = await query(
+      `SELECT * FROM checkin_items WHERE id = $1 AND session_id = $2 AND removed_at IS NULL`,
+      [req.params.itemId, req.params.id],
+    );
+    const item = found.rows[0];
+    if (!item) return res.status(404).json({ error: 'Scan not found' });
+
+    const oldSku = item.medusa_sku || item.nw_code;
+    const newSku = resolved.medusa_sku || resolved.sku;
+    await query(
+      `UPDATE checkin_items
+          SET nw_code = $1, medusa_sku = $2, colour = COALESCE($3, colour), updated_at = NOW()
+        WHERE id = $4`,
+      [resolved.nw_code || newSku, newSku, resolved.colour_name, item.id],
+    );
+
+    const session = await query(`SELECT status, started_by FROM checkin_sessions WHERE id = $1`, [req.params.id]);
+    if (session.rows[0]?.status === 'COMPLETE' && oldSku && oldSku !== newSku) {
+      const holding = await getHoldingLocation();
+      const colour = await resolveColourCode(newSku, resolved.colour_code);
+      const actor = toUuidOrNull(req.user?.id) || toUuidOrNull(session.rows[0].started_by);
+      const client = await getPool().connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(
+          `UPDATE warehouse_inventory
+              SET quantity = GREATEST(quantity - $1, 0), updated_at = NOW()
+            WHERE location_id = $2 AND product_sku = $3`,
+          [item.quantity_scanned, holding, oldSku],
+        );
+        await client.query(
+          `INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, 'Bisley', NOW(), NOW())
+           ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
+           DO UPDATE SET quantity = warehouse_inventory.quantity + EXCLUDED.quantity, updated_at = NOW()`,
+          [holding, newSku, colour, item.quantity_scanned],
+        );
+        if (actor) {
+          await client.query(
+            `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, colour_code, quantity, notes, performed_by, checkin_session_id)
+             VALUES ('RECEIVE', $1, $2, $3, $4, $5, $6, $7)`,
+            [holding, newSku, colour, item.quantity_scanned, `Reconciled from ${oldSku}`, actor, req.params.id],
+          );
+        }
+        await client.query('COMMIT');
+      } catch (moveErr) {
+        await client.query('ROLLBACK');
+        throw moveErr;
+      } finally {
+        client.release();
+      }
+    }
+
+    res.json({ success: true, sku: newSku, product_name: resolved.product_name });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to reconcile scan';
+    res.status(500).json({ error: message });
   }
 });
 

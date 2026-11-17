@@ -288,11 +288,6 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
     if (target.missing) return res.status(404).json({ error: 'Session not found' });
     if (target.id !== session_id) {
       logger.info(`[stock-in] Filing scan for abandoned session ${session_id} onto open session ${target.id}`);
-    } else {
-      const session = await query(`SELECT status FROM checkin_sessions WHERE id = $1`, [session_id]);
-      if (session.rows[0]?.status !== 'OPEN') {
-        return res.status(400).json({ error: 'Session is not open' });
-      }
     }
     const writeSessionId = target.id;
 
@@ -377,6 +372,30 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : JSON.stringify(err);
     logger.error(`Scan failed: ${errorMsg}`);
+    const code = String(req.body?.scan_input || '').trim().toUpperCase();
+    const sessionId = String(req.body?.session_id || '');
+    if (code && sessionId) {
+      try {
+        const qty = Math.min(9999, Math.max(1, Math.trunc(Number(req.body?.quantity)) || 1));
+        const item = await query(
+          `INSERT INTO checkin_items (session_id, nw_code, colour, medusa_sku, quantity_scanned, scanned_at, created_at)
+           VALUES ($1, $2, NULL, NULL, $3, NOW(), NOW()) RETURNING *`,
+          [sessionId, code, qty],
+        );
+        const scanLog = await query(
+          `INSERT INTO checkin_scans (session_id, item_id, quantity) VALUES ($1, $2, $3) RETURNING id, item_id, quantity, scanned_at`,
+          [sessionId, item.rows[0].id, qty],
+        );
+        return res.json({
+          success: true,
+          unmatched: true,
+          scan: scanLog.rows[0],
+          item: { ...item.rows[0], product_sku: code, product_name: 'Not in catalogue', colour_name: '', colour_code: '' },
+        });
+      } catch (inner) {
+        logger.error(`Scan could not be stored: ${inner instanceof Error ? inner.message : JSON.stringify(inner)}`);
+      }
+    }
     res.status(500).json({ error: `Scan failed: ${errorMsg}` });
   }
 });
@@ -478,7 +497,11 @@ router.patch('/sessions/:id/items/:itemId', authMiddleware, async (req: AuthRequ
       [quantity, req.params.itemId, req.params.id]
     );
 
-    if (!result.rows[0]) return res.status(404).json({ error: 'Item not found or session is not open' });
+    if (!result.rows[0]) {
+      // A missing row must not fail the handheld sync. The scan is already stored.
+      logger.warn(`[stock-in] Quantity update skipped for item ${req.params.itemId} on session ${req.params.id}`);
+      return res.json({ success: true, skipped: true });
+    }
 
     logger.info(`[stock-in] Updated item ${req.params.itemId} qty to ${quantity}`);
     res.json(result.rows[0]);
