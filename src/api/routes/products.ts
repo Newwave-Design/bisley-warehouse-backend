@@ -598,10 +598,15 @@ async function runSyncJob() {
     // parameter against a `timestamp without time zone` column silently shifts by the caller's
     // local UTC offset (bit us once: archived almost the whole table when run from a non-UTC
     // machine). A run-id string has no such failure mode.
+    // keep_for_receiving marks a row the warehouse added or restored for a delivery
+    // note. The catalogue sync must not hide it again just because Medusa did not
+    // send that SKU on this run.
     const archiveResult = await query(
       `UPDATE wms_products
        SET is_archived = true, archived_at = NOW()
-       WHERE (last_sync_run_id IS DISTINCT FROM $1) AND is_archived = false
+       WHERE (last_sync_run_id IS DISTINCT FROM $1)
+         AND is_archived = false
+         AND COALESCE(metadata->>'keep_for_receiving', '') <> 'true'
        RETURNING variant_sku`,
       [runId]
     );
