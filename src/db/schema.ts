@@ -1750,4 +1750,26 @@ FROM generate_series(1, 9) AS r(n)
 CROSS JOIN generate_series(1, 25) AS p(n)
 ON CONFLICT (location_code) DO NOTHING;
 
+CREATE TABLE IF NOT EXISTS delivery_notes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  arrives_on DATE NOT NULL,
+  title TEXT NOT NULL,
+  reference TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS delivery_notes_day_title ON delivery_notes (arrives_on, title);
+
+CREATE TABLE IF NOT EXISTS delivery_note_lines (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  delivery_note_id UUID NOT NULL REFERENCES delivery_notes(id) ON DELETE CASCADE,
+  sku TEXT NOT NULL,
+  quantity INT NOT NULL,
+  UNIQUE (delivery_note_id, sku)
+);
+
+ALTER TABLE checkin_sessions ADD COLUMN IF NOT EXISTS delivery_note_id UUID REFERENCES delivery_notes(id);
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_delivery_checkin
+  ON checkin_sessions (delivery_note_id)
+  WHERE status = 'OPEN' AND delivery_note_id IS NOT NULL;
+
 `;

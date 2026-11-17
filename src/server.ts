@@ -16,6 +16,7 @@ import { ensureFulfillmentSchema } from './db/ensure-fulfillment-schema.js';
 import { ensurePickListEvents } from './db/ensure-pick-list-events.js';
 import { ensureStockSoldAudit } from './db/ensure-stock-sold-audit.js';
 import { ensurePackagingSchema } from './db/ensure-packaging-schema.js';
+import { ensureDeliveryNotes } from './lib/delivery-notes.js';
 import { shipCollectionsDueToday } from './lib/ship-todays-collections.js';
 import packagingRoutes from './api/routes/packaging.js';
 import productMarginRoutes from './api/routes/product-margins.js';
@@ -205,6 +206,12 @@ async function start() {
       await ensurePackagingSchema();
     } catch (packagingError) {
       console.warn('⚠️  Packaging schema bootstrap warning:', (packagingError as Error).message);
+    }
+
+    try {
+      await ensureDeliveryNotes();
+    } catch (noteError) {
+      console.warn('⚠️  Delivery note bootstrap warning:', (noteError as Error).message);
     }
 
     try {

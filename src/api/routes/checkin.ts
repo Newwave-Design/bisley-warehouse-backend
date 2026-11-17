@@ -22,6 +22,7 @@ import { scheduleStockHolds } from '../../lib/stock-holds.js';
 import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
+import { deliveryNoteForSession, openDeliveryNote } from '../../lib/delivery-notes.js';
 
 async function enrichCheckinItems(items: any[]) {
   const keys = [...new Set(items.flatMap((i) => [i.medusa_sku, i.nw_code].filter(Boolean)))]
@@ -146,7 +147,12 @@ router.get('/sessions', authMiddleware, async (req: AuthRequest, res: Response) 
 // Start new session
 router.post('/sessions', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { order_id, delivery_id, notes } = req.body;
+    const { order_id, delivery_id, delivery_note_id, notes } = req.body;
+    if (delivery_note_id) {
+      const opened = await openDeliveryNote(delivery_note_id, (req as any).user?.email || 'warehouse');
+      if (!opened) return res.status(404).json({ error: 'Delivery note not found' });
+      return res.status(201).json(opened);
+    }
     const result = await query(
       `INSERT INTO checkin_sessions (order_id, notes, started_by, created_at, updated_at)
        VALUES ($1, $2, $3, NOW(), NOW()) RETURNING *`,
@@ -200,8 +206,13 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
 
     // Expected quantities from the linked order, if any — lets the UI show a live
     // "scanned / expected" count per code as the user scans, without running Compare.
+    const delivery_note = await deliveryNoteForSession(session.rows[0].delivery_note_id);
     let order_line_items: any[] = [];
-    if (session.rows[0].order_id) {
+    if (delivery_note) {
+      order_line_items = delivery_note.lines.map((line) => ({
+        nw_code: line.sku, colour: null, quantity_ordered: line.quantity, medusa_sku: line.sku, quantity_received: line.received,
+      }));
+    } else if (session.rows[0].order_id) {
       const lines = await query(
         `SELECT nw_code, colour, quantity_ordered, medusa_sku FROM order_line_items WHERE order_id = $1`,
         [session.rows[0].order_id]
@@ -209,7 +220,7 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
       order_line_items = lines.rows;
     }
 
-    res.json({ ...session.rows[0], items: enrichedItems, discrepancies: discrepancies.rows, order_line_items, failed_scans: await failedScansFor('STOCK_IN', req.params.id) });
+    res.json({ ...session.rows[0], items: enrichedItems, discrepancies: discrepancies.rows, order_line_items, delivery_note, failed_scans: await failedScansFor('STOCK_IN', req.params.id) });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch session' });
   }

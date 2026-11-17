@@ -11,8 +11,18 @@
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { listDeliveryNotes } from '../../lib/delivery-notes.js';
 
 const router = express.Router();
+
+router.get('/notes', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    res.json({ notes: await listDeliveryNotes() });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to load delivery notes' });
+  }
+});
 
 router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {

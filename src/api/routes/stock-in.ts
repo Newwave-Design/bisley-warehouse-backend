@@ -22,6 +22,7 @@ import express, { Response } from 'express';
 import { query, getPool } from '../../db/index.js';
 import { toUuidOrNull } from './mobile.js';
 import { failedScansFor } from '../../lib/failed-scans.js';
+import { openDeliveryNote } from '../../lib/delivery-notes.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
@@ -124,7 +125,13 @@ router.get('/sessions', authMiddleware, async (req: AuthRequest, res: Response) 
 /** POST /api/stock-in/start-session — Create new stock-in session */
 router.post('/start-session', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    const { order_id, notes } = req.body;
+    const { order_id, notes, delivery_note_id } = req.body;
+    if (delivery_note_id) {
+      const opened = await openDeliveryNote(delivery_note_id, (req as any).user?.email || 'warehouse');
+      if (!opened) return res.status(404).json({ error: 'Delivery note not found' });
+      logger.info(`[stock-in] Opened delivery note session: ${opened.id}`);
+      return res.status(201).json(opened);
+    }
 
     const result = await query(
       `INSERT INTO checkin_sessions (order_id, status, started_by, notes, created_at, updated_at)
