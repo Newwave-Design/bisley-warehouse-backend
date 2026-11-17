@@ -90,15 +90,13 @@ export async function listDeliveryNotes() {
   return out;
 }
 
-/** The open check-in for this note, creating one when scanning has not started. */
+/** A new check-in against this note. Several can be open at once; abandoning one leaves the others. */
 export async function openDeliveryNote(noteId: string, startedBy: string) {
   const note = await query(`SELECT id, title FROM delivery_notes WHERE id = $1`, [noteId]);
   if (!note.rows[0]) return null;
   const saved = await query(
     `INSERT INTO checkin_sessions (delivery_note_id, notes, started_by, status, created_at, updated_at)
      VALUES ($1, $2, $3, 'OPEN', NOW(), NOW())
-     ON CONFLICT (delivery_note_id) WHERE status = 'OPEN' AND delivery_note_id IS NOT NULL
-     DO UPDATE SET updated_at = NOW()
      RETURNING *`,
     [noteId, note.rows[0].title, startedBy],
   );

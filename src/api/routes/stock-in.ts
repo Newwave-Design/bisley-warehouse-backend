@@ -227,10 +227,8 @@ router.post('/sessions/:id/abandon', authMiddleware, async (req: AuthRequest, re
 
 /**
  * The session a scan should be written to.
- * A delivery may have only one open check-in. The phone keeps calling reopen on the
- * abandoned one and then posts scans to that id; those scans belong on the open check-in.
- * `missing` is set when the session does not exist. A closed session with no open check-in
- * for the same delivery comes back unchanged, and the caller refuses the scan.
+ * Scans stay on the session the scanner named. Another open session for the same delivery is a
+ * different check-in. `missing` is set when the session does not exist and could not be recovered.
  */
 async function sessionForScan(requestedId: string): Promise<{ id: string; missing: boolean }> {
   const session = await query(
@@ -253,18 +251,7 @@ async function sessionForScan(requestedId: string): Promise<{ id: string; missin
       return { id: requestedId, missing: true };
     }
   }
-  if (row.status === 'OPEN') return { id: row.id, missing: false };
-  if (row.delivery_note_id) {
-    const open = await query(
-      `SELECT id FROM checkin_sessions
-        WHERE delivery_note_id = $1 AND status = 'OPEN'
-        ORDER BY updated_at DESC
-        LIMIT 1`,
-      [row.delivery_note_id]
-    );
-    if (open.rows[0]) return { id: open.rows[0].id, missing: false };
-  }
-  return { id: requestedId, missing: false };
+  return { id: row.id, missing: false };
 }
 
 /** POST /api/stock-in/sessions/:id/reopen — put an abandoned session back to OPEN so scanning can carry on */

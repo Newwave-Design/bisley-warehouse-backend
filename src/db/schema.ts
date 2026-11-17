@@ -1768,8 +1768,6 @@ CREATE TABLE IF NOT EXISTS delivery_note_lines (
 );
 
 ALTER TABLE checkin_sessions ADD COLUMN IF NOT EXISTS delivery_note_id UUID REFERENCES delivery_notes(id);
-CREATE UNIQUE INDEX IF NOT EXISTS one_open_delivery_checkin
-  ON checkin_sessions (delivery_note_id)
-  WHERE status = 'OPEN' AND delivery_note_id IS NOT NULL;
+DROP INDEX IF EXISTS one_open_delivery_checkin;
 
 `;
