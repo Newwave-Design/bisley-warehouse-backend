@@ -570,7 +570,8 @@ async function runSyncJob() {
             medusa_product_id = EXCLUDED.medusa_product_id,
             medusa_variant_id = EXCLUDED.medusa_variant_id,
             updated_at        = NOW()
-          WHERE barcode_mappings.product_sku = EXCLUDED.product_sku
+          WHERE barcode_mappings.assigned_by IS NULL
+            AND barcode_mappings.product_sku = EXCLUDED.product_sku
         `, params);
         barcodesSynced += batch.length;
       } catch (err: any) {

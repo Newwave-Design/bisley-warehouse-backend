@@ -8,6 +8,7 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
+import { assignBarcode } from '../../lib/assign-barcode.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 
 /** Newest change across barcodes, products, bays and stock. The scanner skips the catalogue download when this matches. */
@@ -76,38 +77,22 @@ router.post('/barcodes', authMiddleware, async (req: AuthRequest, res: Response)
     if (!barcode || !sku) return res.status(400).json({ error: 'barcode and sku required' });
     if (barcode.length > 100) return res.status(400).json({ error: 'Barcode is too long' });
 
-    const product = await query(
-      `SELECT variant_sku, product_title, colour_code, colour_name, variant_thumbnail, medusa_product_id, medusa_variant_id
-         FROM wms_products WHERE variant_sku = $1 AND is_archived = false LIMIT 1`,
-      [sku]
-    );
-    const p = product.rows[0];
-    if (!p) return res.status(404).json({ error: `Product not found: ${sku}` });
-
-    const existing = await query(`SELECT product_sku, is_active FROM barcode_mappings WHERE barcode = $1`, [barcode]);
-    const ex = existing.rows[0];
-    if (ex?.is_active && ex.product_sku !== p.variant_sku) {
-      return res.status(409).json({ error: `Barcode ${barcode} is already assigned to ${ex.product_sku}` });
+    const saved = await assignBarcode(barcode, sku, req.user?.email ?? null);
+    if (!saved) {
+      const taken = await query(
+        `SELECT product_sku FROM barcode_mappings WHERE upper(barcode) = upper($1) AND is_active = true`,
+        [barcode],
+      );
+      if (taken.rows[0]) return res.status(409).json({ error: `Barcode ${barcode} is already assigned to ${taken.rows[0].product_sku}` });
+      return res.status(404).json({ error: `Product not found: ${sku}` });
     }
-
-    await query(
-      `INSERT INTO barcode_mappings
-         (barcode, product_sku, colour_code, colour_name, product_name, thumbnail_url, medusa_product_id, medusa_variant_id, assigned_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       ON CONFLICT (barcode) DO UPDATE SET
-         product_sku = EXCLUDED.product_sku, colour_code = EXCLUDED.colour_code, colour_name = EXCLUDED.colour_name,
-         product_name = EXCLUDED.product_name, thumbnail_url = EXCLUDED.thumbnail_url,
-         medusa_product_id = EXCLUDED.medusa_product_id, medusa_variant_id = EXCLUDED.medusa_variant_id,
-         is_active = true, assigned_by = EXCLUDED.assigned_by, updated_at = NOW()`,
-      [barcode, p.variant_sku, p.colour_code, p.colour_name, p.product_title, p.variant_thumbnail, p.medusa_product_id, p.medusa_variant_id, req.user?.email ?? null]
-    );
-    console.log(`[mobile-sync] Barcode ${barcode} assigned to ${p.variant_sku} by ${req.user?.email}`);
+    console.log(`[mobile-sync] Barcode ${barcode} assigned to ${saved.sku} by ${req.user?.email}`);
     // every scan of this code that failed earlier is now explained
     await query(
       `UPDATE failed_scans SET resolved_at = NOW(), resolution = 'ASSIGNED', resolved_sku = $2 WHERE code = $1 AND resolved_at IS NULL`,
-      [barcode, p.variant_sku]
+      [barcode, saved.sku]
     );
-    res.json({ success: true, barcode, sku: p.variant_sku });
+    res.json({ success: true, barcode, sku: saved.sku });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to assign barcode';
     console.error('Barcode assignment error:', message);

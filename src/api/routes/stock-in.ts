@@ -29,6 +29,7 @@ import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { getLogger } from '../../lib/logger.js';
 import { singleTrayFromFivePack } from '../../lib/insert-trays.js';
+import { assignBarcode } from '../../lib/assign-barcode.js';
 import { resolveScan } from '../../lib/resolve-scan.js';
 
 /**
@@ -292,8 +293,16 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
     const writeSessionId = target.id;
 
     const q = (scan_input as string).trim().toUpperCase();
-    const resolved = await resolveScan(q);
+    let resolved = await resolveScan(q);
     if (!resolved) return res.status(400).json({ error: 'scan_input required' });
+    const chosenSku = String(req.body?.product_sku || '').trim();
+    if (!resolved.matched && chosenSku) {
+      const saved = await assignBarcode(q, chosenSku, (req as AuthRequest).user?.email ?? null);
+      if (saved) {
+        resolved = saved;
+        logger.info(`[stock-in] Saved ${q} as ${saved.sku} for the scans after this one`);
+      }
+    }
     if (!resolved.matched) {
       logger.info(`[stock-in] Accepted unmatched code ${q} into session ${writeSessionId}`);
     }
