@@ -6,6 +6,7 @@ import { getPool, query } from '../db/index.js';
 import { scheduleAllocationRun } from './allocation.js';
 import { applyDispatchStock } from './dispatch-stock.js';
 import { syncSkuToMedusa } from './medusa-inventory.js';
+import { consumeBoxesForShipments } from './packaging-usage.js';
 import { isPaid } from './payment-status.js';
 
 async function actorId(preferred?: string | null): Promise<string | null> {
@@ -27,6 +28,42 @@ async function pushStock(skus: string[]): Promise<void> {
     const result = await syncSkuToMedusa(sku, available);
     if (!result.ok) console.warn(`Booked collection stock sync failed for ${sku}: ${result.error}`);
   }
+}
+
+/** Removes the picked stock when an order is marked shipped. Lines already taken are left alone. */
+export async function takeStockForShippedLists(pickListIds: string[], preferredActor?: string | null): Promise<void> {
+  const userId = await actorId(preferredActor);
+  if (!userId) return;
+  const changed = new Set<string>();
+  let took = false;
+  for (const pickListId of [...new Set(pickListIds.filter(Boolean))]) {
+    const found = await query(
+      `SELECT id, medusa_order_id, is_sandbox, is_return, payment_status, purchase_order_number
+       FROM pick_lists WHERE id = $1 AND NOT is_archived`,
+      [pickListId],
+    );
+    const list = found.rows[0];
+    if (!list || list.is_sandbox || !isPaid(list)) continue;
+    const client = await getPool().connect();
+    let skus: string[] = [];
+    try {
+      await client.query('BEGIN');
+      const result = await applyDispatchStock(client, list, userId);
+      await consumeBoxesForShipments(client, [pickListId], userId);
+      await client.query('COMMIT');
+      skus = result.syncSkus;
+      took = true;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    if (skus.length && !list.is_return) for (const sku of skus) changed.add(sku);
+  }
+  if (!took) return;
+  if (changed.size) await pushStock([...changed]);
+  scheduleAllocationRun(`pick lists marked shipped`);
 }
 
 /** Removes the picked stock for one booked order. Safe to call again. */

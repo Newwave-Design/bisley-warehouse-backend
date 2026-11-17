@@ -7,6 +7,7 @@ import express, { Request, Response } from 'express';
 import { query, getPool } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { applyDispatchStock } from '../../lib/dispatch-stock.js';
+import { takeStockForShippedLists } from '../../lib/collection-stock.js';
 import { consumeBoxesForShipments } from '../../lib/packaging-usage.js';
 import { paidSql, isPaid } from '../../lib/payment-status.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
@@ -556,6 +557,7 @@ router.post('/bulk-status', authMiddleware, async (req: AuthRequest, res: Respon
       ? [...new Set((req.body.pickListIds as unknown[]).map((id) => String(id || '').trim()).filter(Boolean))]
       : [];
     if (!ids.length) return res.status(400).json({ error: 'Select at least one pick list' });
+    if (status === 'DISPATCHED') await takeStockForShippedLists(ids, req.user?.id);
     await recordPickListEvents({
       ids,
       actor: actorName(req.user),
@@ -633,6 +635,7 @@ router.patch('/:pickListId/status', authMiddleware, async (req: AuthRequest, res
     if (!status) return res.status(400).json({ error: 'Unknown status' });
     const found = await query(`SELECT id FROM pick_lists WHERE id = $1`, [req.params.pickListId]);
     if (!found.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+    if (status === 'DISPATCHED') await takeStockForShippedLists([req.params.pickListId], req.user?.id);
     await recordPickListEvents({
       ids: [req.params.pickListId],
       actor: actorName(req.user),
