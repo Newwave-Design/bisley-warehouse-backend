@@ -238,7 +238,21 @@ async function sessionForScan(requestedId: string): Promise<{ id: string; missin
     [requestedId]
   );
   const row = session.rows[0];
-  if (!row) return { id: requestedId, missing: true };
+  if (!row) {
+    // A 404 makes the phone mark the scan uploaded and drop it. Recreate the session so the scan is stored.
+    try {
+      await query(
+        `INSERT INTO checkin_sessions (id, status, started_by, notes, created_at, updated_at)
+         VALUES ($1::uuid, 'OPEN', 'scanner', 'Recovered from the handheld', NOW(), NOW())
+         ON CONFLICT (id) DO NOTHING`,
+        [requestedId],
+      );
+      return { id: requestedId, missing: false };
+    } catch (err) {
+      logger.warn(`[stock-in] Could not recover session ${requestedId}: ${err instanceof Error ? err.message : err}`);
+      return { id: requestedId, missing: true };
+    }
+  }
   if (row.status === 'OPEN') return { id: row.id, missing: false };
   if (row.delivery_note_id) {
     const open = await query(
@@ -286,7 +300,11 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
     }
 
     const target = await sessionForScan(session_id);
-    if (target.missing) return res.status(404).json({ error: 'Session not found' });
+    if (target.missing) {
+      // Keep the scan on the phone to retry. A 404 would make the handheld drop it.
+      logger.error(`[stock-in] Session ${session_id} is missing and could not be recovered`);
+      return res.status(500).json({ error: 'Session not ready, scan kept for retry' });
+    }
     if (target.id !== session_id) {
       logger.info(`[stock-in] Filing scan for abandoned session ${session_id} onto open session ${target.id}`);
     }
