@@ -23,6 +23,7 @@ import { takeStockForBookedCollection } from '../../lib/collection-stock.js';
 import { attachPackaging, shippingTypeForLines } from '../../lib/pick-list-packaging.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { catalogueRevisedAt } from './mobile-sync.js';
+import { resolveScan } from '../../lib/resolve-scan.js';
 
 const router = express.Router();
 
@@ -62,58 +63,41 @@ function rejectPickFault(res: Response, where: string, err: unknown) {
 
 /** Resolve any scan (EAN/supercode, NW code, SKU) to product info + stock; shared with move sessions */
 export async function lookupProduct(q: string): Promise<any> {
-    // 1. Exact barcode match (EAN, supercode like H2910NL-av1)
-    const bm = await query(
-      `SELECT bm.product_sku AS sku, bm.colour_code, bm.colour_name, bm.product_name,
-              bm.thumbnail_url AS thumbnail, bm.medusa_variant_id
-       FROM barcode_mappings bm WHERE bm.barcode = $1 AND is_active = true LIMIT 1`,
-      [q]
-    );
-    if (bm.rows[0]) {
-      const stock = await getStock(bm.rows[0].sku, bm.rows[0].colour_code);
-      return { found: true, source: 'barcode', ...bm.rows[0], stock };
+    const resolved = await resolveScan(q);
+    if (resolved?.matched) {
+      const stock = await getStock(resolved.sku, resolved.colour_code);
+      return {
+        found: true,
+        source: resolved.source === 'barcode' ? 'barcode' : 'nw_code',
+        sku: resolved.sku,
+        colour_code: resolved.colour_code,
+        colour_name: resolved.colour_name,
+        product_name: resolved.product_name,
+        thumbnail: resolved.thumbnail,
+        stock,
+      };
     }
 
-    // 2. NW code — checked directly against wms_products.nw_code first (the canonical mapping
-    // key populated per-product from sku_mappings whenever a New Wave order PDF is parsed),
-    // falling back to the sku_mappings join for any code not yet copied onto a product row.
-    const wpNw = await query(
-      `SELECT variant_sku AS sku, colour_code, colour_name, product_title AS product_name,
-              variant_thumbnail AS thumbnail
-       FROM wms_products WHERE UPPER(nw_code) = $1 AND is_archived = false LIMIT 1`,
-      [q]
-    );
-    if (wpNw.rows[0]) {
-      const stock = await getStock(wpNw.rows[0].sku, wpNw.rows[0].colour_code);
-      return { found: true, source: 'nw_code', ...wpNw.rows[0], stock };
-    }
-
-    const sm = await query(
-      `SELECT s.nw_code AS sku, s.colour AS colour_name, s.product_name,
-              w.variant_thumbnail AS thumbnail, w.colour_code
-       FROM sku_mappings s
-       LEFT JOIN wms_products w ON w.variant_sku = s.medusa_sku
-       WHERE UPPER(s.nw_code) = $1 LIMIT 1`,
-      [q]
-    );
-    if (sm.rows[0]) {
-      const stock = await getStock(sm.rows[0].sku, sm.rows[0].colour_code);
-      return { found: true, source: 'nw_code', ...sm.rows[0], stock };
-    }
-
-    // 3. Partial SKU search in wms_products
+    // No exact product. A stock-in scan still has to be kept, so the code itself is a result.
+    // Partial names stay in alternatives for the check-item screen.
     const wp = await query(
       `SELECT DISTINCT ON (product_title) variant_sku AS sku, colour_code, colour_name,
               product_title AS product_name, variant_thumbnail AS thumbnail
        FROM wms_products WHERE variant_sku ILIKE $1 AND is_archived = false LIMIT 5`,
       [`%${q}%`]
     );
-    if (wp.rows.length > 0) {
-      const stock = await getStock(wp.rows[0].sku, wp.rows[0].colour_code);
-      return { found: true, source: 'sku_search', ...wp.rows[0], stock, alternatives: wp.rows };
-    }
-
-    return { found: false, query: q };
+    return {
+      found: true,
+      source: 'unmatched',
+      sku: resolved?.sku || q,
+      product_name: 'Not in catalogue',
+      colour_code: null,
+      colour_name: null,
+      thumbnail: null,
+      query: q,
+      stock: { locations: [] },
+      alternatives: wp.rows,
+    };
 }
 
 /** GET /api/mobile/lookup?q=BARCODE — resolve any scan to product info + stock */

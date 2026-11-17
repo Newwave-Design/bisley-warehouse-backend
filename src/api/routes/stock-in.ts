@@ -29,6 +29,7 @@ import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { getLogger } from '../../lib/logger.js';
 import { singleTrayFromFivePack } from '../../lib/insert-trays.js';
+import { resolveScan } from '../../lib/resolve-scan.js';
 
 /**
  * Hairpin legs are sold as one pack, and each pack is two legs.
@@ -171,7 +172,7 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
         ci.scanned_at,
         ci.removed_at,
         ci.created_at,
-        COALESCE(bm.product_name, wp.product_title, 'Unknown') as product_name,
+        COALESCE(bm.product_name, wp.product_title, 'Not in catalogue') as product_name,
         COALESCE(bm.colour_code, wp.colour_code, '') as colour_code,
         COALESCE(bm.colour_name, wp.colour_name, ci.colour) as colour_name
        FROM checkin_items ci
@@ -295,46 +296,19 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
     }
     const writeSessionId = target.id;
 
-    // Lookup: try barcode first, then NW code
     const q = (scan_input as string).trim().toUpperCase();
-    
-    let productInfo: any = null;
-    
-    // Try barcode_mappings (EAN / Supercode)
-    const barcode = await query(
-      `SELECT bm.product_sku as nw_code, bm.colour_name as colour_name, bm.colour_code,
-              bm.product_name, wp.variant_sku AS medusa_sku
-       FROM barcode_mappings bm
-       LEFT JOIN wms_products wp ON wp.variant_sku = bm.product_sku
-       WHERE bm.barcode = $1 AND bm.is_active = true
-       LIMIT 1`,
-      [q]
-    );
-    
-    if (barcode.rows[0]) {
-      productInfo = barcode.rows[0];
-    } else {
-      // Try sku_mappings or wms_products by NW code / SKU
-      const sku = await query(
-        `SELECT DISTINCT variant_sku as medusa_sku, colour_code, product_title, nw_code
-         FROM wms_products
-         WHERE UPPER(COALESCE(nw_code, variant_sku)) = $1
-         LIMIT 1`,
-        [q]
-      );
-      if (sku.rows[0]) {
-        productInfo = {
-          nw_code: sku.rows[0].nw_code || q,
-          medusa_sku: sku.rows[0].medusa_sku,
-          product_name: sku.rows[0].product_title,
-          colour_code: colour || sku.rows[0].colour_code || null,
-        };
-      }
+    const resolved = await resolveScan(q);
+    if (!resolved) return res.status(400).json({ error: 'scan_input required' });
+    if (!resolved.matched) {
+      logger.info(`[stock-in] Accepted unmatched code ${q} into session ${writeSessionId}`);
     }
-
-    if (!productInfo) {
-      return res.status(404).json({ error: 'Product not found', query: q });
-    }
+    let productInfo: any = {
+      nw_code: resolved.nw_code,
+      medusa_sku: resolved.medusa_sku,
+      product_name: resolved.product_name,
+      colour_code: colour || resolved.colour_code || null,
+      colour_name: resolved.colour_name,
+    };
 
     const tray = await asSingleInsertTray(String(productInfo.medusa_sku || productInfo.nw_code || ''));
     if (tray) {
