@@ -1,7 +1,7 @@
 /**
  * Assigns stock on hand to open orders, oldest first. A purchase order counts as paid.
  * A scan may take one unit of a SKU only while this order still has some of its count left.
- * Samples are ignored. A kit is assigned its parts, and only in complete kits, so one part is not trapped.
+ * Samples are ignored. Each part of a kit is reserved to that order, even when another part is not in stock.
  * Units already picked or scanned stay with that order.
  * This does not change quantity_reserved or the pay-when-sold ledger.
  */
@@ -96,13 +96,13 @@ export function planHolds(lines: HoldDemand[], onHand: Map<string, number>, clai
   const holds: PlannedHold[] = [];
   for (const line of ordered) {
     if (line.parts.length) {
-      let extra = Math.max(0, line.required - line.picked);
-      for (const part of line.parts) extra = Math.min(extra, Math.floor((free.get(part.sku) ?? 0) / part.per));
       for (const part of line.parts) {
+        const have = taken(line, part.sku, part.per);
         const granted = grant.get(claimKey(line.itemId, part.sku)) ?? 0;
-        const qty = Math.min(line.required * part.per, taken(line, part.sku, part.per) + extra * part.per + granted);
+        const extra = Math.min(Math.max(0, line.required * part.per - have - granted), free.get(part.sku) ?? 0);
+        const qty = have + extra + granted;
         if (qty > 0) holds.push({ itemId: line.itemId, sku: part.sku, qty });
-        free.set(part.sku, (free.get(part.sku) ?? 0) - extra * part.per);
+        free.set(part.sku, (free.get(part.sku) ?? 0) - extra);
       }
     } else {
       const have = taken(line, line.sku, 1);

@@ -1544,7 +1544,7 @@ CREATE INDEX IF NOT EXISTS idx_sale_alloc_line ON sale_allocations (pick_list_it
 CREATE INDEX IF NOT EXISTS idx_sale_alloc_sku ON sale_allocations (sku, status);
 
 -- How many units of a SKU an open order may pick. Rebuilt from stock on hand, oldest paid order first.
--- Samples are not held. A kit is held as its parts, and only as complete kits.
+-- Samples are not held. Each part of a kit is held for that order, even when another part is missing.
 CREATE TABLE IF NOT EXISTS order_stock_holds (
   pick_list_item_id UUID NOT NULL REFERENCES pick_list_items(id) ON DELETE CASCADE,
   sku VARCHAR(100) NOT NULL,
