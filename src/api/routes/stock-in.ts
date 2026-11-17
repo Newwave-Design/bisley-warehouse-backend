@@ -223,6 +223,34 @@ router.post('/sessions/:id/abandon', authMiddleware, async (req: AuthRequest, re
   }
 });
 
+/**
+ * The session a scan should be written to.
+ * A delivery may have only one open check-in. The phone keeps calling reopen on the
+ * abandoned one and then posts scans to that id; those scans belong on the open check-in.
+ * `missing` is set when the session does not exist. A closed session with no open check-in
+ * for the same delivery comes back unchanged, and the caller refuses the scan.
+ */
+async function sessionForScan(requestedId: string): Promise<{ id: string; missing: boolean }> {
+  const session = await query(
+    `SELECT id, status, delivery_note_id FROM checkin_sessions WHERE id = $1`,
+    [requestedId]
+  );
+  const row = session.rows[0];
+  if (!row) return { id: requestedId, missing: true };
+  if (row.status === 'OPEN') return { id: row.id, missing: false };
+  if (row.delivery_note_id) {
+    const open = await query(
+      `SELECT id FROM checkin_sessions
+        WHERE delivery_note_id = $1 AND status = 'OPEN'
+        ORDER BY updated_at DESC
+        LIMIT 1`,
+      [row.delivery_note_id]
+    );
+    if (open.rows[0]) return { id: open.rows[0].id, missing: false };
+  }
+  return { id: requestedId, missing: false };
+}
+
 /** POST /api/stock-in/sessions/:id/reopen — put an abandoned session back to OPEN so scanning can carry on */
 router.post('/sessions/:id/reopen', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
@@ -235,6 +263,12 @@ router.post('/sessions/:id/reopen', authMiddleware, async (req: AuthRequest, res
     logger.info(`[stock-in] Reopened session ${req.params.id}`);
     res.json({ success: true });
   } catch (err) {
+    // One open check-in per delivery. The phone retries a 500 forever and never uploads the scans behind it.
+    const code = (err as { code?: string } | null)?.code;
+    if (code === '23505') {
+      logger.warn(`[stock-in] Delivery already has an open check-in; leaving ${req.params.id} abandoned`);
+      return res.json({ success: true, already_open: true });
+    }
     logger.error(`Failed to reopen session: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
     res.status(500).json({ error: 'Failed to reopen session' });
   }
@@ -249,15 +283,17 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
       return res.status(400).json({ error: 'session_id and scan_input required' });
     }
 
-    // Check session is open
-    const session = await query(
-      `SELECT status FROM checkin_sessions WHERE id = $1`,
-      [session_id]
-    );
-    if (!session.rows[0]) return res.status(404).json({ error: 'Session not found' });
-    if (session.rows[0].status !== 'OPEN') {
-      return res.status(400).json({ error: 'Session is not open' });
+    const target = await sessionForScan(session_id);
+    if (target.missing) return res.status(404).json({ error: 'Session not found' });
+    if (target.id !== session_id) {
+      logger.info(`[stock-in] Filing scan for abandoned session ${session_id} onto open session ${target.id}`);
+    } else {
+      const session = await query(`SELECT status FROM checkin_sessions WHERE id = $1`, [session_id]);
+      if (session.rows[0]?.status !== 'OPEN') {
+        return res.status(400).json({ error: 'Session is not open' });
+      }
     }
+    const writeSessionId = target.id;
 
     // Lookup: try barcode first, then NW code
     const q = (scan_input as string).trim().toUpperCase();
@@ -321,7 +357,7 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
     const existing = await query(
       `SELECT id, quantity_scanned FROM checkin_items
        WHERE session_id = $1 AND nw_code = $2 AND LOWER(COALESCE(colour, '')) = LOWER($3) AND removed_at IS NULL`,
-      [session_id, nw_code, colour_used]
+      [writeSessionId, nw_code, colour_used]
     );
 
     let item;
@@ -335,22 +371,22 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
         [units, existing.rows[0].id]
       );
       item = result.rows[0];
-      logger.info(`[stock-in] Incremented ${nw_code} (${colour_used}) to ${item.quantity_scanned}x in session ${session_id}`);
+      logger.info(`[stock-in] Incremented ${nw_code} (${colour_used}) to ${item.quantity_scanned}x in session ${writeSessionId}`);
     } else {
       // Create new row
       const result = await query(
         `INSERT INTO checkin_items (session_id, nw_code, colour, medusa_sku, quantity_scanned, scanned_at, created_at)
          VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
          RETURNING *`,
-        [session_id, nw_code, colour_used || null, medusa_sku || null, units]
+        [writeSessionId, nw_code, colour_used || null, medusa_sku || null, units]
       );
       item = result.rows[0];
-      logger.info(`[stock-in] Scanned ${units}x ${nw_code} (${colour_used}) into session ${session_id}`);
+      logger.info(`[stock-in] Scanned ${units}x ${nw_code} (${colour_used}) into session ${writeSessionId}`);
     }
 
     const scanLog = await query(
       `INSERT INTO checkin_scans (session_id, item_id, quantity) VALUES ($1, $2, $3) RETURNING id, item_id, quantity, scanned_at`,
-      [session_id, item.id, units]
+      [writeSessionId, item.id, units]
     );
 
     res.json({
