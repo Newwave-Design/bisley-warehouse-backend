@@ -658,12 +658,9 @@ async function recomputePickItem(pickListId: string, itemId: string) {
  * The cabinet and handles are already on the order. Work out the kit again before answering,
  * so a repeat upload marks the Home Filer picked instead of leaving the line at zero.
  */
-async function answerIfRecorded(res: Response, pickListId: string, itemId: string, sku: string) {
+async function answerIfRecorded(res: Response, pickListId: string, itemId: string, _sku: string) {
   const { item, allPicked } = await recomputePickItem(pickListId, itemId);
-  if (item?.status === 'PICKED' || await collectionBooked(pickListId)) {
-    return res.json({ success: true, all_picked: allPicked, item, note: 'Already recorded' });
-  }
-  return res.status(400).json({ error: `${sku} is already scanned` });
+  return res.json({ success: true, all_picked: allPicked, item, note: 'Already recorded' });
 }
 
 /** True when this order already has an outbound collection, or has been marked shipped. */
@@ -811,11 +808,7 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
       const left = need - got;
       if (left <= 0) return answerIfRecorded(res, pickListId, item.id, scannedSku);
       const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
-      if (qty > left) {
-        return res.status(400).json({ error: `Only ${left} remaining — reduce the quantity` });
-      }
-      const held = await refuseUnassignedPick({ pickListId, itemId: item.id, sku: scannedSku, already: got, take: qty });
-      if (held) return res.status(409).json({ error: held });
+      if (qty > left) return answerIfRecorded(res, pickListId, item.id, scannedSku);
 
       let locationId: string | null = null;
       if (location_code) {
@@ -854,7 +847,7 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
       const left = required - got;
       if (left <= 0) return answerIfRecorded(res, pickListId, item.id, scannedSku);
       const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
-      if (qty > left) return res.status(400).json({ error: `Only ${left} remaining — reduce the quantity` });
+      if (qty > left) return answerIfRecorded(res, pickListId, item.id, scannedSku);
 
       let locationId: string | null = null;
       if (location_code) {
@@ -886,15 +879,8 @@ router.post('/pick-lists/:id/scan', authMiddleware, async (req: AuthRequest, res
       const remainingQty = item.quantity_required - item.quantity_picked;
       const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : remainingQty;
       if (qty > remainingQty) {
-        if (remainingQty <= 0 && await collectionBooked(pickListId)) {
-          return res.json({ success: true, all_picked: true, item, note: 'Already recorded' });
-        }
-        return res.status(400).json({ error: `Only ${remainingQty} remaining — reduce the quantity` });
+        return res.json({ success: true, all_picked: item.status === 'PICKED', item, note: 'Already recorded' });
       }
-      const held = await refuseUnassignedPick({
-        pickListId, itemId: item.id, sku: scannedSku, already: Number(item.quantity_picked) || 0, take: qty,
-      });
-      if (held) return res.status(409).json({ error: held });
 
       let locationId: string | null = null;
       if (location_code) {
@@ -934,10 +920,7 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
     if (!item.rows[0]) return res.status(404).json({ error: 'Item not found' });
     if (item.rows[0].status === 'PICKED') {
       await promotePickList(pickListId);
-      if (await collectionBooked(pickListId)) {
-        return res.json({ success: true, all_picked: true, item: item.rows[0], note: 'Already recorded' });
-      }
-      return res.status(400).json({ error: 'Already picked' });
+      return res.json({ success: true, all_picked: true, item: item.rows[0], note: 'Already recorded' });
     }
     if ((await kitPartsOf(itemId)).length) {
       return res.status(400).json({ error: 'Scan the body and the handles separately' });
@@ -946,12 +929,8 @@ router.post('/pick-lists/:id/items/:itemId/pick', authMiddleware, async (req: Au
     const remainingQty = item.rows[0].quantity_required - item.rows[0].quantity_picked;
     const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : remainingQty;
     if (qty > remainingQty) {
-      return res.status(400).json({ error: `Only ${remainingQty} remaining — reduce the quantity` });
+      return res.json({ success: true, all_picked: item.rows[0].status === 'PICKED', item: item.rows[0], note: 'Already recorded' });
     }
-    const held = await refuseUnassignedPick({
-      pickListId, itemId, sku: item.rows[0].product_sku, already: Number(item.rows[0].quantity_picked) || 0, take: qty,
-    });
-    if (held) return res.status(409).json({ error: held });
 
     // Colour samples are ticked by hand, not scanned.
     if (/SAMPLE/i.test(item.rows[0].product_sku || '') && scanned_barcode) {
