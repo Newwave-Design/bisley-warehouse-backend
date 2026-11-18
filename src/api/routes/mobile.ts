@@ -288,7 +288,9 @@ router.post('/undo', authMiddleware, async (req: AuthRequest, res: Response) => 
  */
 router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
-    await shipCollectionsDueToday().catch((error) => {
+    // Shipping and the shop update run on their own. Waiting for them held the scanner on Syncing
+    // until the request timed out, so the list never arrived.
+    void shipCollectionsDueToday().catch((error) => {
       console.warn('Shipping today\'s collections failed', error instanceof Error ? error.message : 'failed');
     });
     const statusParam = ((req.query.status as string) || 'PENDING,IN_PROGRESS').toUpperCase();
