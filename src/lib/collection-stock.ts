@@ -26,7 +26,10 @@ async function pushStock(skus: string[]): Promise<void> {
     );
     const available = Math.max(0, parseInt(total.rows[0]?.qty ?? '0', 10) - parseInt(total.rows[0]?.reserved ?? '0', 10));
     const result = await syncSkuToMedusa(sku, available);
-    if (!result.ok) console.warn(`Booked collection stock sync failed for ${sku}: ${result.error}`);
+    // A kit is sold as the parent. Its body and handle pack are warehouse parts, not shop inventory.
+    if (!result.ok && !result.error?.startsWith('No Medusa inventory item')) {
+      console.warn(`Booked collection stock sync failed for ${sku}: ${result.error}`);
+    }
   }
 }
 
