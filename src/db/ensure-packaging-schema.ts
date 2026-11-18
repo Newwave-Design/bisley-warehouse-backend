@@ -87,6 +87,7 @@ export async function ensurePackagingSchema() {
     )`,
     `CREATE INDEX IF NOT EXISTS idx_packaging_specs_method ON packaging_product_specs(method, is_active)`,
     `ALTER TABLE packaging_product_specs ADD COLUMN IF NOT EXISTS preferred_courier VARCHAR(20)`,
+    `ALTER TABLE packaging_product_specs ADD COLUMN IF NOT EXISTS royal_mail_eligible BOOLEAN NOT NULL DEFAULT false`,
 
     `CREATE TABLE IF NOT EXISTS packaging_boms (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

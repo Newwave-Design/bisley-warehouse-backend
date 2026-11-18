@@ -89,7 +89,7 @@ export async function attachPackaging<T extends { sku: string; quantity_required
   if (!skus.length) return groups;
 
   const [specs, boms] = await Promise.all([
-    query(`SELECT product_code, method, preferred_courier, weight_grams,
+    query(`SELECT product_code, method, preferred_courier, royal_mail_eligible, weight_grams,
                   length_packed_mm, width_packed_mm, height_packed_mm
            FROM packaging_product_specs WHERE is_active`),
     query(
@@ -108,13 +108,14 @@ export async function attachPackaging<T extends { sku: string; quantity_required
   const specByCode = new Map<string, {
     method: string
     courier: string | null
+    royalMail: boolean
     weight: number | null
     length: number | null
     width: number | null
     height: number | null
   }>();
   const codes: string[] = [];
-  for (const row of specs.rows as { product_code: string; method: string; preferred_courier: string | null; weight_grams: number | null; length_packed_mm: number | null; width_packed_mm: number | null; height_packed_mm: number | null }[]) {
+  for (const row of specs.rows as { product_code: string; method: string; preferred_courier: string | null; royal_mail_eligible: boolean | null; weight_grams: number | null; length_packed_mm: number | null; width_packed_mm: number | null; height_packed_mm: number | null }[]) {
     const code = String(row.product_code || '').toUpperCase();
     if (!code || specByCode.has(code)) continue;
     const rawCourier = String(row.preferred_courier || '').trim();
@@ -122,6 +123,7 @@ export async function attachPackaging<T extends { sku: string; quantity_required
     specByCode.set(code, {
       method: row.method,
       courier,
+      royalMail: row.royal_mail_eligible === true,
       weight: row.weight_grams,
       length: row.length_packed_mm,
       width: row.width_packed_mm,
@@ -213,6 +215,7 @@ export async function attachPackaging<T extends { sku: string; quantity_required
         note: lines.length ? null : (PACKAGING_METHOD_NOTE[method] || null),
         items: lines,
         preferred_courier: isMultiDesk(exact) || isMultiDesk(productCode) ? 'DX' : (spec?.courier || null),
+        royal_mail: spec?.royalMail === true,
         shipping_option: option,
         weight_grams: spec?.weight ?? null,
         length_packed_mm: spec?.length ?? null,
