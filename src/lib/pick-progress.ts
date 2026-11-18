@@ -42,9 +42,9 @@ export async function promotePickList(pickListId: string): Promise<{ allPicked: 
 
   await query(
     `UPDATE pick_lists
-        SET status = $1,
-            completed_at = CASE WHEN $1 IN ('PICKED', 'LABEL_PRINTED') THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
-            label_printed_at = CASE WHEN $1 = 'LABEL_PRINTED' THEN COALESCE(label_printed_at, NOW()) ELSE label_printed_at END,
+        SET status = $1::varchar,
+            completed_at = CASE WHEN $1::varchar IN ('PICKED', 'LABEL_PRINTED') THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
+            label_printed_at = CASE WHEN $1::varchar = 'LABEL_PRINTED' THEN COALESCE(label_printed_at, NOW()) ELSE label_printed_at END,
             updated_at = NOW()
       WHERE id = $2 AND status IN ('PENDING', 'IN_PROGRESS', 'PICKED')`,
     [next, pickListId],
