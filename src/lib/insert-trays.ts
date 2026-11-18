@@ -6,16 +6,13 @@
  */
 const TRAY_BASE = '(?:22[1-7]|NCS22[2-7]|PIT45[01]|PIT522|PIT580)'
 const SINGLE_TRAY = new RegExp(`^${TRAY_BASE}P1-`)
-const FIVE_PACK_TRAY = new RegExp(`^${TRAY_BASE}P5-`, 'i')
 
 export function fivePackTraySku(sku: string): string | null {
   if (!SINGLE_TRAY.test(sku)) return null
   return sku.replace(/P1-/, 'P5-')
 }
 
-/** Receiving override. A scanned 5-pack is one single of the same tray. The catalogue barcode stays a 5-pack. */
-export function singleTrayFromFivePack(sku: string): string | null {
-  const code = sku.trim()
-  if (!FIVE_PACK_TRAY.test(code)) return null
-  return code.replace(/P5-/i, 'P1-')
+/** A scanned 5-pack stays the 5-pack. The delivery note counts packs, not singles. */
+export function singleTrayFromFivePack(_sku: string): string | null {
+  return null
 }

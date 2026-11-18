@@ -78,7 +78,7 @@ export async function resolveColourCode(sku: string, checkinColour: string | nul
   return code.slice(0, 20);
 }
 
-/** A 5-pack insert tray is received as one single of the same tray. Other scans are unchanged. */
+/** A 5-pack insert tray is received as that 5-pack. */
 export async function asSingleInsertTray(sku: string): Promise<{ sku: string; title: string | null; colour_code: string | null; colour_name: string | null } | null> {
   const single = singleTrayFromFivePack(sku);
   if (!single) return null;
