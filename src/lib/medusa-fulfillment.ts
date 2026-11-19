@@ -308,7 +308,7 @@ export async function fulfillPickListInMedusa(pickListId: string, options?: { sh
         await saveTrackingNote(fulfillmentId, pickList.carrier, pickList.tracking_number, pickList.tracking_url);
         await markShopSynced(pickListId);
       } else {
-        await saveShopTracking(orderId, fulfillmentId, pickList.carrier, pickList.tracking_number, pickList.tracking_url, false).catch((error) => {
+        await saveShopTracking(orderId, fulfillmentId, pickList.carrier, pickList.tracking_number, pickList.tracking_url, await sharesOrder(orderId, pickListId)).catch((error) => {
           console.warn('[tracking] Medusa label was not saved', error instanceof Error ? error.message : 'failed');
         });
         await markShopShipped(pickListId);
