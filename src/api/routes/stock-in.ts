@@ -24,7 +24,7 @@ import { toUuidOrNull } from './mobile.js';
 import { failedScansFor } from '../../lib/failed-scans.js';
 import { openDeliveryNote } from '../../lib/delivery-notes.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
-import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
+import { pushAvailableStock } from '../../lib/medusa-inventory.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { getLogger } from '../../lib/logger.js';
@@ -703,7 +703,9 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
       // Non-fatal - continue to mark session complete
     }
 
-    logger.info(`[stock-in] Stocked ${stocked} items to warehouse_inventory. Medusa inventory unchanged (sync disabled for now).`);
+    const syncErrors = await pushAvailableStock([...syncedSkus]);
+    if (syncErrors.length) logger.error(`[stock-in] Medusa sync failed: ${syncErrors.join('; ')}`);
+    else logger.info(`[stock-in] Sent free stock for ${syncedSkus.size} SKUs to Medusa`);
 
     res.json({
       success: true,
@@ -711,7 +713,7 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
       items_stocked: stocked,
       unique_skus: syncedSkus.size,
       unblocked_pick_lists: unblocked?.length ?? 0,
-      note: 'Medusa inventory is NOT changed by stock-in. It only changes during fulfillment/shipment.',
+      sync_errors: syncErrors.length ? syncErrors : undefined,
     });
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : JSON.stringify(err);

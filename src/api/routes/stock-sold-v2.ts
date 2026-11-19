@@ -27,6 +27,7 @@ import { toUuidOrNull } from './mobile.js';
 import { loadPools, bisleyFree, ownedFree, runAllocation, scheduleAllocationRun } from '../../lib/allocation.js';
 import { buildWeek, listWeeks, lockWeek, LockError } from '../../lib/settlement.js';
 import { withAudit, logAuditEvent, actorOf } from '../../lib/audit.js';
+import { pushAvailableStock } from '../../lib/medusa-inventory.js';
 import { isFriday } from '../../lib/weeks.js';
 
 const router = express.Router();
@@ -251,7 +252,13 @@ router.post('/returns/:id/decide', ...READ, async (req: AuthRequest, res: Respon
         [r.id, status, notes?.trim() || null, actor, movementId])).rows[0];
       return { code: 200, body: upd };
     });
-    if (out.code === 200) scheduleAllocationRun(`return ${status.toLowerCase()} ${req.params.id}`);
+    if (out.code === 200) {
+      scheduleAllocationRun(`return ${status.toLowerCase()} ${req.params.id}`);
+      if (status === 'RESELL' && out.body?.sku) {
+        const syncErrors = await pushAvailableStock([out.body.sku]);
+        if (syncErrors.length) console.error(`[stock-sold-v2] Medusa sync failed: ${syncErrors.join('; ')}`);
+      }
+    }
     res.status(out.code).json(out.body);
   } catch (err) { fail(res, err, 'save the decision'); }
 });

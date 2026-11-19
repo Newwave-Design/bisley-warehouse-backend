@@ -23,6 +23,7 @@ import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { deliveryNoteForSession, openDeliveryNote } from '../../lib/delivery-notes.js';
+import { pushAvailableStock } from '../../lib/medusa-inventory.js';
 import { resolveScan } from '../../lib/resolve-scan.js';
 
 async function enrichCheckinItems(items: any[]) {
@@ -373,6 +374,8 @@ router.post('/sessions/:id/items/:itemId/reconcile', authMiddleware, async (req:
       } finally {
         client.release();
       }
+      const syncErrors = await pushAvailableStock([oldSku, newSku]);
+      if (syncErrors.length) console.error(`[checkin] Medusa sync failed: ${syncErrors.join('; ')}`);
     }
 
     res.json({ success: true, sku: newSku, product_name: resolved.product_name });
@@ -548,6 +551,8 @@ router.post('/sessions/:id/complete', authMiddleware, async (req: AuthRequest, r
     }
 
     if (syncedSkus.size) await unblockBackorderedPickLists([...syncedSkus]);
+    const syncErrors = syncedSkus.size ? await pushAvailableStock([...syncedSkus]) : [];
+    if (syncErrors.length) console.error(`[checkin] Medusa sync failed: ${syncErrors.join('; ')}`);
     scheduleStockHolds();
 
     const summary = await query(
@@ -555,7 +560,7 @@ router.post('/sessions/:id/complete', authMiddleware, async (req: AuthRequest, r
       [req.params.id]
     );
 
-    res.json({ success: true, queued_for_location: prepared.length, ...summary.rows[0] });
+    res.json({ success: true, queued_for_location: prepared.length, ...summary.rows[0], sync_errors: syncErrors.length ? syncErrors : undefined });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to complete session' });

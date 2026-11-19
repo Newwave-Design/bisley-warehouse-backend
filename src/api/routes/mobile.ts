@@ -24,6 +24,7 @@ import { attachPackaging, shippingTypeForLines } from '../../lib/pick-list-packa
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { catalogueRevisedAt } from './mobile-sync.js';
 import { resolveScan } from '../../lib/resolve-scan.js';
+import { pushAvailableStock } from '../../lib/medusa-inventory.js';
 
 const router = express.Router();
 
@@ -164,9 +165,11 @@ router.post('/receive', authMiddleware, async (req: AuthRequest, res: Response) 
     `, [locationId, sku, colour_code ?? null, quantity, notes ?? null, (req as any).user?.id ?? '1']);
 
     scheduleStockHolds();
+    const syncErrors = await pushAvailableStock([sku]);
     res.json({
       success: true,
       movement_id: mvt.rows[0].id,
+      sync_errors: syncErrors.length ? syncErrors : undefined,
       sku, colour_code, location_code: location_code.toUpperCase(), quantity,
     });
   } catch (err: any) {

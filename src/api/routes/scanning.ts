@@ -7,6 +7,7 @@ import express, { Request, Response } from 'express';
 import { parseSupercode, validateBarcodeExists } from '../../modules/scanning/barcode.js';
 import { query } from '../../db/index.js';
 import { authMiddleware } from '../../middleware/auth.js';
+import { pushAvailableStock } from '../../lib/medusa-inventory.js';
 
 const router = express.Router();
 
@@ -100,6 +101,8 @@ router.post('/inventory/receive', authMiddleware, async (req: Request, res: Resp
       [locationId, productSku, colourCode || null, quantity]
     );
 
+    const syncErrors = await pushAvailableStock([productSku]);
+
     // Log the movement
     await query(
       `INSERT INTO warehouse_movements 
@@ -120,6 +123,7 @@ router.post('/inventory/receive', authMiddleware, async (req: Request, res: Resp
       success: true,
       inventory: inventoryResult.rows[0],
       message: `Received ${quantity} units of ${productSku} at ${locationCode}`,
+      sync_errors: syncErrors.length ? syncErrors : undefined,
     });
   } catch (error) {
     console.error('Receive error:', error);

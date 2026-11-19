@@ -17,6 +17,7 @@ import { ensurePickListEvents } from './db/ensure-pick-list-events.js';
 import { ensureStockSoldAudit } from './db/ensure-stock-sold-audit.js';
 import { ensurePackagingSchema } from './db/ensure-packaging-schema.js';
 import { ensureDeliveryNotes } from './lib/delivery-notes.js';
+import { installStagingGuard, isStaging } from './lib/staging.js';
 import { shipCollectionsDueToday } from './lib/ship-todays-collections.js';
 import packagingRoutes from './api/routes/packaging.js';
 import productMarginRoutes from './api/routes/product-margins.js';
@@ -62,6 +63,7 @@ import { createNotificationOnce } from './lib/notifications.js';
 import { reconcileOrders, syncOpenOrders } from './api/routes/webhooks.js';
 import { refreshUnpaidPickLists } from './lib/payment-status.js';
 import { scheduleAllocationRun } from './lib/allocation.js';
+import { reconcileAvailableStock } from './lib/medusa-inventory.js';
 import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
 import { query as dbQueryUtil } from './db/index.js';
 
@@ -90,6 +92,7 @@ const corsOptions = {
     'http://localhost:5176',
     'https://bisley-shop.medusajs.app',
     'https://bisley-warehouse-dashboard-production.up.railway.app',
+    ...(process.env.WAREHOUSE_ENV === 'staging' ? ['https://staging-warehouse-desk-staging.up.railway.app'] : []),
   ],
   credentials: true,
 };
@@ -176,6 +179,7 @@ async function start() {
   console.log(`🗄️ Node version: ${process.version}`);
   console.log('');
   try {
+    installStagingGuard();
     // Initialize database pool
     try {
       initializePool();
@@ -231,7 +235,8 @@ async function start() {
     });
 
     // Scheduled Genero poll — every 2 hours in production if API URL is configured
-    if (process.env.NODE_ENV === 'production' && process.env.GENERO_API_URL) {
+    const liveJobs = process.env.NODE_ENV === 'production' && !isStaging();
+    if (liveJobs && process.env.GENERO_API_URL) {
       const TWO_HOURS = 2 * 60 * 60 * 1000;
       setInterval(async () => {
         const h = new Date().getHours();
@@ -261,12 +266,14 @@ async function start() {
     }
 
     // Scheduled inventory discrepancy check — every 30 minutes in production, any time of day
-    if (process.env.NODE_ENV === 'production') {
+    if (liveJobs) {
       const THIRTY_MIN = 30 * 60 * 1000;
       setInterval(async () => {
         try {
           const result = await runDiscrepancyCheck();
           console.log(`[scheduler] Discrepancy check: ${result.checked} SKUs, ${result.mismatches} mismatches (${result.newlyLogged} newly logged, ${result.autoResolved} auto-resolved)`);
+          const synced = await reconcileAvailableStock();
+          console.log(`[scheduler] Free-stock sync: ${synced.checked} SKUs, ${synced.updated} updated, ${synced.floored} negative counts stored as 0, ${synced.missing} with no Medusa item`);
           if (result.newlyLogged > 0) {
             await createNotificationOnce('INVENTORY_DISCREPANCY',
               `${result.newlyLogged} new inventory discrepanc${result.newlyLogged === 1 ? 'y' : 'ies'} found`,
@@ -280,7 +287,7 @@ async function start() {
     }
 
     // Daily checks unconditional of Genero config: weekly report + liability review reminder
-    if (process.env.NODE_ENV === 'production') {
+    if (liveJobs) {
       const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
       setInterval(() => { void runDailyChecks(); }, TWENTY_FOUR_HOURS);
       void runDailyChecks(); // also run once on boot rather than waiting a full day
@@ -289,7 +296,7 @@ async function start() {
 
     // Order catch-up: the order.placed webhook is fire-and-forget, so every 10 minutes (and shortly after boot,
     // since redeploys are when deliveries get dropped) create pick lists for any recent Medusa order that has none.
-    if (process.env.NODE_ENV === 'production') {
+    if (liveJobs) {
       const runCatchUp = async () => {
         try {
           const r = await reconcileOrders({ days: 2, dryRun: false });
@@ -341,7 +348,7 @@ async function start() {
 
     // Scheduled catalogue sync — pulls new/changed Medusa products into the WMS automatically,
     // so nobody has to remember to click "Sync Now" when a product is added in Medusa.
-    if (process.env.NODE_ENV === 'production') {
+    if (liveJobs) {
       const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
       setInterval(() => {
         const r = triggerScheduledCatalogueSync();
