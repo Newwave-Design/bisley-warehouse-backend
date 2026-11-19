@@ -9,6 +9,7 @@
  * Used by: PATCH /api/pick-lists/:pickListId/dispatch
  */
 import type { PoolClient } from 'pg';
+import { kitParts, trayPackParts } from './stock-holds.js';
 
 interface KitComponent { sku: string; required_quantity?: number }
 
@@ -109,6 +110,114 @@ export async function applyDispatchStock(
         remaining -= take;
         syncSkus.add(sku);
         if (remaining === 0) break;
+      }
+
+      if (remaining > 0) {
+        const holders = (await client.query(
+          `SELECT variant_sku, kit_components FROM wms_products
+            WHERE NOT COALESCE(is_archived, false)
+              AND jsonb_typeof(kit_components) = 'array'
+              AND kit_components::text LIKE $1`,
+          [`%${sku}%`],
+        )).rows;
+        const single = /^(.+)P1-000$/i.exec(sku);
+        if (single) holders.push({ variant_sku: `${single[1]}P5-000`, kit_components: [{ sku, required_quantity: 5 }] });
+        const packs = holders.flatMap((holder) => {
+          const part = kitParts(holder.variant_sku, holder.kit_components).find((item) => item.sku === sku);
+          return part ? [{ packSku: holder.variant_sku as string, size: part.per }] : [];
+        });
+        for (const pack of packs) {
+          if (remaining <= 0) break;
+          const packRows = (await client.query(
+            `SELECT id, location_id, quantity FROM warehouse_inventory
+             WHERE product_sku = $1 AND quantity > 0
+             ORDER BY quantity DESC
+             FOR UPDATE`,
+            [pack.packSku],
+          )).rows;
+          for (const row of packRows) {
+            if (remaining <= 0) break;
+            const available = Math.max(0, parseInt(row.quantity, 10));
+            const open = Math.min(available, Math.ceil(remaining / pack.size));
+            if (open <= 0) continue;
+            const yielded = open * pack.size;
+            const used = Math.min(remaining, yielded);
+            await client.query(
+              `UPDATE warehouse_inventory
+               SET quantity = quantity - $1, quantity_reserved = GREATEST(quantity_reserved - $1, 0), updated_at = NOW()
+               WHERE id = $2`,
+              [open, row.id],
+            );
+            const singles = await client.query(
+              `UPDATE warehouse_inventory SET quantity = quantity + $1, updated_at = NOW()
+               WHERE id = (
+                 SELECT id FROM warehouse_inventory
+                 WHERE location_id = $2 AND product_sku = $3
+                 ORDER BY quantity DESC LIMIT 1
+               )
+               RETURNING id, location_id`,
+              [yielded, row.location_id, sku],
+            );
+            const singleRow = singles.rows[0] ?? (await client.query(
+              `INSERT INTO warehouse_inventory (location_id, product_sku, quantity)
+               VALUES ($1, $2, $3)
+               RETURNING id, location_id`,
+              [row.location_id, sku, yielded],
+            )).rows[0];
+            await client.query(
+              `UPDATE warehouse_inventory SET quantity = quantity - $1, updated_at = NOW() WHERE id = $2`,
+              [used, singleRow.id],
+            );
+            const opened = `${kitNote ? kitNote + '; ' : ''}Opened into ${sku}`;
+            await client.query(
+              `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, quantity, notes, performed_by, order_id)
+               VALUES ('ADJUST', $1, $2, $3, $4, $5, $6), ('ADJUST', $7, $8, $9, $4, $5, $6)`,
+              [row.location_id, pack.packSku, -open, opened, userId, pickList.medusa_order_id, singleRow.location_id, sku, yielded],
+            );
+            await client.query(
+              `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, quantity, notes, performed_by, order_id, pick_list_item_id)
+               VALUES ('DISPATCH', $1, $2, $3, $4, $5, $6, $7)`,
+              [singleRow.location_id, sku, -used, kitNote, userId, pickList.medusa_order_id, item.id],
+            );
+            remaining -= used;
+            syncSkus.add(pack.packSku);
+            syncSkus.add(sku);
+          }
+        }
+      }
+
+      const madeOf = trayPackParts(sku);
+      if (remaining > 0 && madeOf.length === 1) {
+        const part = madeOf[0];
+        const singleRows = (await client.query(
+          `SELECT id, location_id, quantity FROM warehouse_inventory
+           WHERE product_sku = $1 AND quantity > 0
+           ORDER BY quantity DESC
+           FOR UPDATE`,
+          [part.sku],
+        )).rows;
+        const available = singleRows.reduce((sum, row) => sum + Math.max(0, parseInt(row.quantity, 10)), 0);
+        const packsFromSingles = Math.min(remaining, Math.floor(available / part.per));
+        let take = packsFromSingles * part.per;
+        for (const row of singleRows) {
+          if (take <= 0) break;
+          const used = Math.min(take, Math.max(0, parseInt(row.quantity, 10)));
+          if (used <= 0) continue;
+          await client.query(
+            `UPDATE warehouse_inventory
+             SET quantity = quantity - $1, quantity_reserved = GREATEST(quantity_reserved - $1, 0), updated_at = NOW()
+             WHERE id = $2`,
+            [used, row.id],
+          );
+          await client.query(
+            `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, quantity, notes, performed_by, order_id, pick_list_item_id)
+             VALUES ('DISPATCH', $1, $2, $3, $4, $5, $6, $7)`,
+            [row.location_id, part.sku, -used, `${kitNote ? kitNote + '; ' : ''}Singles for ${sku}`, userId, pickList.medusa_order_id, item.id],
+          );
+          take -= used;
+          syncSkus.add(part.sku);
+        }
+        remaining -= packsFromSingles;
       }
 
       if (remaining > 0) {

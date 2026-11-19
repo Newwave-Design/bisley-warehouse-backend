@@ -598,9 +598,12 @@ async function kitPartsOf(itemId: string): Promise<{ sku: string; required_quant
     [sku]
   );
   const parts = Array.isArray(kit.rows[0]?.kit_components) ? kit.rows[0].kit_components : [];
-  return parts
+  const distinct = parts
     .filter((part: any) => part?.sku && part.sku !== sku)
     .map((part: any) => ({ sku: part.sku, required_quantity: Math.max(1, Number(part.required_quantity) || 1) }));
+  // A pack of one component, such as five trays, is picked by the pack barcode. A kit of different parts is scanned part by part.
+  if (new Set(distinct.map((part: { sku: string }) => part.sku)).size < 2) return [];
+  return distinct;
 }
 
 async function resolveScanSku(barcode: string | null, componentSku: string | null): Promise<string | null> {

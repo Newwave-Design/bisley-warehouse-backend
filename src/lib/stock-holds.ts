@@ -3,6 +3,8 @@
  * A scan may take one unit of a SKU only while this order still has some of its count left.
  * Samples are ignored. Each part of a kit is reserved to that order, even when another part is not in stock.
  * Units already picked or scanned stay with that order.
+ * A kit in the bin counts as its components. A 5-pack of trays is five singles, and those singles
+ * fill either singles or another pack. The same units are not promised twice.
  * This does not change quantity_reserved or the pay-when-sold ledger.
  */
 import { getPool, query } from '../db/index.js';
@@ -46,6 +48,26 @@ function taken(line: HoldDemand, sku: string, per: number): number {
 function demandFor(line: HoldDemand, sku: string, per: number): number {
   if (line.parts.length) return Math.max(0, line.required - line.picked) * per;
   return Math.max(0, line.required * per - taken(line, sku, per));
+}
+
+/** 227P5-000 is five 227P1-000. Customers order either the single or the pack. */
+export function trayPackParts(sku: string): HoldPart[] {
+  const match = /^(.+)P5-000$/i.exec(sku);
+  if (!match) return [];
+  return [{ sku: `${match[1]}P1-000`, per: 5 }];
+}
+
+/** A pack in a bin is five singles. Those singles are not also kept as a separate pack. */
+export function applyKitStock(onHand: Map<string, number>, kits: { sku: string; parts: HoldPart[] }[]): Map<string, number> {
+  const free = new Map(onHand);
+  for (const kit of kits) {
+    if (!kit.parts.length) continue;
+    const qty = free.get(kit.sku) ?? 0;
+    if (qty <= 0) continue;
+    free.set(kit.sku, 0);
+    for (const part of kit.parts) free.set(part.sku, (free.get(part.sku) ?? 0) + qty * part.per);
+  }
+  return free;
 }
 
 /** Pure assignment. `onHand` is the physical quantity still in the warehouse. Claims are satisfied before older orders. */
@@ -142,17 +164,20 @@ async function computeHolds(): Promise<void> {
         AND pli.product_sku NOT ILIKE '%SAMPLE%'`
   );
 
-  const lines: HoldDemand[] = demand.rows.map((row: any) => ({
-    itemId: row.item_id,
-    orderedAt: new Date(row.ordered_at).getTime(),
-    pickListNumber: row.pick_list_number || '',
-    lineNumber: Number(row.line_number) || 0,
-    sku: row.product_sku,
-    required: Number(row.quantity_required) || 0,
-    picked: Number(row.quantity_picked) || 0,
-    parts: kitParts(row.product_sku, row.kit_components),
-    scanned: new Map<string, number>(),
-  }));
+  const lines: HoldDemand[] = demand.rows.map((row: any) => {
+    const stored = kitParts(row.product_sku, row.kit_components);
+    return {
+      itemId: row.item_id,
+      orderedAt: new Date(row.ordered_at).getTime(),
+      pickListNumber: row.pick_list_number || '',
+      lineNumber: Number(row.line_number) || 0,
+      sku: row.product_sku,
+      required: Number(row.quantity_required) || 0,
+      picked: Number(row.quantity_picked) || 0,
+      parts: stored.length ? stored : trayPackParts(row.product_sku),
+      scanned: new Map<string, number>(),
+    };
+  });
   const byId = new Map(lines.map((line) => [line.itemId, line]));
 
   if (lines.length) {
@@ -178,6 +203,11 @@ async function computeHolds(): Promise<void> {
     else skus.add(line.sku);
     for (const sku of line.scanned.keys()) skus.add(sku);
   }
+  for (const sku of [...skus]) {
+    const single = /^(.+)P1-000$/i.exec(sku);
+    if (single) skus.add(`${single[1]}P5-000`);
+    for (const part of trayPackParts(sku)) skus.add(part.sku);
+  }
   const onHand = new Map<string, number>();
   if (skus.size) {
     const stock = await query(
@@ -187,6 +217,10 @@ async function computeHolds(): Promise<void> {
     );
     for (const row of stock.rows) onHand.set(row.product_sku, Number(row.qty) || 0);
   }
+  const packs = [...onHand.keys()]
+    .map((sku) => ({ sku, parts: trayPackParts(sku) }))
+    .filter((kit) => kit.parts.length > 0 && (onHand.get(kit.sku) ?? 0) > 0);
+  const withKits = applyKitStock(onHand, packs);
 
   const claims: HoldClaim[] = [];
   if (lines.length) {
@@ -207,7 +241,7 @@ async function computeHolds(): Promise<void> {
     }
   }
 
-  const holds = planHolds(lines, onHand, claims);
+  const holds = planHolds(lines, withKits, claims);
   const unique = new Map<string, PlannedHold>();
   for (const hold of holds) {
     const key = `${hold.itemId}\0${hold.sku}`;

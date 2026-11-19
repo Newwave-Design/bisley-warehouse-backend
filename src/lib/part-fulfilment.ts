@@ -46,7 +46,7 @@ export class PartFulfilError extends Error {
 }
 
 export function isInventoryKit(sku: string, raw: unknown): boolean {
-  return kitParts(sku, raw).length > 0;
+  return new Set(kitParts(sku, raw).map((part) => part.sku)).size > 1;
 }
 
 function qtyLabel(sku: string, qty: number): string {
