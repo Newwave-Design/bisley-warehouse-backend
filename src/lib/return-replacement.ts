@@ -1,6 +1,7 @@
 /**
- * A replacement return puts the returned item back on To pick.
- * It is a warehouse pick only: the shop order was already fulfilled.
+ * A replacement is a new warehouse order for Plan picks.
+ * planned_at stays empty, so it is not on a pick list until someone adds it.
+ * The shop order was already fulfilled.
  */
 import { query } from '../db/index.js';
 import { rootMedusaOrderId } from './order-values.js';
@@ -60,7 +61,7 @@ export async function openReturnReplacement(sourcePickListId: string, sku: strin
   if (pickListId && open.rows[0].status === 'CANCELLED') {
     await query(
       `UPDATE pick_lists
-          SET status = 'PENDING', is_archived = false, archived_at = NULL, is_return = true, updated_at = NOW()
+          SET status = 'PENDING', is_archived = false, archived_at = NULL, is_return = true, planned_at = NULL, updated_at = NOW()
         WHERE id = $1`,
       [pickListId]
     );
@@ -75,11 +76,11 @@ export async function openReturnReplacement(sourcePickListId: string, sku: strin
       `INSERT INTO pick_lists (
          medusa_order_id, pick_list_number, status, parent_pick_list_id,
          customer_name, customer_email, shipping_method_name, shipping_method_code, shipping_address,
-         is_sandbox, is_return, payment_status, purchase_order_number, notes, created_at, updated_at
+         is_sandbox, is_return, payment_status, purchase_order_number, notes, planned_at, created_at, updated_at
        ) VALUES (
          $1, $2, 'PENDING', $3,
          $4, $5, $6, $7, $8::jsonb,
-         $9, true, $10, $11, $12, NOW(), NOW()
+         $9, true, $10, $11, $12, NULL, NOW(), NOW()
        ) RETURNING id, pick_list_number`,
       [
         medusaId,

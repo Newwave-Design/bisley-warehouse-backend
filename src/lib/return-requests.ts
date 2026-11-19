@@ -2,6 +2,7 @@
  * A return request is the queue for the warehouse. Booking the collection comes after.
  */
 import { query } from '../db/index.js';
+import { outcomeChange } from './return-booking-rules.js';
 import { openReturnReplacement, releaseReturnReplacement } from './return-replacement.js';
 
 const RETURNABLE = ['DISPATCHED', 'PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED'];
@@ -68,7 +69,7 @@ async function skusOnList(pickListId: string): Promise<string[]> {
   return items.rows.map((row: { product_sku: string }) => row.product_sku);
 }
 
-/** Mark the whole order, or the given items, as waiting for a return collection. A replacement goes straight to To pick. */
+/** Mark the whole order, or the given items, as waiting for a return collection. A replacement is created for Plan picks and is not put on a pick list. */
 export async function requestReturns(pickListId: string, skus: string[] | null, actor: string, outcome: string) {
   const choice = outcome === 'replace' ? 'replace' : outcome === 'refund' ? 'refund' : '';
   if (!choice) throw new ReturnRequestError('Choose whether this return is a refund or a replacement.');
@@ -95,6 +96,25 @@ export async function requestReturns(pickListId: string, skus: string[] | null, 
   if (missing.length) throw new ReturnRequestError(`${missing[0]} is not on this order.`);
 
   for (const sku of wanted) {
+    const current = await query(
+      `SELECT status, outcome FROM return_requests
+        WHERE pick_list_id = $1 AND sku = $2 AND status <> 'cancelled'
+        ORDER BY created_at DESC LIMIT 1`,
+      [pickListId, sku]
+    );
+    const booked = await query(
+      `SELECT outcome FROM collection_bookings
+        WHERE pick_list_id = $1 AND sku = $2 AND status <> 'cancelled'
+          AND COALESCE(direction, 'outbound') = 'return'
+        ORDER BY created_at DESC LIMIT 1`,
+      [pickListId, sku]
+    );
+    const existing = booked.rows[0]
+      ? { status: 'booked', outcome: booked.rows[0].outcome || current.rows[0]?.outcome }
+      : current.rows[0] || null;
+    const change = outcomeChange(existing, choice);
+    if (!change.ok) throw new ReturnRequestError(change.error);
+    if (booked.rows[0]) continue;
     await query(
       `INSERT INTO return_requests (pick_list_id, sku, created_by, outcome)
        VALUES ($1, $2, $3, $4)
@@ -103,8 +123,8 @@ export async function requestReturns(pickListId: string, skus: string[] | null, 
        WHERE return_requests.status = 'requested'`,
       [pickListId, sku, actor.slice(0, 255), choice]
     );
-    if (choice === 'replace') await openReturnReplacement(pickListId, sku);
-    else await releaseReturnReplacement(pickListId, sku);
+    if (change.createOrder) await openReturnReplacement(pickListId, sku);
+    if (change.releaseOrder) await releaseReturnReplacement(pickListId, sku);
   }
   return listReturnRequests(pickListId);
 }
@@ -149,13 +169,16 @@ export async function cancelReturnRequests(pickListId: string, skus: string[]) {
   return listReturnRequests(pickListId);
 }
 
-export async function markReturnRequestsBooked(pickListId: string, sku: string, bookingId: string | null) {
+export async function markReturnRequestsBooked(pickListId: string, sku: string, bookingId: string | null, outcome?: string) {
   if (!sku) return;
+  const choice = outcome === 'replace' || outcome === 'refund' ? outcome : null;
   await query(
     `UPDATE return_requests
-        SET status = 'booked', booking_id = $3, updated_at = NOW()
+        SET status = 'booked', booking_id = $3,
+            outcome = COALESCE($4, outcome),
+            updated_at = NOW()
       WHERE pick_list_id = $1 AND sku = $2 AND status = 'requested'`,
-    [pickListId, sku, bookingId]
+    [pickListId, sku, bookingId, choice]
   );
 }
 

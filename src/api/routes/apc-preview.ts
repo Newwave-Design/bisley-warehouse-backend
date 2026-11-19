@@ -12,19 +12,21 @@ import { returnStockForCancelledCollection, takeStockForBookedCollection } from 
 import { actorName, reopenDispatchedPickList, shipBookedPickList } from '../../lib/pick-list-events.js';
 import { fulfillPickListInMedusa } from '../../lib/medusa-fulfillment.js';
 import { fitZpl } from '../../lib/zpl-fit.js';
-import { addDxCollection, addDxConsignment, deleteDxConsignment, dxConfigured, DxError, fetchDxLabels, quoteDxCollection } from '../../lib/dx-freight.js';
+import { addDxCollection, addDxConsignment, collectionPhone, deleteDxConsignment, dxConfigured, DxError, fetchDxLabels, quoteDxCollection } from '../../lib/dx-freight.js';
+import { outcomeChange } from '../../lib/return-booking-rules.js';
 import { openReturnReplacement, releaseReturnReplacement } from '../../lib/return-replacement.js';
 import { markReturnRequestsBooked, reopenReturnRequests } from '../../lib/return-requests.js';
 import { appropriateApcServices } from '../../lib/apc-service.js';
 import { createRoyalMailParcel, deleteRoyalMailOrders, fetchRoyalMailLabelPdf, quoteRoyalMailParcels, readRoyalMailTracking, RoyalMailError, royalMailConfigured, type RoyalMailParcelFormat } from '../../lib/royal-mail.js';
 
-async function dropReplacements(pickListId: string | undefined, waybill: string) {
-  if (!pickListId || !waybill) return;
+async function dropReplacements(pickListId: string | undefined, waybill: string, orderNumber = '') {
+  if (!pickListId || (!waybill && !orderNumber)) return;
   const rows = await query(
     `SELECT sku, outcome FROM collection_bookings
-      WHERE pick_list_id = $1 AND waybill = $2 AND status <> 'cancelled'
-        AND COALESCE(direction, 'outbound') = 'return'`,
-    [pickListId, waybill]
+      WHERE pick_list_id = $1 AND status <> 'cancelled'
+        AND COALESCE(direction, 'outbound') = 'return'
+        AND (($2 <> '' AND waybill = $2) OR ($3 <> '' AND apc_order_number = $3))`,
+    [pickListId, waybill, orderNumber]
   );
   for (const row of rows.rows) {
     await reopenReturnRequests(pickListId, row.sku).catch((error) => {
@@ -181,6 +183,9 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
   const askedCourier = text(req.body?.courier).trim().toUpperCase();
   let courier: 'APC' | 'DX' | 'RM' = askedCourier === 'DX' ? 'DX' : askedCourier === 'RM' ? 'RM' : 'APC';
   if (returning && /^[0-9a-f-]{36}$/i.test(pickListId)) courier = await deliveredCourier(pickListId);
+  if (process.env.WAREHOUSE_ENV === 'staging' && courier !== 'DX') {
+    return res.status(409).json({ error: 'Staging can book DX on the UAT service only.' });
+  }
   if (returning && !agreedDate) {
     return res.status(400).json({ error: 'Enter the collection date agreed with the customer. It has to be a weekday that has not passed.' });
   }
@@ -525,7 +530,10 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   const askedCourier = text(req.body?.courier).trim().toUpperCase();
   let courier: 'APC' | 'DX' | 'RM' = askedCourier === 'DX' ? 'DX' : askedCourier === 'RM' ? 'RM' : 'APC';
   if (returning && /^[0-9a-f-]{36}$/i.test(pickListId)) courier = await deliveredCourier(pickListId);
-  if (returning && outcome !== 'refund' && outcome !== 'replace') {
+  if (process.env.WAREHOUSE_ENV === 'staging' && courier !== 'DX') {
+    return res.status(409).json({ error: 'Staging can book DX on the UAT service only.' });
+  }
+  if (returning && outcome && outcome !== 'refund' && outcome !== 'replace') {
     return res.status(400).json({ error: 'Choose whether this return is a refund or a replacement.' });
   }
   if (returning && !agreedDate) {
@@ -573,12 +581,24 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         return res.status(409).json({ error: returning ? 'This item already has a return collection' : 'One of these items already has a collection' });
       }
     }
+    const replacementActions = new Map<string, { createOrder: boolean; releaseOrder: boolean }>();
+    if (returning && (outcome === 'refund' || outcome === 'replace')) {
+      const choice = outcome === 'replace' ? 'replace' : 'refund';
+      for (const sku of skus) {
+        const current = await query(
+          `SELECT status, outcome FROM return_requests
+            WHERE pick_list_id = $1 AND sku = $2 AND status <> 'cancelled'
+            ORDER BY created_at DESC LIMIT 1`,
+          [pickListId, sku]
+        );
+        const change = outcomeChange(current.rows[0] || null, choice);
+        if (!change.ok) return res.status(409).json({ error: change.error });
+        replacementActions.set(sku, change);
+      }
+    }
 
     const delivery = deliveryFrom(list);
-    if (returning) {
-      const given = text(req.body?.phone).trim();
-      if (given) delivery.phone = given;
-    }
+    delivery.phone = collectionPhone(text(list.shipping_address?.phone), text(req.body?.phone));
     if (!['GB', 'UK'].includes(delivery.country)) {
       return res.status(400).json({ error: returning ? 'A return can only be collected from a UK address' : `${courier} collections are only booked to a UK address` });
     }
@@ -849,6 +869,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     let replacement: { id: string; pick_list_number: string } | null = null;
     if (returning && outcome === 'replace') {
       for (const sku of rowSkus) {
+        if (!replacementActions.get(sku)?.createOrder) continue;
         replacement = await openReturnReplacement(pickListId, sku).catch((error) => {
           console.warn('Opening the replacement pick failed', error instanceof Error ? error.message : 'failed');
           return replacement;
@@ -857,6 +878,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     }
     if (returning && outcome === 'refund') {
       for (const sku of rowSkus) {
+        if (!replacementActions.get(sku)?.releaseOrder) continue;
         await releaseReturnReplacement(pickListId, sku).catch((error) => {
           console.warn('Removing the replacement pick failed', error instanceof Error ? error.message : 'failed');
         });
@@ -864,7 +886,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     }
     if (returning) {
       for (const row of saved) {
-        await markReturnRequestsBooked(pickListId, row.sku, row.id).catch((error) => {
+        await markReturnRequestsBooked(pickListId, row.sku, row.id, outcome).catch((error) => {
           console.warn('Marking the return request booked failed', error instanceof Error ? error.message : 'failed');
         });
       }
@@ -996,7 +1018,7 @@ async function loadBookingLabels(id: string, format: 'ZPL' | 'PDF'): Promise<Pri
     if (tracking && !waybill) {
       await query(
         `UPDATE collection_bookings
-            SET waybill = $1,
+            SET waybill = $1::text,
                 pieces = CASE
                   WHEN jsonb_typeof(pieces) = 'array' AND jsonb_array_length(pieces) > 0
                     THEN jsonb_set(pieces, '{0,trackingNumber}', to_jsonb($1::text), true)
@@ -1099,6 +1121,7 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
         const message = error instanceof Error ? error.message : 'Royal Mail did not cancel the postage. It is still booked here.';
         return res.status(502).json({ error: message });
       }
+      if (booking.direction === 'return') await dropReplacements(booking.pick_list_id, waybill, String(orderId));
       await query(
         `UPDATE collection_bookings
             SET status = 'cancelled', updated_at = NOW()

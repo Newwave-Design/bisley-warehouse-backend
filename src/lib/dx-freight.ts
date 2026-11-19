@@ -84,6 +84,11 @@ function account() {
   const depot = text(process.env.DX_DEPOT);
   const password = text(process.env.DX_PASSWORD);
   const base = (text(process.env.DX_API_URL) || LIVE_URL).replace(/\/$/, '');
+  if (process.env.WAREHOUSE_ENV === 'staging') {
+    let host = '';
+    try { host = new URL(base).hostname.toLowerCase(); } catch { host = ''; }
+    if (host !== 'uat-dm.dxdelivery.com') throw new DxError('Staging can only book DX on the UAT service');
+  }
   if (!accountNumber || !depot || !password) throw new DxError('DX login is not configured');
   return { accountNumber, depot, password, base };
 }
@@ -281,13 +286,24 @@ export function dxGoodsDescription(title: string): string {
   return dxContentDescription(title || 'Furniture').slice(0, 30)
 }
 
+/** UK national number, or blank when the value is not a usable phone. */
+export function ukPhone(value: string): string {
+  let digits = String(value || '').replace(/[^\d+]/g, '');
+  if (digits.startsWith('+44')) digits = digits.slice(3);
+  else if (digits.startsWith('0044')) digits = digits.slice(4);
+  else if (digits.startsWith('44') && digits.length >= 12) digits = digits.slice(2);
+  digits = digits.replace(/\D/g, '').replace(/^0+/, '');
+  if (digits.length < 9 || digits.length > 10) return '';
+  return `0${digits}`;
+}
+
 export function dxPhone(value: string): string {
-  let digits = value.replace(/[^\d+]/g, '');
-  if (digits.startsWith('+44')) digits = `0${digits.slice(3)}`;
-  else if (/^44\d{10}$/.test(digits)) digits = `0${digits.slice(2)}`;
-  digits = digits.replace(/\D/g, '');
-  if (digits.length < 10) return FALLBACK_PHONE;
-  return digits.slice(0, 14);
+  return ukPhone(value) || FALLBACK_PHONE;
+}
+
+/** The customer's number on the order. A number typed on the desk is used only when the order has none. */
+export function collectionPhone(orderPhone: string, typedPhone: string): string {
+  return ukPhone(orderPhone) || ukPhone(typedPhone) || FALLBACK_PHONE;
 }
 
 function clipWords(value: string, max: number): string[] {
@@ -555,7 +571,7 @@ export async function addDxCollection(input: {
     DeliveryCountry: 'GB',
     DeliveryEmail: '',
     DeliveryName: dxAscii(clipWords(WAREHOUSE_DELIVERY.company, 25)[0] || '').slice(0, 25),
-    DeliveryPhoneNumber: FALLBACK_PHONE,
+    DeliveryPhoneNumber: dxPhone(input.collection.phone),
     DeliveryPostcode: WAREHOUSE_DELIVERY.postcode,
     DeliveryType: 2,
     DescriptionOfGoods: dxGoodsDescription(input.pieces.map((piece) => piece.title).filter(Boolean).join(', ') || 'Furniture'),

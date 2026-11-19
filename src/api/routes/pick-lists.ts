@@ -11,6 +11,7 @@ import { takeStockForShippedLists } from '../../lib/collection-stock.js';
 import { consumeBoxesForShipments } from '../../lib/packaging-usage.js';
 import { paidSql, isPaid } from '../../lib/payment-status.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
+import { splitPairView, unsplitPickList, UnsplitError } from '../../lib/unsplit.js';
 import { kitParts, refuseUnassignedPick } from '../../lib/stock-holds.js';
 import { promotePickList } from '../../lib/pick-progress.js';
 import { toUuidOrNull } from './mobile.js';
@@ -47,6 +48,7 @@ function formatPickListOverview(items: any[] | null | undefined) {
       colour,
       quantity_required: Number(item.quantity_required) || 0,
       quantity_picked: Number(item.quantity_picked) || 0,
+      assigned: item.assigned == null ? null : Number(item.assigned) || 0,
       thumbnail: item.variant_thumbnail || item.product_thumbnail || null,
     };
   });
@@ -321,6 +323,7 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.is_archived,
          pl.archived_at,
          pl.deferred_at,
+         pl.planned_at,
          to_char(pl.named_delivery_on, 'YYYY-MM-DD') AS named_delivery_on,
          pl.payment_status,
          pl.purchase_order_number,
@@ -348,6 +351,31 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
            'item_title', ${lite ? 'pli.item_title' : 'COALESCE(wp.product_title, pli.item_title)'},
            'quantity_required', pli.quantity_required,
            'quantity_picked', pli.quantity_picked
+           ${lite ? `, 'assigned', COALESCE((
+             SELECT COALESCE(
+               (
+                 SELECT MIN(FLOOR(COALESCE((
+                   SELECT SUM(h.qty) FROM order_stock_holds h
+                   WHERE h.pick_list_item_id = pli.id AND h.sku = comp->>'sku'
+                 ), 0)::numeric / GREATEST(CASE WHEN (comp->>'required_quantity') ~ '^[0-9]+(\\\\.[0-9]+)?$' THEN (comp->>'required_quantity')::numeric ELSE 1 END, 1)))::int
+                 FROM wms_products kit
+                 CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(kit.kit_components) = 'array' THEN kit.kit_components ELSE '[]'::jsonb END) comp
+                 WHERE kit.id = (
+                   SELECT id FROM wms_products
+                   WHERE variant_sku = pli.product_sku AND NOT COALESCE(is_archived, false)
+                   ORDER BY CASE WHEN jsonb_typeof(kit_components) = 'array' AND jsonb_array_length(kit_components) > 0 THEN 0 ELSE 1 END
+                   LIMIT 1
+                 )
+                   AND NULLIF(comp->>'sku', '') IS NOT NULL
+                   AND comp->>'sku' <> pli.product_sku
+                   AND comp->>'sku' NOT ILIKE '%SAMPLE%'
+               ),
+               (
+                 SELECT COALESCE(SUM(h.qty), 0)::int FROM order_stock_holds h
+                 WHERE h.pick_list_item_id = pli.id AND h.sku = pli.product_sku
+               )
+             )
+           ), 0)` : ''}
            ${lite ? '' : `, 'variant_thumbnail', wp.variant_thumbnail, 'product_thumbnail', wp.product_thumbnail`}
          ) ORDER BY pli.line_number) FILTER (WHERE pli.id IS NOT NULL) AS items
          ${skuParamIndex > 0 ? `, MAX(CASE WHEN pli.product_sku = $${skuParamIndex} THEN pli.quantity_required END) as sku_quantity_required
@@ -1241,6 +1269,7 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
       && shortItems.every(s => s.shortQty === s.item.quantity_required - s.item.quantity_picked);
 
     let childPickListNumber: string | null = null;
+    let pickPartNumber: string | null = null;
 
     if (fullyBackordered) {
       // Nothing on this list can be picked at all right now — block it in place
@@ -1248,22 +1277,27 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
     } else {
       const suffix = Date.now().toString(36).slice(-4).toUpperCase();
       const childOrderId = `${pl.medusa_order_id}-BO${suffix}`;
-      childPickListNumber = `${pl.pick_list_number}-B`;
+      const baseNumber = String(pl.pick_list_number || '').replace(/-(?:1|2|B)$/i, '');
+      // -1 stays on plan picks with the short lines. -2 is the part that can be picked.
+      childPickListNumber = `${baseNumber}-1`;
+      pickPartNumber = `${baseNumber}-2`;
 
       const child = await query(
         `INSERT INTO pick_lists (
            medusa_order_id, pick_list_number, status, parent_pick_list_id,
            customer_name, customer_email, shipping_method_name, shipping_method_code, shipping_address,
-           is_sandbox, notes, created_at, updated_at
+           is_sandbox, notes, created_at, updated_at,
+           payment_status, purchase_order_number, named_delivery_on
          )
-         VALUES ($1, $2, 'AWAITING_STOCK', $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, NOW())
+         VALUES ($1, $2, 'AWAITING_STOCK', $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, NOW(), $12, $13, $14)
          RETURNING id`,
         [
           childOrderId, childPickListNumber, pickListId,
           pl.customer_name, pl.customer_email, pl.shipping_method_name, pl.shipping_method_code,
           JSON.stringify(pl.shipping_address || {}), pl.is_sandbox,
-          `Split from ${pl.pick_list_number} — awaiting stock`,
+          `Split from ${baseNumber} — awaiting stock`,
           pl.created_at,
+          pl.payment_status, pl.purchase_order_number, pl.named_delivery_on,
         ]
       );
       const childId = child.rows[0].id;
@@ -1290,6 +1324,13 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
            item.medusa_order_line_item_id, item.medusa_variant_id, item.medusa_product_id, item.created_at]
         );
       }
+      // The ready lines keep this list, now numbered as the pick-list part. The time moves so the scanner re-downloads it.
+      await query(
+        `UPDATE pick_lists
+         SET pick_list_number = $2, planned_at = COALESCE(planned_at, NOW()), updated_at = NOW()
+         WHERE id = $1`,
+        [pickListId, pickPartNumber]
+      );
     }
 
     // Raise (or top up) a pending reorder request per backordered SKU
@@ -1384,6 +1425,7 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
       success: true,
       fully_backordered: fullyBackordered,
       child_pick_list_number: childPickListNumber,
+      pick_part_number: pickPartNumber,
       backordered_skus: shortItems.map(s => s.item.product_sku),
       reorder_requests_created: reorderRequestsCreated,
       supplier_orders_created: supplierOrdersCreated,
@@ -1391,6 +1433,26 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
   } catch (error) {
     console.error('Split backorder error:', error);
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to split backorder' });
+  }
+});
+
+router.get('/:pickListId/split-pair', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    return res.json(await splitPairView(req.params.pickListId));
+  } catch (error) {
+    console.error('Split pair error:', error);
+    return res.status(500).json({ error: 'Failed to load the split' });
+  }
+});
+
+router.post('/:pickListId/unsplit', authMiddleware, requirePermission('manage_operations'), async (req: Request, res: Response) => {
+  try {
+    const result = await unsplitPickList(req.params.pickListId);
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    if (error instanceof UnsplitError) return res.status(error.status).json({ error: error.message });
+    console.error('Unsplit error:', error);
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to unsplit' });
   }
 });
 
@@ -1674,6 +1736,27 @@ router.patch('/:pickListId/items/:itemId/pick', authMiddleware, async (req: Requ
  * PATCH /api/pick-lists/:pickListId/complete
  * Mark pick list as completed
  */
+router.patch('/:pickListId/plan', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const on = req.body?.on === true;
+    const toPick = req.body?.toPick === true;
+    const result = await query(
+      `UPDATE pick_lists
+       SET planned_at = CASE WHEN $2::boolean THEN COALESCE(planned_at, NOW()) ELSE NULL END,
+           status = CASE WHEN $3::boolean AND status IN ('IN_PROGRESS', 'PICKED', 'PACKING') THEN 'PENDING' ELSE status END,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING id, planned_at, status`,
+      [req.params.pickListId, on, toPick]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Pick list not found' });
+    return res.json({ pickList: result.rows[0] });
+  } catch (error) {
+    console.error('Pick list plan error', error);
+    return res.status(500).json({ error: 'Failed to update the pick list' });
+  }
+});
+
 router.patch('/:pickListId/start', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { pickListId } = req.params;

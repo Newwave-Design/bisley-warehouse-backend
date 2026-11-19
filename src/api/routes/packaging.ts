@@ -323,15 +323,18 @@ router.get('/boms', async (req: Request, res: Response) => {
     if (product) { params.push(product); conds.push(`b.product_code = $${params.length}`); }
     if (sku) { params.push(sku); conds.push(`b.sku = $${params.length}`); }
     const result = await query(
-      `SELECT b.*, COALESCE(json_agg(json_build_object(
+      `SELECT b.*, COALESCE(spec.royal_mail_eligible, false) AS royal_mail,
+              COALESCE(json_agg(json_build_object(
           'id', l.id, 'packaging_item_id', l.packaging_item_id, 'code', i.code, 'name', i.name,
           'item_type', i.item_type, 'stock_on_hand', i.stock_on_hand, 'qty', l.qty, 'qty_confirmed', l.qty_confirmed, 'notes', l.notes
         ) ORDER BY i.item_type, i.code) FILTER (WHERE l.id IS NOT NULL), '[]') AS lines
        FROM packaging_boms b
+       LEFT JOIN packaging_product_specs spec
+         ON upper(spec.product_code) = upper(COALESCE(b.sku, b.product_code))
        LEFT JOIN packaging_bom_lines l ON l.bom_id = b.id
        LEFT JOIN packaging_items i ON i.id = l.packaging_item_id
        WHERE ${conds.join(' AND ')}
-       GROUP BY b.id
+       GROUP BY b.id, spec.royal_mail_eligible
        ORDER BY b.product_code, b.sku, b.option_rank`,
       params
     );

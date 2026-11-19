@@ -306,7 +306,7 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
 
     const result = await query(`
       SELECT
-        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at,
+        pl.id, pl.pick_list_number, pl.medusa_order_id, pl.status, pl.created_at, pl.deferred_at, pl.planned_at,
         to_char(pl.named_delivery_on, 'YYYY-MM-DD') AS named_delivery_on, pl.is_return,
         (SELECT parent.pick_list_number FROM pick_lists parent
           WHERE parent.id = pl.parent_pick_list_id AND (pl.medusa_order_id LIKE '%-PF%' OR pl.medusa_order_id LIKE 'manual-%' OR pl.medusa_order_id LIKE 'part-%')) AS part_of_number,
@@ -315,7 +315,7 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
         (SELECT string_agg(child.pick_list_number, ', ' ORDER BY child.created_at)
            FROM pick_lists child
           WHERE child.parent_pick_list_id = pl.id AND (child.medusa_order_id LIKE '%-PF%' OR child.medusa_order_id LIKE 'manual-%' OR child.medusa_order_id LIKE 'part-%')) AS part_numbers,
-        -- The scanner sorts oldest first and does not pin replacements, so an open return is dated back to the top of To pick.
+        -- Replacements that have been added to a pick list still sort to the top. An unplanned replacement is left off this list.
         CASE WHEN COALESCE(pl.is_return, false) AND pl.status IN ('PENDING', 'IN_PROGRESS', 'AWAITING_STOCK')
              THEN pl.created_at - INTERVAL '100 years'
              WHEN COALESCE(pl.is_return, false) THEN pl.created_at
@@ -351,6 +351,7 @@ router.get('/pick-lists', authMiddleware, async (req: AuthRequest, res: Response
       FROM pick_lists pl
       LEFT JOIN pick_list_items pli ON pli.pick_list_id = pl.id AND COALESCE(pli.is_archived, false) = false
       WHERE pl.is_archived = false AND ${paidSql('pl')} AND ($1::text[] IS NULL OR pl.status = ANY($1::text[]))
+        AND NOT (COALESCE(pl.is_return, false) AND pl.planned_at IS NULL AND pl.status IN ('PENDING', 'AWAITING_STOCK'))
       ${sampleClause}
       GROUP BY pl.id
       ORDER BY CASE WHEN COALESCE(pl.is_return, false) AND pl.status IN ('PENDING', 'IN_PROGRESS', 'AWAITING_STOCK') THEN 0 ELSE 1 END, order_date ${orderDir}

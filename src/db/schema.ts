@@ -380,6 +380,31 @@ ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_refunded_gbp DECIMAL(10,2)
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_currency VARCHAR(10);
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS order_value_checked_at TIMESTAMP;
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS is_return BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS planned_at TIMESTAMP;
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS desk_status VARCHAR(40);
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS how_back VARCHAR(40);
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS hold_refund BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS courier_problem VARCHAR(40);
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS tracking_number VARCHAR(120);
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS pick_list_id UUID;
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS decision VARCHAR(40);
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS refund_shipping BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS report_sent BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS sold_stock_hold BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS legacy_key VARCHAR(160);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_return_authorizations_legacy_key ON return_authorizations (legacy_key);
+ALTER TABLE return_items ADD COLUMN IF NOT EXISTS item_scanned BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE return_items ADD COLUMN IF NOT EXISTS bay_scanned VARCHAR(40);
+ALTER TABLE return_items ADD COLUMN IF NOT EXISTS unopened_confirmed BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE return_items ADD COLUMN IF NOT EXISTS stock_scanned_at TIMESTAMP;
+CREATE TABLE IF NOT EXISTS return_claims (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  return_authorization_id UUID NOT NULL REFERENCES return_authorizations(id) ON DELETE CASCADE,
+  kind VARCHAR(20) NOT NULL,
+  note TEXT,
+  report_name VARCHAR(160),
+  created_at TIMESTAMP DEFAULT NOW()
+);
 CREATE INDEX IF NOT EXISTS idx_pick_lists_parent ON pick_lists(parent_pick_list_id);
 CREATE INDEX IF NOT EXISTS idx_pick_lists_archived ON pick_lists(is_archived);
 
@@ -1583,6 +1608,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_return_requests_open
 CREATE TABLE IF NOT EXISTS return_request_images (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   return_request_id UUID NOT NULL REFERENCES return_requests(id) ON DELETE CASCADE,
+  content_type VARCHAR(40) NOT NULL,
+  image BYTEA NOT NULL,
+  created_by VARCHAR(255),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS return_desk_photos (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  return_authorization_id UUID NOT NULL REFERENCES return_authorizations(id) ON DELETE CASCADE,
+  return_item_id UUID REFERENCES return_items(id) ON DELETE CASCADE,
   content_type VARCHAR(40) NOT NULL,
   image BYTEA NOT NULL,
   created_by VARCHAR(255),
