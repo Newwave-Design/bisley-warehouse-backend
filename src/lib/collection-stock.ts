@@ -6,6 +6,7 @@ import { getPool, query } from '../db/index.js';
 import { scheduleAllocationRun } from './allocation.js';
 import { applyDispatchStock } from './dispatch-stock.js';
 import { syncSkuToMedusa } from './medusa-inventory.js';
+import { bookingSkusIncludingTraySingles } from './tray-stock.js';
 import { consumeBoxesForShipments } from './packaging-usage.js';
 import { isPaid } from './payment-status.js';
 
@@ -84,7 +85,14 @@ export async function takeStockForBookedCollection(pickListId: string, preferred
   );
   const list = found.rows[0];
   if (!list || list.is_sandbox || !isPaid(list)) return;
-  const skus = (list.skus as string[]).filter((sku) => sku && sku !== 'SAMPLE' && !sku.startsWith('extra-'));
+  const picked = await query(
+    `SELECT product_sku, quantity_picked FROM pick_list_items WHERE pick_list_id = $1 AND quantity_picked > 0`,
+    [pickListId],
+  );
+  const skus = bookingSkusIncludingTraySingles(
+    list.skus as string[],
+    picked.rows.map((row) => ({ sku: String(row.product_sku), quantity: Number(row.quantity_picked) || 0 })),
+  );
   if (!skus.length) return;
 
   const client = await getPool().connect();

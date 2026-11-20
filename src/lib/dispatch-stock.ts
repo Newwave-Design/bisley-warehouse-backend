@@ -10,6 +10,7 @@
  */
 import type { PoolClient } from 'pg';
 import { kitParts, trayPackParts } from './stock-holds.js';
+import { TRAYS_PER_PACK, packsToOpen, singlesUsedToShipPacks } from './tray-stock.js';
 
 interface KitComponent { sku: string; required_quantity?: number }
 
@@ -138,7 +139,9 @@ export async function applyDispatchStock(
           for (const row of packRows) {
             if (remaining <= 0) break;
             const available = Math.max(0, parseInt(row.quantity, 10));
-            const open = Math.min(available, Math.ceil(remaining / pack.size));
+            const open = pack.size === TRAYS_PER_PACK
+              ? Math.min(available, packsToOpen(0, available, remaining))
+              : Math.min(available, Math.ceil(remaining / pack.size));
             if (open <= 0) continue;
             const yielded = open * pack.size;
             const used = Math.min(remaining, yielded);
@@ -197,7 +200,9 @@ export async function applyDispatchStock(
           [part.sku],
         )).rows;
         const available = singleRows.reduce((sum, row) => sum + Math.max(0, parseInt(row.quantity, 10)), 0);
-        const packsFromSingles = Math.min(remaining, Math.floor(available / part.per));
+        const packsFromSingles = part.per === TRAYS_PER_PACK
+          ? singlesUsedToShipPacks(available, 0, remaining) / TRAYS_PER_PACK
+          : Math.min(remaining, Math.floor(available / part.per));
         let take = packsFromSingles * part.per;
         for (const row of singleRows) {
           if (take <= 0) break;
