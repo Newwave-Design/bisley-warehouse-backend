@@ -1,6 +1,36 @@
 import { query } from '../db/index.js';
 import { COLOUR_NAMES, componentDisplaySku, extractColourCode } from './colour-names.js';
 
+const PACK_OF_FIVE = /^(.+)P5-000$/i;
+const SINGLE_TRAY = /^(.+)P1-000$/i;
+
+/** A 5-pack and its single are one pool. A pack line can be made from five singles, and a single from an opened pack. */
+export function sellableTrayCount(sku: string, onHand: Map<string, number>): number | null {
+  const code = sku.trim();
+  const pack = PACK_OF_FIVE.exec(code);
+  if (pack) {
+    const singles = onHand.get(`${pack[1]}P1-000`) ?? 0;
+    const packs = onHand.get(`${pack[1]}P5-000`) ?? 0;
+    return packs + Math.floor(Math.max(0, singles) / 5);
+  }
+  const single = SINGLE_TRAY.exec(code);
+  if (single) {
+    const singles = onHand.get(`${single[1]}P1-000`) ?? 0;
+    const packs = onHand.get(`${single[1]}P5-000`) ?? 0;
+    return Math.max(0, singles) + Math.max(0, packs) * 5;
+  }
+  return null;
+}
+
+export function trayMateSku(sku: string): string | null {
+  const code = sku.trim();
+  const pack = PACK_OF_FIVE.exec(code);
+  if (pack) return `${pack[1]}P1-000`;
+  const single = SINGLE_TRAY.exec(code);
+  if (single) return `${single[1]}P5-000`;
+  return null;
+}
+
 type CatalogueProduct = {
   variant_sku: string
   product_title?: string
@@ -89,7 +119,7 @@ export async function expandKitPicksByList<T extends { sku: string; quantity_req
   }));
 
   const pickSkus = [...new Set(expanded.flat().filter((item: { kit_header?: boolean; sku?: string }) => !item.kit_header && item.sku).map((item) => item.sku as string))];
-  const lookup = [...new Set(pickSkus.flatMap((sku) => [sku, componentDisplaySku(sku)]))];
+  const lookup = [...new Set(pickSkus.flatMap((sku) => [sku, componentDisplaySku(sku), trayMateSku(sku)].filter((code): code is string => Boolean(code))))];
   const stockBySku = new Map<string, { available_stock: number; location_code: string | null }>();
   if (lookup.length) {
     const stock = await query(
@@ -113,10 +143,16 @@ export async function expandKitPicksByList<T extends { sku: string; quantity_req
   return expanded.map((items) => items.map((item) => {
     if ((item as { kit_header?: boolean }).kit_header) return { ...item, available_stock: null };
     const stock = stockBySku.get(item.sku) || stockBySku.get(componentDisplaySku(item.sku));
+    const quantities = new Map<string, number>();
+    for (const [code, row] of stockBySku) quantities.set(code, row.available_stock);
+    const sellable = sellableTrayCount(item.sku, quantities);
+    const mate = trayMateSku(item.sku);
+    const mateStock = mate ? stockBySku.get(mate) : undefined;
+    const location = (stock?.available_stock ? stock.location_code : null) || mateStock?.location_code || stock?.location_code || null;
     return {
       ...item,
-      available_stock: stock?.available_stock ?? 0,
-      location_code: (item as { location_code?: string | null }).location_code || stock?.location_code || null,
+      available_stock: sellable ?? stock?.available_stock ?? 0,
+      location_code: (item as { location_code?: string | null }).location_code || location,
     };
   }));
 }
