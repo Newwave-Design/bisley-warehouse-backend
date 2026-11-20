@@ -13,6 +13,7 @@ import { paidSql, isPaid } from '../../lib/payment-status.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { splitPairView, unsplitPickList, UnsplitError } from '../../lib/unsplit.js';
 import { kitParts, lineCovered, refuseUnassignedPick } from '../../lib/stock-holds.js';
+import { assignStockedToOlderOrders, awaitingListsCovered } from '../../lib/assign-arrived-stock.js';
 import { promotePickList } from '../../lib/pick-progress.js';
 import { toUuidOrNull } from './mobile.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -1507,31 +1508,21 @@ router.post('/:pickListId/split-for-picking', authMiddleware, requirePermission(
  */
 export async function unblockBackorderedPickLists(skus: string[]): Promise<string[]> {
   if (!skus.length) return [];
-  const unblocked: string[] = [];
-
+  await assignStockedToOlderOrders(skus);
+  const covered = new Set(await awaitingListsCovered(skus));
+  if (!covered.size) return [];
   const candidates = await query(
     `SELECT DISTINCT pl.id, pl.pick_list_number
      FROM pick_lists pl
      JOIN pick_list_items pli ON pli.pick_list_id = pl.id
-     WHERE pl.status = 'AWAITING_STOCK' AND pli.product_sku = ANY($1::text[])`,
-    [skus]
+     WHERE pl.status = 'AWAITING_STOCK' AND pl.id = ANY($1::uuid[])`,
+    [[...covered]]
   );
-
+  const unblocked: string[] = [];
   for (const candidate of candidates.rows) {
-    const itemsRow = await query(
-      `SELECT pli.quantity_required, pli.quantity_picked,
-              COALESCE((SELECT SUM(quantity) FROM warehouse_inventory WHERE product_sku = pli.product_sku), 0)::int AS available
-       FROM pick_list_items pli
-       WHERE pli.pick_list_id = $1 AND NOT COALESCE(pli.is_archived, false)`,
-      [candidate.id]
-    );
-    const stillShort = itemsRow.rows.some(r => r.available < (r.quantity_required - r.quantity_picked));
-    if (!stillShort) {
-      await query(`UPDATE pick_lists SET status = 'PENDING', updated_at = NOW() WHERE id = $1`, [candidate.id]);
-      unblocked.push(candidate.pick_list_number);
-    }
+    await query(`UPDATE pick_lists SET status = 'PENDING', updated_at = NOW() WHERE id = $1 AND status = 'AWAITING_STOCK'`, [candidate.id]);
+    unblocked.push(candidate.pick_list_number);
   }
-
   return unblocked;
 }
 

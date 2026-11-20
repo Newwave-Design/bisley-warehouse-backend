@@ -27,6 +27,7 @@ import { authMiddleware, requirePermission, AuthRequest } from '../../middleware
 import { pushAvailableStock } from '../../lib/medusa-inventory.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { unblockBackorderedPickLists } from './pick-lists.js';
+import { assignStockedToOlderOrders } from '../../lib/assign-arrived-stock.js';
 import { getLogger } from '../../lib/logger.js';
 import { singleTrayFromFivePack } from '../../lib/insert-trays.js';
 import { assignBarcode } from '../../lib/assign-barcode.js';
@@ -712,6 +713,7 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
     logger.info(`[stock-in] Successfully stocked ${stocked} items, attempting to unblock pick lists...`);
     scheduleAllocationRun(`stock-in session ${sessionId} confirmed (${stocked} lines)`);
 
+    await assignStockedToOlderOrders([...syncedSkus]);
     // Unblock any backorder pick lists that can now be fulfilled
     let unblocked: string[] = [];
     try {

@@ -19,6 +19,7 @@ import { ensurePackagingSchema } from './db/ensure-packaging-schema.js';
 import { ensureDeliveryNotes } from './lib/delivery-notes.js';
 import { installStagingGuard, isStaging } from './lib/staging.js';
 import { shipCollectionsDueToday } from './lib/ship-todays-collections.js';
+import { assignStockedToOlderOrders } from './lib/assign-arrived-stock.js';
 import packagingRoutes from './api/routes/packaging.js';
 import productMarginRoutes from './api/routes/product-margins.js';
 import scanningRoutes from './api/routes/scanning.js';
@@ -337,6 +338,10 @@ async function start() {
 
       // Stock Sold V2: allocation is also triggered by every change that affects it, this run catches anything missed
       setInterval(() => scheduleAllocationRun('scheduled safety run', 0), 5 * 60 * 1000);
+      setInterval(() => {
+        void assignStockedToOlderOrders().catch((err) => console.warn('[scheduler] Older-order stock assignment:', err));
+      }, 5 * 60 * 1000);
+      console.log('✓ Arrived stock is reserved to older orders (every 5 min, and when stocking in finishes)');
 
       const runTodaysCollections = () => {
         void shipCollectionsDueToday().catch((err) => console.warn('[scheduler] Today\'s collections:', err));

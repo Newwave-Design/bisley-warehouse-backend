@@ -25,6 +25,7 @@ import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { catalogueRevisedAt } from './mobile-sync.js';
 import { resolveScan } from '../../lib/resolve-scan.js';
 import { pushAvailableStock } from '../../lib/medusa-inventory.js';
+import { assignStockedToOlderOrders } from '../../lib/assign-arrived-stock.js';
 
 const router = express.Router();
 
@@ -164,6 +165,7 @@ router.post('/receive', authMiddleware, async (req: AuthRequest, res: Response) 
       RETURNING id
     `, [locationId, sku, colour_code ?? null, quantity, notes ?? null, (req as any).user?.id ?? '1']);
 
+    await assignStockedToOlderOrders([sku]);
     scheduleStockHolds();
     const syncErrors = await pushAvailableStock([sku]);
     res.json({

@@ -33,6 +33,7 @@ import { unblockBackorderedPickLists } from './pick-lists.js';
 import { getLogger } from '../../lib/logger.js';
 import { getProductDetails } from '../../lib/inventory-sync-service.js';
 import { scheduleStockHolds } from '../../lib/stock-holds.js';
+import { assignStockedToOlderOrders } from '../../lib/assign-arrived-stock.js';
 
 const router = express.Router();
 const logger = getLogger('receiving');
@@ -323,6 +324,7 @@ router.post('/pallets/:id/stock', authMiddleware, async (req: AuthRequest, res: 
       logger.info(`  ✓ ${item.quantity}x ${productDisplay}`);
     }
 
+    await assignStockedToOlderOrders([...syncedSkus]);
     // Push updated totals for all SKUs to Medusa
     const syncErrors: string[] = [];
     logger.info(`[pallet] Syncing ${syncedSkus.size} unique SKUs to Medusa...`);
@@ -543,7 +545,8 @@ router.post('/queue/:id/stock', authMiddleware, async (req: AuthRequest, res: Re
       [itemId]
     );
 
-    // Push WMS available (physical - reserved) to Medusa — no Medusa reservation needed
+    await assignStockedToOlderOrders([sku]);
+    // Available is shelf minus reserved, after older orders have been reserved.
     const totalResult = await query(
       `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
       [sku]
@@ -611,6 +614,7 @@ router.post('/queue/bulk-stock', authMiddleware, async (req: AuthRequest, res: R
       logger.info(`  ✓ ${item.quantity}x ${productDisplay}`);
     }
 
+    await assignStockedToOlderOrders([...syncedSkus]);
     // Push updated totals for all affected SKUs to Medusa
     const syncErrors: string[] = [];
     logger.info(`Syncing ${syncedSkus.size} unique SKUs to Medusa...`);

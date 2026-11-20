@@ -24,6 +24,7 @@ import { unblockBackorderedPickLists } from './pick-lists.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { deliveryNoteForSession, openDeliveryNote } from '../../lib/delivery-notes.js';
 import { pushAvailableStock } from '../../lib/medusa-inventory.js';
+import { assignStockedToOlderOrders } from '../../lib/assign-arrived-stock.js';
 import { resolveScan } from '../../lib/resolve-scan.js';
 
 async function enrichCheckinItems(items: any[]) {
@@ -374,6 +375,7 @@ router.post('/sessions/:id/items/:itemId/reconcile', authMiddleware, async (req:
       } finally {
         client.release();
       }
+      await assignStockedToOlderOrders([oldSku, newSku]);
       const syncErrors = await pushAvailableStock([oldSku, newSku]);
       if (syncErrors.length) console.error(`[checkin] Medusa sync failed: ${syncErrors.join('; ')}`);
     }

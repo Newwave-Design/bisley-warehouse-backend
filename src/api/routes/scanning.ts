@@ -8,6 +8,7 @@ import { parseSupercode, validateBarcodeExists } from '../../modules/scanning/ba
 import { query } from '../../db/index.js';
 import { authMiddleware } from '../../middleware/auth.js';
 import { pushAvailableStock } from '../../lib/medusa-inventory.js';
+import { assignStockedToOlderOrders } from '../../lib/assign-arrived-stock.js';
 
 const router = express.Router();
 
@@ -101,6 +102,7 @@ router.post('/inventory/receive', authMiddleware, async (req: Request, res: Resp
       [locationId, productSku, colourCode || null, quantity]
     );
 
+    await assignStockedToOlderOrders([productSku]);
     const syncErrors = await pushAvailableStock([productSku]);
 
     // Log the movement
