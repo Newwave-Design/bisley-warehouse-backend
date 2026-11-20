@@ -8,7 +8,7 @@
  */
 import { query } from '../db/index.js';
 import { extractColourCode } from './colour-names.js';
-import { ensureStockHolds, kitParts } from './stock-holds.js';
+import { ensureStockHolds, kitParts, lineCovered, trayPackParts } from './stock-holds.js';
 
 export const STANDARD_WEEKS = { min: 2, max: 4 };
 /** In-stock promise on orders placed before 9 Oct 2026. */
@@ -124,19 +124,19 @@ export async function getDeliveryDues(pickListIds: string[]): Promise<Record<str
       if (/SAMPLE/i.test(it.product_sku)) continue;
       if (Number(it.remaining) <= 0) continue;
       const parts = kitParts(it.product_sku, it.kit_components);
+      const units = parts.length ? parts : trayPackParts(it.product_sku);
       const assigned = holds.get(it.id) ?? new Map<string, number>();
       const required = Number(it.quantity_required) || 0;
-      const shortSkus = parts.length
-        ? parts.filter((part) => (assigned.get(part.sku) ?? 0) < part.per * required).map((part) => part.sku)
-        : ((assigned.get(it.product_sku) ?? 0) < required ? [it.product_sku] : []);
-      if (!shortSkus.length) continue;
+      const covered = lineCovered(it.product_sku, parts, assigned);
+      if (covered >= required) continue;
+      const shortSkus = units.length
+        ? units.filter((part) => (assigned.get(part.sku) ?? 0) < part.per * required).map((part) => part.sku)
+        : [it.product_sku];
       inStock = false;
       let lineWindow = backorderWeeks(shortSkus[0]);
       for (const sku of shortSkus) lineWindow = longer(lineWindow, backorderWeeks(sku));
       shortWindow = shortWindow ? longer(shortWindow, lineWindow) : lineWindow;
-      const got = parts.length
-        ? Math.min(...parts.map((part) => Math.floor((assigned.get(part.sku) ?? 0) / part.per)))
-        : (assigned.get(it.product_sku) ?? 0);
+      const got = covered;
       note(got > 0
         ? `Only ${got} of ${required} assigned: ${it.product_sku} (${lineWindow.min}-${lineWindow.max} weeks)`
         : `No stock assigned: ${it.product_sku} (${lineWindow.min}-${lineWindow.max} weeks)`);

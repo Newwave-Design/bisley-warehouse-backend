@@ -57,6 +57,16 @@ export function trayPackParts(sku: string): HoldPart[] {
   return [{ sku: `${match[1]}P1-000`, per: 5 }];
 }
 
+/**
+ * How many of this line the order has been given.
+ * A kit is limited by its shortest part. A pack of five is covered by five singles.
+ */
+export function lineCovered(sku: string, parts: HoldPart[], held: Map<string, number>): number {
+  const used = parts.length ? parts : trayPackParts(sku);
+  if (!used.length) return held.get(sku) ?? 0;
+  return Math.min(...used.map((part) => Math.floor((held.get(part.sku) ?? 0) / part.per)));
+}
+
 /** A pack in a bin is five singles. Those singles are not also kept as a separate pack. */
 export function applyKitStock(onHand: Map<string, number>, kits: { sku: string; parts: HoldPart[] }[]): Map<string, number> {
   const free = new Map(onHand);

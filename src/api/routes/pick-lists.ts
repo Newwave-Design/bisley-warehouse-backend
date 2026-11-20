@@ -12,7 +12,7 @@ import { consumeBoxesForShipments } from '../../lib/packaging-usage.js';
 import { paidSql, isPaid } from '../../lib/payment-status.js';
 import { scheduleAllocationRun } from '../../lib/allocation.js';
 import { splitPairView, unsplitPickList, UnsplitError } from '../../lib/unsplit.js';
-import { kitParts, refuseUnassignedPick } from '../../lib/stock-holds.js';
+import { kitParts, lineCovered, refuseUnassignedPick } from '../../lib/stock-holds.js';
 import { promotePickList } from '../../lib/pick-progress.js';
 import { toUuidOrNull } from './mobile.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -46,6 +46,7 @@ function formatPickListOverview(items: any[] | null | undefined) {
       sku: item.product_sku,
       colour_code: code || null,
       colour,
+      id: item.id || null,
       quantity_required: Number(item.quantity_required) || 0,
       quantity_picked: Number(item.quantity_picked) || 0,
       assigned: item.assigned == null ? null : Number(item.assigned) || 0,
@@ -443,6 +444,30 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
 
 const PICK_LIST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** Units of each line that this order has been given. The bay total stays on available_stock. */
+async function holdCoverage(groups: any[][]): Promise<any[][]> {
+  const itemIds = [...new Set(groups.flat().map((item) => String(item?.id || '')).filter((id) => PICK_LIST_ID.test(id)))];
+  const held = new Map<string, Map<string, number>>();
+  if (itemIds.length) {
+    const rows = await query(
+      `SELECT pick_list_item_id, sku, qty FROM order_stock_holds WHERE pick_list_item_id = ANY($1::uuid[])`,
+      [itemIds],
+    );
+    for (const row of rows.rows) {
+      if (!held.has(row.pick_list_item_id)) held.set(row.pick_list_item_id, new Map());
+      held.get(row.pick_list_item_id)!.set(row.sku, Number(row.qty) || 0);
+    }
+  }
+  return groups.map((items) => items.map((item) => {
+    if (item?.kit_header) return { ...item, assigned: null };
+    const sku = String(item?.sku || '');
+    if (/sample/i.test(sku)) return { ...item, assigned: Number(item.quantity_required) || 0 };
+    const bag = held.get(item?.id) ?? new Map<string, number>();
+    const parts = item?.kit_part ? [] : kitParts(sku, item?.kit_components);
+    return { ...item, assigned: lineCovered(sku, parts, bag) };
+  }));
+}
+
 /**
  * POST /api/pick-lists/enrichment
  * Due dates, kit lines and packaging for lists already shown. The desktop loads the rows first.
@@ -456,7 +481,7 @@ router.post('/enrichment', authMiddleware, async (req: Request, res: Response) =
     if (!ids.length) return res.json({ dues: {}, items: {} });
 
     const rows = await query(
-      `SELECT pick_list_id, product_sku, colour_code, item_title, quantity_required, quantity_picked, line_number
+      `SELECT id, pick_list_id, product_sku, colour_code, item_title, quantity_required, quantity_picked, line_number
        FROM pick_list_items
        WHERE pick_list_id = ANY($1::uuid[]) AND NOT COALESCE(is_archived, false)
        ORDER BY line_number`,
@@ -469,8 +494,9 @@ router.post('/enrichment', authMiddleware, async (req: Request, res: Response) =
       getDeliveryDues(ids),
       expandKitPicksByList(ordered).then((groups) => attachPackaging(groups)),
     ]);
+    const covered = await holdCoverage(expanded);
     const items: Record<string, unknown> = {};
-    ids.forEach((id, index) => { items[id] = expanded[index]; });
+    ids.forEach((id, index) => { items[id] = covered[index]; });
     return res.json({ dues, items });
   } catch (error) {
     console.error('Pick list enrichment failed', error);

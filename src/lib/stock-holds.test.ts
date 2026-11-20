@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { applyKitStock, planHolds, type HoldDemand } from './stock-holds.ts'
+import { applyKitStock, lineCovered, planHolds, type HoldDemand } from './stock-holds.ts'
 
 function line(partial: Partial<HoldDemand> & Pick<HoldDemand, 'itemId' | 'sku' | 'orderedAt'>): HoldDemand {
   return {
@@ -13,6 +13,15 @@ function line(partial: Partial<HoldDemand> & Pick<HoldDemand, 'itemId' | 'sku' |
     ...partial,
   }
 }
+
+test('a line is covered only by the units assigned to it', () => {
+  const held = new Map([['1623-bx6', 0], ['227P1-000', 5], ['TOP', 1], ['LEG', 0]])
+  assert.equal(lineCovered('1623-bx6', [], held), 0)
+  assert.equal(lineCovered('227P5-000', [], held), 1)
+  assert.equal(lineCovered('227P5-000', [], new Map([['227P1-000', 4]])), 0)
+  assert.equal(lineCovered('DESK', [{ sku: 'TOP', per: 1 }, { sku: 'LEG', per: 1 }], held), 0)
+  assert.equal(lineCovered('TOP', [], held), 1)
+})
 
 test('an older kit keeps the parts that are in stock', () => {
   const older = line({
