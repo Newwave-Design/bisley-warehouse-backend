@@ -17,7 +17,7 @@ import { outcomeChange } from '../../lib/return-booking-rules.js';
 import { openReturnReplacement, releaseReturnReplacement } from '../../lib/return-replacement.js';
 import { markReturnRequestsBooked, reopenReturnRequests } from '../../lib/return-requests.js';
 import { collectionDateRefused, weekdayCollectionDates, weekdaysAfter } from '../../lib/apc-days.js';
-import { apcAvailabilityItems, apcConsignmentSize, appropriateApcServices } from '../../lib/apc-service.js';
+import { apcAvailabilityItems, apcConsignmentSize, apcDutyItem, appropriateApcServices, northernIrelandPostcode } from '../../lib/apc-service.js';
 import { createRoyalMailParcel, deleteRoyalMailOrders, fetchRoyalMailLabelPdf, quoteRoyalMailParcels, readRoyalMailTracking, RoyalMailError, royalMailConfigured, type RoyalMailParcelFormat } from '../../lib/royal-mail.js';
 
 async function dropReplacements(pickListId: string | undefined, waybill: string, orderNumber = '') {
@@ -555,6 +555,11 @@ async function placeApcOrder(input: {
   customerParty: Record<string, unknown>;
   items: { Type: string; Weight: string; Length: string; Width: string; Height: string; Reference: string }[];
 }): Promise<{ ok: boolean; accepted: boolean; status: number; detail: string; order: any; waybill: string }> {
+  const deliveringTo = input.returning ? COLLECTION.PostalCode : String(input.customerParty.PostalCode || '')
+  const duty = northernIrelandPostcode(deliveringTo)
+  const shipped = duty
+    ? input.items.map((item) => ({ ...item, DutyItems: { DutyItem: apcDutyItem(item.Reference) } }))
+    : input.items
   const response = await fetch(ORDER_URL, {
     method: 'POST',
     headers: {
@@ -572,10 +577,10 @@ async function placeApcOrder(input: {
           Reference: input.reference,
           Collection: input.returning ? input.customerParty : COLLECTION,
           Delivery: input.returning ? COLLECTION : input.customerParty,
-          GoodsInfo: { GoodsValue: '50', Fragile: 'false' },
+          GoodsInfo: { GoodsValue: String(duty ? 50 * input.items.length : 50), Fragile: 'false' },
           ShipmentDetails: {
-            NumberOfPieces: String(input.items.length),
-            Items: { Item: input.items.length === 1 ? input.items[0] : input.items },
+            NumberOfPieces: String(shipped.length),
+            Items: { Item: shipped.length === 1 ? shipped[0] : shipped },
           },
         },
       },

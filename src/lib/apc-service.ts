@@ -93,6 +93,23 @@ export function apcAvailabilityItems<T>(boxes: ApcBox[], items: T[]): T[] {
   return largest.map((row) => items[row.index])
 }
 
+/** Northern Ireland needs a duty line on every box. Mainland postcodes do not. */
+export function northernIrelandPostcode(postcode: string): boolean {
+  return /^BT\d/i.test(postcode.replace(/\s+/g, ''))
+}
+
+/** Steel furniture, made in Great Britain. APC rejects a Northern Ireland order without these fields. */
+export function apcDutyItem(description: string): { Description: string; HTSCode: string; OriginCountry: string; Units: string; UnitValue: string } {
+  const text = description.replace(/\s+/g, ' ').trim()
+  return {
+    Description: (text || 'Metal furniture').slice(0, 50),
+    HTSCode: '9403208000',
+    OriginCountry: 'GB',
+    Units: '1',
+    UnitValue: '50',
+  }
+}
+
 /** How many boxes one APC order can carry for this product. Null when the booking stays as one consignment. */
 export function apcConsignmentSize(serviceCode: string): number | null {
   const code = serviceCode.trim().toUpperCase()

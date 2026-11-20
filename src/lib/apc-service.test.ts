@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { apcAvailabilityItems, apcConsignmentSize, appropriateApcServices } from './apc-service.ts'
+import { apcAvailabilityItems, apcConsignmentSize, apcDutyItem, appropriateApcServices, northernIrelandPostcode } from './apc-service.ts'
 
 const services = [
   { code: 'APCND16', name: 'Next day parcel', ruleMatch: false, ruleName: '' },
@@ -41,6 +41,13 @@ test('a Northern Ireland non-conveyable box uses the road service', () => {
   const chosen = appropriateApcServices(ireland, [box])
   assert.equal(chosen[0]?.code, 'APCRDNC')
   assert.equal(apcConsignmentSize('APCRDNC'), 4)
+})
+
+test('a Northern Ireland postcode needs a duty line', () => {
+  assert.equal(northernIrelandPostcode('BT67 0FD'), true)
+  assert.equal(northernIrelandPostcode('NP4 0HZ'), false)
+  assert.equal(apcDutyItem('Multidrawer').HTSCode, '9403208000')
+  assert.equal(apcDutyItem('Multidrawer').OriginCountry, 'GB')
 })
 
 test('six parcel boxes are quoted together', () => {
