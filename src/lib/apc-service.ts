@@ -5,8 +5,8 @@
  * Lightweight is one boxed item, 5kg, 45 × 35 × 20 cm.
  * Next day parcel is up to 20 items, 30kg each, 120 × 55 × 50 cm.
  * Non-conveyable is up to 4 items, 30kg each, 160 × 60 × 60 cm.
- * More than 4 still uses this service, as separate consignments of 4.
  * Anything larger stays on non-conveyable extra.
+ * More than 4 boxes on either of those is separate consignments of 4.
  *
  * A mainland postcode is offered the next-day product (APCNC16 and the
  * 10:30 / 12:00 versions). A remote postcode is offered the same size as a
@@ -41,7 +41,7 @@ const FAMILIES: Family[] = [
   { label: 'Lightweight', codes: ['APCLW16', 'APCLW12', 'APCLW10', 'APCTDLW'], maxPieces: 1, maxWeightKg: 5, limit: [45, 35, 20] },
   { label: 'Next day parcel', codes: ['APCND16', 'APCND12', 'APCND10', 'APCTDAY'], maxPieces: 20, maxWeightKg: 30, limit: [120, 55, 50] },
   { label: 'Non-conveyable', codes: ['APCNC16', 'APCNC12', 'APCNC10', 'APCTDNC'], maxPieces: 4, maxWeightKg: 30, limit: [160, 60, 60] },
-  { label: 'Non-conveyable extra', codes: ['APCYC16', 'APCYC12', 'APCYC10'], maxPieces: 2, maxWeightKg: 30, limit: null },
+  { label: 'Non-conveyable extra', codes: ['APCYC16', 'APCYC12', 'APCYC10'], maxPieces: 4, maxWeightKg: 30, limit: null },
 ]
 
 function serviceLabel(code: string, name: string, family: string): string {

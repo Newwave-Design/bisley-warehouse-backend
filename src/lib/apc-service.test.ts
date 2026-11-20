@@ -26,6 +26,15 @@ test('six non-conveyable boxes are quoted as the four largest', () => {
   assert.deepEqual(apcAvailabilityItems(boxes, [0, 1, 2, 3, 4, 5]), [2, 3, 4, 5])
 })
 
+test('non-conveyable extra also goes out in fours', () => {
+  const oversize = { weightKg: 20, lengthCm: 180, widthCm: 70, heightCm: 50 }
+  const extra = [{ code: 'APCYC16', name: 'Non-conveyable extra', ruleMatch: false, ruleName: '' }]
+  const chosen = appropriateApcServices(extra, Array.from({ length: 6 }, () => oversize))
+  assert.equal(chosen[0]?.code, 'APCYC16')
+  assert.equal(apcConsignmentSize('APCYC16'), 4)
+  assert.deepEqual(apcAvailabilityItems(Array.from({ length: 6 }, () => oversize), [0, 1, 2, 3, 4, 5]).length, 4)
+})
+
 test('six parcel boxes are quoted together', () => {
   const small = { weightKg: 4, lengthCm: 40, widthCm: 30, heightCm: 20 }
   const boxes = Array.from({ length: 6 }, () => small)
