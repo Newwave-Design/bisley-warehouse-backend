@@ -35,6 +35,14 @@ test('non-conveyable extra also goes out in fours', () => {
   assert.deepEqual(apcAvailabilityItems(Array.from({ length: 6 }, () => oversize), [0, 1, 2, 3, 4, 5]).length, 4)
 })
 
+test('a Northern Ireland non-conveyable box uses the road service', () => {
+  const ireland = [{ code: 'APCRDNC', name: 'ROAD SERVICE NON-CONVEYABLE', ruleMatch: true, ruleName: '' }]
+  const box = { weightKg: 13.6, lengthCm: 56, widthCm: 43, heightCm: 94 }
+  const chosen = appropriateApcServices(ireland, [box])
+  assert.equal(chosen[0]?.code, 'APCRDNC')
+  assert.equal(apcConsignmentSize('APCRDNC'), 4)
+})
+
 test('six parcel boxes are quoted together', () => {
   const small = { weightKg: 4, lengthCm: 40, widthCm: 30, heightCm: 20 }
   const boxes = Array.from({ length: 6 }, () => small)

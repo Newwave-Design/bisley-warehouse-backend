@@ -11,6 +11,7 @@
  * A mainland postcode is offered the next-day product (APCNC16 and the
  * 10:30 / 12:00 versions). A remote postcode is offered the same size as a
  * 2–5 day product (APCTDNC and the matching lightweight and parcel codes).
+ * Northern Ireland is the road non-conveyable product, APCRDNC.
  * Those slower products are listed after the next-day codes, so a next-day
  * service is kept when APC offers both.
  */
@@ -40,7 +41,7 @@ interface Family {
 const FAMILIES: Family[] = [
   { label: 'Lightweight', codes: ['APCLW16', 'APCLW12', 'APCLW10', 'APCTDLW'], maxPieces: 1, maxWeightKg: 5, limit: [45, 35, 20] },
   { label: 'Next day parcel', codes: ['APCND16', 'APCND12', 'APCND10', 'APCTDAY'], maxPieces: 20, maxWeightKg: 30, limit: [120, 55, 50] },
-  { label: 'Non-conveyable', codes: ['APCNC16', 'APCNC12', 'APCNC10', 'APCTDNC'], maxPieces: 4, maxWeightKg: 30, limit: [160, 60, 60] },
+  { label: 'Non-conveyable', codes: ['APCNC16', 'APCNC12', 'APCNC10', 'APCTDNC', 'APCRDNC'], maxPieces: 4, maxWeightKg: 30, limit: [160, 60, 60] },
   { label: 'Non-conveyable extra', codes: ['APCYC16', 'APCYC12', 'APCYC10'], maxPieces: 4, maxWeightKg: 30, limit: null },
 ]
 
