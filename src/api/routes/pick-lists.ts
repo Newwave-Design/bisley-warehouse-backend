@@ -26,6 +26,8 @@ import { actorName, PICK_LIST_STATUSES, recordPickListEvents, type PickListStatu
 import { fulfillPickListInMedusa, fulfillPickListsInMedusa } from '../../lib/medusa-fulfillment.js';
 import { buildSampleAddressZpl, formatSampleAddressLabel, formatShippingAddressText } from '../../lib/sample-address-label.js';
 import { attachPackaging } from '../../lib/pick-list-packaging.js';
+import { boxHoldsForItems } from '../../lib/box-holds.js';
+import { ensureStockHolds } from '../../lib/stock-holds.js';
 import { expandKitPicksByList } from '../../lib/pick-list-kits.js';
 import { confirmPartFulfilment, inspectPartFulfilment, PartFulfilError } from '../../lib/part-fulfilment.js';
 import { openPartsSend, PartsSendError } from '../../lib/parts-send.js';
@@ -478,7 +480,8 @@ router.post('/enrichment', authMiddleware, async (req: Request, res: Response) =
     const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : [])
       .map((id: unknown) => String(id || '').trim())
       .filter((id: string) => PICK_LIST_ID.test(id)))].slice(0, 2000);
-    if (!ids.length) return res.json({ dues: {}, items: {} });
+    if (!ids.length) return res.json({ dues: {}, items: {}, boxHolds: {} });
+    await ensureStockHolds();
 
     const rows = await query(
       `SELECT id, pick_list_id, product_sku, colour_code, item_title, quantity_required, quantity_picked, line_number
@@ -490,14 +493,15 @@ router.post('/enrichment', authMiddleware, async (req: Request, res: Response) =
     const grouped = new Map<string, any[]>(ids.map((id) => [id, []]));
     for (const row of rows.rows) grouped.get(row.pick_list_id)?.push(row);
     const ordered = ids.map((id) => formatPickListOverview(grouped.get(id)));
-    const [dues, expanded] = await Promise.all([
+    const [dues, expanded, boxHolds] = await Promise.all([
       getDeliveryDues(ids),
       expandKitPicksByList(ordered).then((groups) => attachPackaging(groups)),
+      boxHoldsForItems(ids),
     ]);
     const covered = await holdCoverage(expanded);
     const items: Record<string, unknown> = {};
     ids.forEach((id, index) => { items[id] = covered[index]; });
-    return res.json({ dues, items });
+    return res.json({ dues, items, boxHolds });
   } catch (error) {
     console.error('Pick list enrichment failed', error);
     return res.status(500).json({ error: 'Failed to load stock and due dates' });

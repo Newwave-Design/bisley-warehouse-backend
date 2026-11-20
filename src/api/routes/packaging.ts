@@ -10,6 +10,7 @@ import { toUuidOrNull } from './mobile.js';
 import { importPackagingSnapshot } from '../../lib/packaging-import.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
 import { loadPackagingReorder } from '../../lib/packaging-reorder.js';
+import { scheduleStockHolds } from '../../lib/stock-holds.js';
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -52,7 +53,14 @@ router.get('/items', async (req: Request, res: Response) => {
       conds.push(`(code ILIKE $${params.length} OR name ILIKE $${params.length} OR supplier_code ILIKE $${params.length})`);
     }
     const result = await query(
-      `SELECT * FROM packaging_items WHERE ${conds.join(' AND ')} ORDER BY item_type, code`,
+      `SELECT i.*, COALESCE(h.reserved, 0)::int AS reserved
+       FROM packaging_items i
+       LEFT JOIN (
+         SELECT packaging_item_id, SUM(qty)::int AS reserved
+         FROM order_box_holds
+         GROUP BY packaging_item_id
+       ) h ON h.packaging_item_id = i.id
+       WHERE ${conds.join(' AND ')} ORDER BY i.item_type, i.code`,
       params
     );
     res.json({ items: result.rows });
@@ -555,6 +563,7 @@ router.post('/movements', requirePermission('manage_settings'), async (req: Requ
       `UPDATE packaging_items SET stock_on_hand = stock_on_hand + $2, updated_at = NOW() WHERE id = $1`,
       [packaging_item_id, signed]
     );
+    scheduleStockHolds();
     res.status(201).json(move.rows[0]);
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to record movement', details: err.message });

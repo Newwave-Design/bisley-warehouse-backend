@@ -314,7 +314,7 @@ function addDays(now: Date, days: number): string {
 }
 
 export async function loadPackagingReorder(db: Sql = { query }, now = new Date(), search = '') {
-  const [items, usage, movements, waiting, boms, specs, families, preferred, cartons, demand] = await Promise.all([
+  const [items, usage, movements, waiting, boms, specs, families, held, preferred, cartons, demand] = await Promise.all([
     db.query(
       `SELECT id, code, name, item_type, stock_on_hand, stocked,
               COALESCE(NULLIF(extra->>'units_month', ''), '0')::numeric AS units_month
@@ -355,6 +355,11 @@ export async function loadPackagingReorder(db: Sql = { query }, now = new Date()
     ),
     db.query(OPEN_PARTS),
     db.query(
+      `SELECT packaging_item_id AS id, COALESCE(SUM(qty), 0)::int AS reserved
+       FROM order_box_holds
+       GROUP BY packaging_item_id`,
+    ).catch(() => ({ rows: [] as { id: string; reserved: number }[] })),
+    db.query(
       `SELECT upper(b.product_code) AS product_code, l.packaging_item_id::text AS item_id, l.qty
        FROM packaging_boms b
        JOIN packaging_bom_lines l ON l.bom_id = b.id
@@ -384,6 +389,8 @@ export async function loadPackagingReorder(db: Sql = { query }, now = new Date()
   }
   const waitingById = new Map<string, number>();
   for (const row of waiting.rows) waitingById.set(row.packaging_item_id, Number(row.qty) || 0);
+  const reservedById = new Map<string, number>();
+  for (const row of held.rows) reservedById.set(row.id, Number(row.reserved) || 0);
   const currentIds = new Set(preferred.rows.map((row) => String(row.item_id)));
   const preferredLines = preferred.rows.map((row) => ({
     productCode: String(row.product_code || ''),
@@ -420,6 +427,7 @@ export async function loadPackagingReorder(db: Sql = { query }, now = new Date()
       intake: moved.intake,
       on_orders: moved.onOrders,
       stock_on_hand: stock,
+      reserved: reservedById.get(item.id) || 0,
       per_week: Math.round(weekly * 10) / 10,
       rate_from: shippedWeekly > 0 ? 'shipped' : planned > 0 ? 'planned' : 'none',
       weeks_left: advice.weeksLeft == null ? null : Math.round(advice.weeksLeft * 10) / 10,

@@ -280,6 +280,13 @@ export async function ensurePackagingSchema() {
       ON return_requests (pick_list_id, sku)
       WHERE status <> 'cancelled'`,
     `ALTER TABLE return_requests ADD COLUMN IF NOT EXISTS outcome VARCHAR(20)`,
+    `CREATE TABLE IF NOT EXISTS order_box_holds (
+      pick_list_item_id UUID NOT NULL REFERENCES pick_list_items(id) ON DELETE CASCADE,
+      packaging_item_id UUID NOT NULL REFERENCES packaging_items(id) ON DELETE CASCADE,
+      qty INT NOT NULL CHECK (qty > 0),
+      PRIMARY KEY (pick_list_item_id, packaging_item_id)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_order_box_holds_box ON order_box_holds (packaging_item_id)`,
     `CREATE TABLE IF NOT EXISTS return_request_images (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       return_request_id UUID NOT NULL REFERENCES return_requests(id) ON DELETE CASCADE,

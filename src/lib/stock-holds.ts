@@ -8,6 +8,7 @@
  * This does not change quantity_reserved or the pay-when-sold ledger.
  */
 import { getPool, query } from '../db/index.js';
+import { computeBoxHolds } from './box-holds.js';
 
 export interface HoldPart { sku: string; per: number }
 
@@ -279,6 +280,7 @@ async function computeHolds(): Promise<void> {
   } finally {
     client.release();
   }
+  await computeBoxHolds();
 }
 
 /** Rebuilds the holds. A recent rebuild is reused unless force is set. */
