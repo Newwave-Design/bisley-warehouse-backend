@@ -12,10 +12,11 @@ const DX_MAX_WEIGHT_KG = 50;
 const DX_MAX_LENGTH_CM = 600;
 
 const SERVICES: { code: string; name: string; deliveryDays: number; saturday: boolean; preferred: boolean }[] = [
-  { code: 'ON', name: 'Overnight', deliveryDays: 1, saturday: false, preferred: true },
-  { code: '930', name: 'Overnight 9:30', deliveryDays: 1, saturday: false, preferred: false },
-  { code: 'AM', name: 'Overnight pre noon', deliveryDays: 1, saturday: false, preferred: false },
-  { code: '3D', name: 'Three day', deliveryDays: 3, saturday: false, preferred: false },
+  { code: '48', name: '48 hour', deliveryDays: 2, saturday: false, preferred: true },
+  { code: 'ON', name: 'Next day', deliveryDays: 1, saturday: false, preferred: false },
+  { code: '3D', name: '72 hour', deliveryDays: 3, saturday: false, preferred: false },
+  { code: '930', name: 'Next day by 9:30', deliveryDays: 1, saturday: false, preferred: false },
+  { code: 'AM', name: 'Next day by noon', deliveryDays: 1, saturday: false, preferred: false },
   { code: 'SAT', name: 'Saturday', deliveryDays: 0, saturday: true, preferred: false },
   { code: 'S93', name: 'Saturday 9:30', deliveryDays: 0, saturday: true, preferred: false },
 ];
