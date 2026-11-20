@@ -16,7 +16,8 @@ import { addDxCollection, addDxConsignment, collectionPhone, deleteDxConsignment
 import { outcomeChange } from '../../lib/return-booking-rules.js';
 import { openReturnReplacement, releaseReturnReplacement } from '../../lib/return-replacement.js';
 import { markReturnRequestsBooked, reopenReturnRequests } from '../../lib/return-requests.js';
-import { appropriateApcServices } from '../../lib/apc-service.js';
+import { collectionDateRefused, weekdayCollectionDates, weekdaysAfter } from '../../lib/apc-days.js';
+import { apcConsignmentSize, appropriateApcServices } from '../../lib/apc-service.js';
 import { createRoyalMailParcel, deleteRoyalMailOrders, fetchRoyalMailLabelPdf, quoteRoyalMailParcels, readRoyalMailTracking, RoyalMailError, royalMailConfigured, type RoyalMailParcelFormat } from '../../lib/royal-mail.js';
 
 async function dropReplacements(pickListId: string | undefined, waybill: string, orderNumber = '') {
@@ -112,12 +113,6 @@ function nextCollectionDate(now = new Date()): string {
   }
   const fallback = shiftLondonDate(1, now);
   return apcDate(fallback.year, fallback.month, fallback.day);
-}
-
-function todayCollectionDate(now = new Date()): string | null {
-  const parts = londonParts(now);
-  if (weekend(parts.weekday)) return null;
-  return apcDate(parts.year, parts.month, parts.day);
 }
 
 function londonStamp(now = new Date()): string {
@@ -243,18 +238,26 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
     Height: text(piece.heightCm, '1'),
     Reference: text(piece.reference),
   }));
-  const today = todayCollectionDate();
-  const dates = requestedDate
-    ? [requestedDate]
-    : [today, nextCollectionDate()].filter((date, index, list): date is string => Boolean(date) && list.indexOf(date) === index);
+  const boxes = items.map((item) => ({
+    weightKg: Number(item.Weight),
+    lengthCm: Number(item.Length),
+    widthCm: Number(item.Width),
+    heightCm: Number(item.Height),
+  }));
+  const candidates = requestedDate ? [requestedDate] : weekdayCollectionDates(8);
 
   try {
-    const quoted = await Promise.all(dates.map((collectionDate) => quoteCollectionDate(remoteUser, collectionDate, collectionPostcode, deliveryPostcode, items)));
-    const failed = quoted.find((entry) => !entry.ok);
-    if (failed) return res.status(502).json({ error: 'APC did not return a service list' });
-
     const byDate = new Map<string, QuotedService[]>();
-    for (const entry of quoted) {
+    let message: unknown = null;
+    let unreachable = 0;
+    for (const collectionDate of candidates) {
+      const entry = await quoteCollectionDate(remoteUser, collectionDate, collectionPostcode, deliveryPostcode, items);
+      if (!entry.ok) {
+        unreachable += 1;
+        if (requestedDate) break;
+        continue;
+      }
+      if (entry.message) message = entry.message;
       for (const service of entry.services) {
         if (!requestedDate && !openForBooking(service.latestBooking)) continue;
         const date = service.collectionDate || entry.collectionDate;
@@ -262,13 +265,10 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
         if (!list.some((existing) => existing.code === service.code)) list.push(service);
         byDate.set(date, list);
       }
+      const openDays = [...byDate.values()].filter((services) => appropriateApcServices(services, boxes).length).length;
+      if (!requestedDate && openDays >= 2) break;
     }
-    const boxes = items.map((item) => ({
-      weightKg: Number(item.Weight),
-      lengthCm: Number(item.Length),
-      widthCm: Number(item.Width),
-      heightCm: Number(item.Height),
-    }));
+    if (unreachable === candidates.length) return res.status(502).json({ error: 'APC did not return a service list' });
     const offered = [...byDate.entries()]
       .sort((left, right) => dateSortKey(left[0]) - dateSortKey(right[0]))
       .map(([date, services]) => ({ date, services }));
@@ -297,7 +297,7 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
         deliveryPostcode,
         collectionDate: agreedDate,
         collectionDates: exact,
-        message: quoted.find((entry) => entry.message)?.message || null,
+        message,
         services: exact[0].services,
       });
     }
@@ -307,9 +307,9 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
       pieces: items.length,
       collectionPostcode,
       deliveryPostcode,
-      collectionDate: collectionDates[0]?.date || dates[0] || nextCollectionDate(),
+      collectionDate: collectionDates[0]?.date || candidates[0] || nextCollectionDate(),
       collectionDates,
-      message: quoted.find((entry) => entry.message)?.message || null,
+      message,
       services,
     });
   } catch (error) {
@@ -522,6 +522,118 @@ function apcContactNumbers(value: string): { PhoneNumber: string; MobileNumber?:
   return { PhoneNumber: digits };
 }
 
+async function nextBookableApcDate(input: {
+  remoteUser: string;
+  after: string;
+  collectionPostcode: string;
+  deliveryPostcode: string;
+  items: { Type: string; Weight: string; Length: string; Width: string; Height: string; Reference: string }[];
+  boxes: { weightKg: number; lengthCm: number; widthCm: number; heightCm: number }[];
+  serviceCode: string;
+}): Promise<{ date: string; code: string; name: string } | null> {
+  for (const date of weekdaysAfter(input.after, 6)) {
+    const entry = await quoteCollectionDate(input.remoteUser, date, input.collectionPostcode, input.deliveryPostcode, input.items);
+    if (!entry.ok) continue;
+    const open = entry.services.filter((service) => openForBooking(service.latestBooking));
+    const fitting = appropriateApcServices(open, input.boxes);
+    const chosen = fitting.find((service) => service.code.toUpperCase() === input.serviceCode.toUpperCase())
+      || fitting.find((service) => service.ruleMatch)
+      || fitting[0];
+    if (!chosen) continue;
+    return { date: chosen.collectionDate || date, code: chosen.code, name: chosen.ruleName || chosen.name };
+  }
+  return null;
+}
+
+async function placeApcOrder(input: {
+  remoteUser: string;
+  collectionDate: string;
+  serviceCode: string;
+  reference: string;
+  returning: boolean;
+  customerParty: Record<string, unknown>;
+  items: { Type: string; Weight: string; Length: string; Width: string; Height: string; Reference: string }[];
+}): Promise<{ ok: boolean; accepted: boolean; status: number; detail: string; order: any; waybill: string }> {
+  const response = await fetch(ORDER_URL, {
+    method: 'POST',
+    headers: {
+      'remote-user': input.remoteUser,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      Orders: {
+        Order: {
+          CollectionDate: input.collectionDate,
+          ReadyAt: '09:00',
+          ClosedAt: '17:00',
+          ProductCode: input.serviceCode,
+          Reference: input.reference,
+          Collection: input.returning ? input.customerParty : COLLECTION,
+          Delivery: input.returning ? COLLECTION : input.customerParty,
+          GoodsInfo: { GoodsValue: '50', Fragile: 'false' },
+          ShipmentDetails: {
+            NumberOfPieces: String(input.items.length),
+            Items: { Item: input.items.length === 1 ? input.items[0] : input.items },
+          },
+        },
+      },
+    }),
+  });
+  const raw = await response.text();
+  let payload: any = null;
+  try { payload = JSON.parse(raw); } catch { payload = null; }
+  const order = asList<any>(payload?.Orders?.Order || payload?.Order)[0] || payload;
+  const message = order ? apcMessages(order) : { ok: false, detail: '' };
+  const waybill = order ? findWaybill(order) : '';
+  return {
+    ok: response.ok && Boolean(payload) && message.ok && Boolean(waybill),
+    accepted: response.ok && Boolean(payload) && message.ok,
+    status: response.status,
+    detail: message.detail,
+    order: payload ? order : null,
+    waybill,
+  };
+}
+
+function chunkRows<T>(rows: T[], size: number): T[][] {
+  const groups: T[][] = [];
+  for (let index = 0; index < rows.length; index += size) groups.push(rows.slice(index, index + size));
+  return groups;
+}
+
+async function cancelApcWaybill(remoteUser: string, waybill: string) {
+  if (!waybill) return;
+  await fetch(`https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(waybill)}.json?searchtype=CarrierWaybill`, {
+    method: 'PUT',
+    headers: { 'remote-user': remoteUser, 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ Orders: { Order: { Status: 'CANCELLED' } } }),
+  }).catch(() => undefined);
+}
+
+/** Every APC waybill booked with this one. A non-conveyable order over 4 boxes is several consignments. */
+async function apcConsignmentWaybills(booking: {
+  pick_list_id?: string
+  waybill?: string
+  direction?: string
+  collection_date?: string
+  created_at?: string
+}): Promise<string[]> {
+  const waybill = text(booking.waybill).trim();
+  if (!booking.pick_list_id || !booking.created_at) return waybill ? [waybill] : [];
+  const siblings = await query(
+    `SELECT DISTINCT waybill FROM collection_bookings
+      WHERE pick_list_id = $1
+        AND courier = 'APC'
+        AND status <> 'cancelled'
+        AND COALESCE(direction, 'outbound') = $2
+        AND COALESCE(collection_date, '') = $3
+        AND created_at BETWEEN $4::timestamptz - interval '2 minutes' AND $4::timestamptz + interval '2 minutes'`,
+    [booking.pick_list_id, booking.direction || 'outbound', booking.collection_date || '', booking.created_at]
+  );
+  return [...new Set([waybill, ...siblings.rows.map((row) => text(row.waybill).trim())].filter(Boolean))];
+}
+
 router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => {
   const returning = text(req.body?.direction).trim().toLowerCase() === 'return';
   const outcome = text(req.body?.outcome).trim().toLowerCase();
@@ -621,6 +733,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     let bookedName = serviceName;
     let collectionDate = (returning ? agreedDate : text(req.body?.collectionDate).trim()).slice(0, 40) || null;
     let savedPieces: { reference: string; trackingNumber: string; title: string; weightKg: string; lengthCm: string; widthCm: string; heightCm: string }[] = [];
+    let apcConsignments: { waybill: string; orderNumber: string; pieces: typeof savedPieces }[] = [];
 
     if (courier === 'RM') {
       if (returning) return res.status(400).json({ error: 'A return is collected by the courier that delivered it.' });
@@ -757,85 +870,117 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       ...(Object.keys(contact).length ? { Contact: contact } : {}),
     };
 
-    const response = await fetch(ORDER_URL, {
-      method: 'POST',
-      headers: {
-        'remote-user': remoteUser || '',
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        Orders: {
-          Order: {
-            CollectionDate: returning ? agreedDate : collectionDateOf(req.body?.collectionDate),
-            ReadyAt: '09:00',
-            ClosedAt: '17:00',
-            ProductCode: serviceCode,
-            Reference: reference,
-            Collection: returning ? customerParty : COLLECTION,
-            Delivery: returning ? COLLECTION : customerParty,
-            GoodsInfo: { GoodsValue: '50', Fragile: 'false' },
-            ShipmentDetails: {
-              NumberOfPieces: String(items.length),
-              Items: { Item: items.length === 1 ? items[0] : items },
-            },
-          },
-        },
-      }),
-    });
-    const raw = await response.text();
-    let payload: any = null;
-    try { payload = JSON.parse(raw); } catch { payload = null; }
-    const order = asList<any>(payload?.Orders?.Order || payload?.Order)[0] || payload;
-    const message = order ? apcMessages(order) : { ok: false, detail: '' };
-    waybill = order ? findWaybill(order) : '';
-    if (!response.ok || !payload || !message.ok) {
-      console.error('APC rejected the collection', message.detail || response.status);
-      return res.status(502).json({ error: message.detail || 'APC did not accept the collection. Nothing was saved.' });
-    }
-    if (!waybill) {
-      return res.status(502).json({ error: 'APC replied without a tracking number. Check APC before booking this order again.' });
-    }
-    if (returning) {
-      const bookedDay = text(order?.CollectionDate).trim();
-      if (bookedDay && bookedDay !== agreedDate) {
-        const orderNumber = text(order?.OrderNumber).trim();
-        const lookup = orderNumber || waybill;
-        await fetch(`https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(lookup)}.json${orderNumber ? '' : '?searchtype=CarrierWaybill'}`, {
-          method: 'PUT',
-          headers: { 'remote-user': remoteUser || '', 'Content-Type': 'application/json', Accept: 'application/json' },
-          body: JSON.stringify({ Orders: { Order: { Status: 'CANCELLED' } } }),
-        }).catch(() => undefined);
-        return res.status(409).json({ error: `APC booked ${bookedDay} instead of the agreed date ${agreedDate}. That collection was cancelled. Call the customer and agree another date.` });
-      }
-      collectionDate = agreedDate;
-    }
-
-    const tracked = asList<any>(order?.ShipmentDetails?.Items?.Item);
-    savedPieces = pieces.map((piece, index) => ({
-      reference: items[index].Reference,
-      trackingNumber: text(tracked[index]?.TrackingNumber || tracked.find((item) => text(item?.Reference) === items[index].Reference)?.TrackingNumber),
-      title: piece.title,
-      weightKg: piece.weightKg,
-      lengthCm: piece.lengthCm,
-      widthCm: piece.widthCm,
-      heightCm: piece.heightCm,
+    let attemptDate = returning ? agreedDate : collectionDateOf(req.body?.collectionDate);
+    const tried = new Set<string>();
+    const boxes = items.map((item) => ({
+      weightKg: Number(item.Weight),
+      lengthCm: Number(item.Length),
+      widthCm: Number(item.Width),
+      heightCm: Number(item.Height),
     }));
-    orderNumber = text(order?.OrderNumber).trim();
-    collectionDate = returning
-      ? agreedDate
-      : (text(order?.CollectionDate).trim() || text(req.body?.collectionDate).trim()).slice(0, 40) || null;
+    const pieceLimit = apcConsignmentSize(bookedService);
+    const itemGroups = pieceLimit && items.length > pieceLimit ? chunkRows(items, pieceLimit) : [items];
+    const pieceGroups = pieceLimit && pieces.length > pieceLimit ? chunkRows(pieces, pieceLimit) : [pieces];
+    const placedOrders: { waybill: string; orderNumber: string; pieces: typeof savedPieces }[] = [];
+    let failed = '';
+    for (let group = 0; group < itemGroups.length; group += 1) {
+      const groupItems = itemGroups[group];
+      const groupPieces = pieceGroups[group] || [];
+      const groupReference = itemGroups.length > 1 ? `${reference}-${group + 1}`.slice(0, 20) : reference;
+      let placed = await placeApcOrder({
+        remoteUser: remoteUser || '',
+        collectionDate: attemptDate,
+        serviceCode: bookedService,
+        reference: groupReference,
+        returning,
+        customerParty,
+        items: groupItems,
+      });
+      tried.add(attemptDate);
+      while (!placed.ok && !returning && collectionDateRefused(placed.detail) && tried.size < 6) {
+        const next = await nextBookableApcDate({
+          remoteUser: remoteUser || '',
+          after: attemptDate,
+          collectionPostcode: COLLECTION.PostalCode,
+          deliveryPostcode: delivery.postcode,
+          items: groupItems,
+          boxes: boxes.slice(group * (pieceLimit || boxes.length), group * (pieceLimit || boxes.length) + groupItems.length),
+          serviceCode: bookedService,
+        });
+        if (!next || tried.has(next.date)) break;
+        attemptDate = next.date;
+        bookedService = next.code;
+        bookedName = next.name || bookedName;
+        tried.add(attemptDate);
+        placed = await placeApcOrder({
+          remoteUser: remoteUser || '',
+          collectionDate: attemptDate,
+          serviceCode: bookedService,
+          reference: groupReference,
+          returning,
+          customerParty,
+          items: groupItems,
+        });
+      }
+      const order = placed.order;
+      if (!placed.accepted || !placed.waybill) {
+        failed = placed.detail || 'APC did not accept the collection. Nothing was saved.';
+        break;
+      }
+      if (returning) {
+        const bookedDay = text(order?.CollectionDate).trim();
+        if (bookedDay && bookedDay !== agreedDate) {
+          await cancelApcWaybill(remoteUser || '', placed.waybill);
+          failed = `APC booked ${bookedDay} instead of the agreed date ${agreedDate}. That collection was cancelled. Call the customer and agree another date.`;
+          break;
+        }
+        collectionDate = agreedDate;
+      }
+      const tracked = asList<any>(order?.ShipmentDetails?.Items?.Item);
+      const groupSaved = groupPieces.map((piece, index) => ({
+        reference: groupItems[index].Reference,
+        trackingNumber: text(tracked[index]?.TrackingNumber || tracked.find((item) => text(item?.Reference) === groupItems[index].Reference)?.TrackingNumber),
+        title: piece.title,
+        weightKg: piece.weightKg,
+        lengthCm: piece.lengthCm,
+        widthCm: piece.widthCm,
+        heightCm: piece.heightCm,
+      }));
+      placedOrders.push({
+        waybill: placed.waybill,
+        orderNumber: text(order?.OrderNumber).trim(),
+        pieces: groupSaved,
+      });
+      collectionDate = returning
+        ? agreedDate
+        : (text(order?.CollectionDate).trim() || attemptDate).slice(0, 40) || null;
+    }
+    if (placedOrders.length !== itemGroups.length) {
+      for (const placed of placedOrders) await cancelApcWaybill(remoteUser || '', placed.waybill);
+      console.error('APC rejected the collection', failed);
+      return res.status(failed.includes('agreed date') ? 409 : 502).json({ error: failed || 'APC did not accept the collection. Nothing was saved.' });
+    }
+    apcConsignments = placedOrders;
+    waybill = placedOrders[0]?.waybill || '';
+    orderNumber = placedOrders[0]?.orderNumber || '';
+    savedPieces = placedOrders.flatMap((placed) => placed.pieces);
     }
     const summary = [delivery.company, delivery.line1, delivery.city, delivery.postcode].filter(Boolean).join(', ');
     const collectionPostcode = returning ? delivery.postcode : COLLECTION.PostalCode;
     const deliveryPostcode = returning ? COLLECTION.PostalCode : delivery.postcode;
     const rowSkus = skus.length ? skus : [`extra-${Date.now().toString(36)}`];
+    const bookingRows = apcConsignments.length > 1
+      ? [
+          ...rowSkus.map((sku) => ({ sku, waybill: apcConsignments[0].waybill, orderNumber: apcConsignments[0].orderNumber, pieces: savedPieces })),
+          ...apcConsignments.slice(1).map((part, index) => ({ sku: `apc-${index + 2}`, waybill: part.waybill, orderNumber: part.orderNumber, pieces: part.pieces })),
+        ]
+      : rowSkus.map((sku) => ({ sku, waybill, orderNumber, pieces: savedPieces }));
 
     const client = await getPool().connect();
     const saved = [];
     try {
       await client.query('BEGIN');
-      for (const sku of rowSkus) {
+      for (const row of bookingRows) {
         const inserted = await client.query(
           `INSERT INTO collection_bookings
              (pick_list_id, sku, courier, service_code, service_name, waybill, apc_order_number,
@@ -843,7 +988,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
            VALUES ($1, $2, $12, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, 'booked', $11, $13, $14)
            RETURNING id, pick_list_id, sku, courier, service_code, service_name, waybill,
                      collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date, direction, outcome`,
-          [pickListId, sku, bookedService, bookedName || null, waybill, orderNumber || null, collectionPostcode, deliveryPostcode, summary, JSON.stringify(savedPieces), collectionDate, courier, returning ? 'return' : 'outbound', returning ? outcome : null]
+          [pickListId, row.sku, bookedService, bookedName || null, row.waybill, row.orderNumber || null, collectionPostcode, deliveryPostcode, summary, JSON.stringify(row.pieces), collectionDate, courier, returning ? 'return' : 'outbound', returning ? outcome : null]
         );
         saved.push(inserted.rows[0]);
       }
@@ -896,11 +1041,10 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         console.warn('Marking the booked order shipped failed', error instanceof Error ? error.message : 'failed');
       });
     }
-    for (const row of saved) {
-      if (row?.id) {
-        warmLabel(row.id, 'ZPL');
-        warmLabel(row.id, 'PDF');
-      }
+    const lead = saved.find((row) => row?.id);
+    if (lead?.id) {
+      warmLabel(lead.id, 'ZPL');
+      warmLabel(lead.id, 'PDF');
     }
     res.status(201).json({ booked: true, waybill, bookings: saved, replacement });
     if (!returning) {
@@ -1000,10 +1144,11 @@ async function labelsForPrint(bookingId: string, format: 'ZPL' | 'PDF'): Promise
 
 async function loadBookingLabels(id: string, format: 'ZPL' | 'PDF'): Promise<PrintedLabel[]> {
   const found = await query(
-    `SELECT id, waybill, apc_order_number, pieces, courier, status FROM collection_bookings WHERE id = $1`,
+    `SELECT id, pick_list_id, waybill, apc_order_number, pieces, courier, status, direction, collection_date, created_at
+       FROM collection_bookings WHERE id = $1`,
     [id]
   );
-  const booking = found.rows[0] as { waybill?: string; apc_order_number?: string; pieces?: { trackingNumber?: string }[]; courier?: string; status?: string } | undefined;
+  const booking = found.rows[0] as { pick_list_id?: string; waybill?: string; apc_order_number?: string; pieces?: { trackingNumber?: string }[]; courier?: string; status?: string; direction?: string; collection_date?: string; created_at?: string } | undefined;
   if (!booking || booking.status === 'cancelled') {
     throw Object.assign(new Error('Unknown booking'), { status: 404 });
   }
@@ -1053,20 +1198,34 @@ async function loadBookingLabels(id: string, format: 'ZPL' | 'PDF'): Promise<Pri
   if (!remoteUser) {
     throw Object.assign(new Error('APC login is not configured on this computer'), { status: 500 });
   }
-  const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(waybill)}.json?labelformat=${format}&markprinted=True&searchtype=CarrierWaybill&labels=True`;
-  const response = await fetch(url, {
-    headers: {
-      'remote-user': remoteUser,
-      Accept: 'application/json',
-    },
-  });
-  const raw = await response.text();
-  let payload: any = null;
-  try { payload = JSON.parse(raw); } catch { payload = null; }
-  const labels = payload ? collectLabels(payload) : [];
-  if (!response.ok || !labels.length) {
-    throw Object.assign(new Error('APC did not return the label. Print it again in a few seconds.'), { status: 502 });
+  const waybills = await apcConsignmentWaybills(booking);
+  const labels: PrintedLabel[] = [];
+  for (const number of waybills) {
+    const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(number)}.json?labelformat=${format}&markprinted=True&searchtype=CarrierWaybill&labels=True`;
+    const response = await fetch(url, {
+      headers: {
+        'remote-user': remoteUser,
+        Accept: 'application/json',
+      },
+    });
+    const raw = await response.text();
+    let payload: any = null;
+    try { payload = JSON.parse(raw); } catch { payload = null; }
+    const foundLabels = payload ? collectLabels(payload) : [];
+    if (!response.ok || !foundLabels.length) {
+      throw Object.assign(new Error('APC did not return the label. Print it again in a few seconds.'), { status: 502 });
+    }
+    labels.push(...foundLabels);
   }
+  const printed = new Set<string>();
+  const unique = labels.filter((label) => {
+    const key = `${label.trackingNumber}\n${label.content}`;
+    if (printed.has(key)) return false;
+    printed.add(key);
+    return true;
+  });
+  labels.length = 0;
+  labels.push(...unique);
   if (format === 'ZPL') {
     for (const label of labels) {
       const zpl = Buffer.from(label.content, 'base64').toString('latin1');
@@ -1102,12 +1261,12 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
 
   try {
     const found = await query(
-      `SELECT id, pick_list_id, waybill, apc_order_number, courier, status, direction
+      `SELECT id, pick_list_id, waybill, apc_order_number, courier, status, direction, collection_date, created_at
        FROM collection_bookings WHERE id = $1`,
       [id]
     );
     const booking = found.rows[0] as {
-      pick_list_id?: string; waybill?: string; apc_order_number?: string; courier?: string; status?: string; direction?: string
+      pick_list_id?: string; waybill?: string; apc_order_number?: string; courier?: string; status?: string; direction?: string; collection_date?: string; created_at?: string
     } | undefined;
     if (!booking) return res.status(404).json({ error: 'Unknown booking' });
     if (booking.status === 'cancelled') return res.json({ cancelled: true });
@@ -1183,44 +1342,50 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
     const remoteUser = authHeader();
     if (!remoteUser) return res.status(500).json({ error: 'APC login is not configured on this computer' });
 
-    const orderNumber = text(booking.apc_order_number).trim();
-    const lookup = orderNumber || waybill;
-    if (!lookup) return res.status(409).json({ error: 'This booking has no APC order to cancel.' });
-
-    const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(lookup)}.json${orderNumber ? '' : '?searchtype=CarrierWaybill'}`;
-    const response = await fetch(url, {
-      method: 'PUT',
-      headers: {
-        'remote-user': remoteUser,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({ Orders: { Order: { Status: 'CANCELLED' } } }),
-    });
-    const raw = await response.text();
-    let payload: any = null;
-    try { payload = JSON.parse(raw); } catch { payload = null; }
-    const order = payload ? (asList<any>(payload?.Orders?.Order || payload?.Order)[0] || payload) : null;
-    const message = order ? apcMessages(order) : { ok: false, detail: '' };
-    const detail = `${message.detail} ${raw}`.toLowerCase();
-    const alreadyGone = /cancel|not found|does not exist/.test(detail);
-    if ((!response.ok || !message.ok) && !alreadyGone) {
-      return res.status(502).json({ error: message.detail || 'APC did not cancel the collection. It is still booked here.' });
+    const waybills = await apcConsignmentWaybills(booking);
+    if (!waybills.length) return res.status(409).json({ error: 'This booking has no APC order to cancel.' });
+    const cancelled: string[] = [];
+    let cancelError = '';
+    for (const number of waybills) {
+      const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(number)}.json?searchtype=CarrierWaybill`;
+      const response = await fetch(url, {
+        method: 'PUT',
+        headers: {
+          'remote-user': remoteUser,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ Orders: { Order: { Status: 'CANCELLED' } } }),
+      });
+      const raw = await response.text();
+      let payload: any = null;
+      try { payload = JSON.parse(raw); } catch { payload = null; }
+      const order = payload ? (asList<any>(payload?.Orders?.Order || payload?.Order)[0] || payload) : null;
+      const message = order ? apcMessages(order) : { ok: false, detail: '' };
+      const detail = `${message.detail} ${raw}`.toLowerCase();
+      const alreadyGone = /cancel|not found|does not exist/.test(detail);
+      if ((!response.ok || !message.ok) && !alreadyGone) {
+        cancelError = message.detail || `APC did not cancel consignment ${number}. It is still booked here.`;
+        continue;
+      }
+      cancelled.push(number);
     }
-
-    await dropReplacements(booking.pick_list_id, waybill);
-    await query(
-      `UPDATE collection_bookings
-          SET status = 'cancelled', updated_at = NOW()
-        WHERE pick_list_id = $1 AND waybill = $2 AND status <> 'cancelled'`,
-      [booking.pick_list_id, waybill]
-    );
-    if (waybill && booking.direction !== 'return') {
+    if (cancelled.length) {
+      await dropReplacements(booking.pick_list_id, waybill);
+      await query(
+        `UPDATE collection_bookings
+            SET status = 'cancelled', updated_at = NOW()
+          WHERE pick_list_id = $1 AND waybill = ANY($2::text[]) AND status <> 'cancelled'`,
+        [booking.pick_list_id, cancelled]
+      );
+    }
+    if (cancelError) return res.status(502).json({ error: cancelError });
+    if (waybills.length && booking.direction !== 'return') {
       await query(
         `UPDATE pick_lists
             SET tracking_number = NULL, carrier = NULL, updated_at = NOW()
-          WHERE id = $1 AND tracking_number = $2`,
-        [booking.pick_list_id, waybill]
+          WHERE id = $1 AND tracking_number = ANY($2::text[])`,
+        [booking.pick_list_id, waybills]
       );
     }
     if (booking.pick_list_id && waybill && booking.direction !== 'return') {

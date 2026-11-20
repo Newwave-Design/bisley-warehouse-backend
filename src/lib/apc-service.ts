@@ -4,7 +4,8 @@
  *
  * Lightweight is one boxed item, 5kg, 45 × 35 × 20 cm.
  * Next day parcel is up to 20 items, 30kg each, 120 × 55 × 50 cm.
- * Non-conveyable is up to 2 items, 30kg each, 160 × 60 × 60 cm.
+ * Non-conveyable is up to 4 items, 30kg each, 160 × 60 × 60 cm.
+ * More than 4 still uses this service, as separate consignments of 4.
  * Anything larger stays on non-conveyable extra.
  *
  * A mainland postcode is offered the next-day product (APCNC16 and the
@@ -39,7 +40,7 @@ interface Family {
 const FAMILIES: Family[] = [
   { label: 'Lightweight', codes: ['APCLW16', 'APCLW12', 'APCLW10', 'APCTDLW'], maxPieces: 1, maxWeightKg: 5, limit: [45, 35, 20] },
   { label: 'Next day parcel', codes: ['APCND16', 'APCND12', 'APCND10', 'APCTDAY'], maxPieces: 20, maxWeightKg: 30, limit: [120, 55, 50] },
-  { label: 'Non-conveyable', codes: ['APCNC16', 'APCNC12', 'APCNC10', 'APCTDNC'], maxPieces: 2, maxWeightKg: 30, limit: [160, 60, 60] },
+  { label: 'Non-conveyable', codes: ['APCNC16', 'APCNC12', 'APCNC10', 'APCTDNC'], maxPieces: 4, maxWeightKg: 30, limit: [160, 60, 60] },
   { label: 'Non-conveyable extra', codes: ['APCYC16', 'APCYC12', 'APCYC10'], maxPieces: 2, maxWeightKg: 30, limit: null },
 ]
 
@@ -52,14 +53,26 @@ function sides(box: ApcBox): [number, number, number] {
   return [length, width, height]
 }
 
+function boxFits(box: ApcBox, family: Family): boolean {
+  if (!Number.isFinite(box.weightKg) || box.weightKg <= 0 || box.weightKg > family.maxWeightKg) return false
+  if (!family.limit) return true
+  const [length, width, height] = sides(box)
+  return length <= family.limit[0] && width <= family.limit[1] && height <= family.limit[2]
+}
+
 function fits(boxes: ApcBox[], family: Family): boolean {
-  if (!boxes.length || boxes.length > family.maxPieces) return false
-  return boxes.every((box) => {
-    if (!Number.isFinite(box.weightKg) || box.weightKg <= 0 || box.weightKg > family.maxWeightKg) return false
-    if (!family.limit) return true
-    const [length, width, height] = sides(box)
-    return length <= family.limit[0] && width <= family.limit[1] && height <= family.limit[2]
-  })
+  if (!boxes.length) return false
+  if (!boxes.every((box) => boxFits(box, family))) return false
+  if (boxes.length <= family.maxPieces) return true
+  return family.label === 'Non-conveyable' || family.label === 'Non-conveyable extra'
+}
+
+/** How many boxes one APC order can carry for this product. Null when the booking stays as one consignment. */
+export function apcConsignmentSize(serviceCode: string): number | null {
+  const code = serviceCode.trim().toUpperCase()
+  const family = FAMILIES.find((row) => row.codes.some((item) => item.toUpperCase() === code))
+  if (!family || family.label === 'Lightweight' || family.maxPieces >= 20) return null
+  return family.maxPieces
 }
 
 export function appropriateApcServices<T extends ApcServiceChoice>(services: T[], boxes: ApcBox[]): T[] {
