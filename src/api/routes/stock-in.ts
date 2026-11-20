@@ -31,6 +31,7 @@ import { getLogger } from '../../lib/logger.js';
 import { singleTrayFromFivePack } from '../../lib/insert-trays.js';
 import { assignBarcode } from '../../lib/assign-barcode.js';
 import { resolveScan } from '../../lib/resolve-scan.js';
+import { applyLineEditToScans } from '../../lib/stock-in-edit.js';
 
 /**
  * Hairpin legs are sold as one pack, and each pack is two legs.
@@ -515,6 +516,27 @@ router.patch('/sessions/:id/items/:itemId', authMiddleware, async (req: AuthRequ
       // A missing row must not fail the handheld sync. The scan is already stored.
       logger.warn(`[stock-in] Quantity update skipped for item ${req.params.itemId} on session ${req.params.id}`);
       return res.json({ success: true, skipped: true });
+    }
+
+    const scans = await query(
+      `SELECT id, quantity FROM checkin_scans
+       WHERE item_id = $1 AND removed_at IS NULL
+       ORDER BY scanned_at, id`,
+      [result.rows[0].id]
+    );
+    const stored = scans.rows.map((scan) => ({ id: String(scan.id), quantity: Number(scan.quantity) }));
+    if (stored.length === 0 && Number(quantity) > 0) {
+      await query(
+        `INSERT INTO checkin_scans (session_id, item_id, quantity, scanned_at) VALUES ($1, $2, $3, NOW())`,
+        [req.params.id, result.rows[0].id, quantity]
+      );
+    } else {
+      for (const scan of applyLineEditToScans(stored, Number(quantity))) {
+        const previous = stored.find((row) => row.id === scan.id);
+        if (previous && previous.quantity !== scan.quantity) {
+          await query(`UPDATE checkin_scans SET quantity = $1 WHERE id = $2`, [scan.quantity, scan.id]);
+        }
+      }
     }
 
     logger.info(`[stock-in] Updated item ${req.params.itemId} qty to ${quantity}`);
