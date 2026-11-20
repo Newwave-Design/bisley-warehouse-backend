@@ -59,6 +59,49 @@ export function weeklyFromPlan(unitsPerMonth: number): number {
   return unitsPerMonth / (52 / 12);
 }
 
+export interface CartonChoice { code: string; qty: number }
+
+/** Open orders that can take a new carton instead of this sleeve, tray, or edge guard. */
+export function cartonInstead(
+  itemId: string,
+  demand: { sku: string; qty: number }[],
+  preferred: { productCode: string; itemId: string; per: number }[],
+  cartons: { productCode: string; code: string }[],
+): CartonChoice[] {
+  const cartonByProduct = new Map<string, string>();
+  for (const row of cartons) {
+    const code = row.productCode.trim().toUpperCase();
+    if (code && row.code && !cartonByProduct.has(code)) cartonByProduct.set(code, row.code);
+  }
+  const mine = preferred.filter((row) => row.itemId === itemId && row.per > 0 && cartonByProduct.has(row.productCode.trim().toUpperCase()));
+  const totals = new Map<string, number>();
+  for (const line of demand) {
+    const sku = line.sku.trim().toUpperCase();
+    if (!sku || line.qty <= 0) continue;
+    let best: { productCode: string; per: number } | null = null;
+    for (const row of mine) {
+      const code = row.productCode.trim().toUpperCase();
+      if ((sku === code || sku.startsWith(`${code}-`)) && (!best || code.length > best.productCode.length)) best = { productCode: code, per: row.per };
+    }
+    if (!best) continue;
+    const carton = cartonByProduct.get(best.productCode);
+    if (!carton) continue;
+    totals.set(carton, (totals.get(carton) || 0) + Math.round(line.qty * best.per));
+  }
+  return [...totals]
+    .map(([code, qty]) => ({ code, qty }))
+    .filter((row) => row.qty > 0)
+    .sort((a, b) => a.code.localeCompare(b.code));
+}
+
+export function buyReason(waiting: number, weeksLeft: number | null, instead: CartonChoice[]): string {
+  const parts: string[] = [];
+  if (waiting > 0) parts.push(`${waiting} still to ship`);
+  if (weeksLeft != null && weeksLeft < PACKAGING_LEAD_WEEKS) parts.push('under 4 weeks of stock');
+  for (const alt of instead) parts.push(`or ${alt.code} ×${alt.qty} instead of the sleeve set`);
+  return parts.join(' · ');
+}
+
 interface BomLine {
   type: string;
 }
@@ -243,13 +286,35 @@ const WAITING = `
   GROUP BY i.id
 `;
 
+const OPEN_SKUS = `
+  SELECT upper(pli.product_sku) AS sku,
+         SUM(CASE WHEN pli.quantity_picked > 0 THEN pli.quantity_picked ELSE pli.quantity_required END)::int AS qty
+  FROM pick_lists pl
+  JOIN pick_list_items pli ON pli.pick_list_id = pl.id
+  WHERE pl.status NOT IN ('DISPATCHED', 'CANCELLED')
+    AND NOT COALESCE(pl.is_sandbox, false)
+    AND NOT COALESCE(pl.is_archived, false)
+    AND NOT COALESCE(pl.is_return, false)
+    AND NOT COALESCE(pli.is_archived, false)
+    AND NOT COALESCE(pli.is_custom, false)
+    AND upper(COALESCE(pli.product_sku, '')) NOT LIKE '%SAMPLE%'
+    AND CASE WHEN pli.quantity_picked > 0 THEN pli.quantity_picked ELSE pli.quantity_required END > 0
+    AND NOT EXISTS (
+      SELECT 1 FROM packaging_stock_movements m
+      WHERE m.pick_list_id = pl.id
+        AND m.movement_type = 'pack_usage'
+        AND m.extra->>'source' = 'shipment'
+    )
+  GROUP BY upper(pli.product_sku)
+`;
+
 function addDays(now: Date, days: number): string {
   const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + days));
   return next.toISOString().slice(0, 10);
 }
 
 export async function loadPackagingReorder(db: Sql = { query }, now = new Date(), search = '') {
-  const [items, usage, movements, waiting, boms, specs, families] = await Promise.all([
+  const [items, usage, movements, waiting, boms, specs, families, preferred, cartons, demand] = await Promise.all([
     db.query(
       `SELECT id, code, name, item_type, stock_on_hand, stocked,
               COALESCE(NULLIF(extra->>'units_month', ''), '0')::numeric AS units_month
@@ -289,6 +354,21 @@ export async function loadPackagingReorder(db: Sql = { query }, now = new Date()
        FROM packaging_product_specs WHERE is_active AND product_code IS NOT NULL`,
     ),
     db.query(OPEN_PARTS),
+    db.query(
+      `SELECT upper(b.product_code) AS product_code, l.packaging_item_id::text AS item_id, l.qty
+       FROM packaging_boms b
+       JOIN packaging_bom_lines l ON l.bom_id = b.id
+       WHERE b.is_active AND b.option_rank = 1 AND b.product_code IS NOT NULL`,
+    ),
+    db.query(
+      `SELECT upper(b.product_code) AS product_code, i.code
+       FROM packaging_boms b
+       JOIN packaging_bom_lines l ON l.bom_id = b.id
+       JOIN packaging_items i ON i.id = l.packaging_item_id AND i.item_type = 'box'
+       WHERE b.is_active AND b.option_rank = 2 AND lower(COALESCE(b.method, '')) = 'box'
+         AND b.product_code IS NOT NULL`,
+    ),
+    db.query(OPEN_SKUS),
   ]);
 
   const usedById = new Map<string, { used: number; firstAt: Date | null }>();
@@ -304,6 +384,14 @@ export async function loadPackagingReorder(db: Sql = { query }, now = new Date()
   }
   const waitingById = new Map<string, number>();
   for (const row of waiting.rows) waitingById.set(row.packaging_item_id, Number(row.qty) || 0);
+  const currentIds = new Set(preferred.rows.map((row) => String(row.item_id)));
+  const preferredLines = preferred.rows.map((row) => ({
+    productCode: String(row.product_code || ''),
+    itemId: String(row.item_id),
+    per: Number(row.qty) || 0,
+  }));
+  const cartonRows = cartons.rows.map((row) => ({ productCode: String(row.product_code || ''), code: String(row.code || '') }));
+  const openDemand = demand.rows.map((row) => ({ sku: String(row.sku || ''), qty: Number(row.qty) || 0 }));
 
   const packs = [];
   for (const item of items.rows) {
@@ -319,10 +407,12 @@ export async function loadPackagingReorder(db: Sql = { query }, now = new Date()
     const stock = Number(item.stock_on_hand) || 0;
     const moved = movedById.get(item.id) || { intake: 0, onOrders: 0 };
     const waitingQty = waitingById.get(item.id) || 0;
-    const tracked = ['box', 'sleeve', 'tray', 'foam'].includes(String(item.item_type || ''));
+    const tracked = ['box', 'sleeve', 'tray', 'foam', 'edge_guard'].includes(String(item.item_type || ''));
     if (!tracked && !(used && used.used > 0)) continue;
+    if (!currentIds.has(String(item.id)) && waitingQty === 0) continue;
     if (item.stocked === false && !(used && used.used > 0) && waitingQty === 0) continue;
     if (stock === 0 && weekly === 0 && waitingQty === 0) continue;
+    const instead = cartonInstead(String(item.id), openDemand, preferredLines, cartonRows);
     packs.push({
       code: item.code,
       name: item.name || item.code,
@@ -334,6 +424,8 @@ export async function loadPackagingReorder(db: Sql = { query }, now = new Date()
       rate_from: shippedWeekly > 0 ? 'shipped' : planned > 0 ? 'planned' : 'none',
       weeks_left: advice.weeksLeft == null ? null : Math.round(advice.weeksLeft * 10) / 10,
       waiting: waitingQty,
+      instead,
+      reason: buyReason(waitingQty, advice.weeksLeft, instead),
       order_qty: advice.orderQty,
       order_now: advice.orderNow,
       order_by: advice.orderInDays == null ? null : addDays(now, advice.orderInDays),

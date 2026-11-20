@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { familyHasPackaging, packagingReorder, weeklyFromPlan, weeklyFromShipments } from './packaging-reorder.ts';
+import { buyReason, cartonInstead, familyHasPackaging, packagingReorder, weeklyFromPlan, weeklyFromShipments } from './packaging-reorder.ts';
 
 const due = packagingReorder({ stock: 30, weekly: 10, waiting: 0 });
 assert.equal(due.orderNow, true);
@@ -31,5 +31,18 @@ assert.ok(Math.abs(weeklyFromPlan(88) - 88 / (52 / 12)) < 0.001);
 assert.equal(familyHasPackaging(['PFA3NH-AG8', 'PFHAWALNHCPK1'], (sku) => sku.startsWith('PFA3NH')), true);
 assert.equal(familyHasPackaging(['PIT580'], () => false), false);
 assert.equal(familyHasPackaging([], () => true), false);
+
+const fern = cartonInstead(
+  'sleeve',
+  [{ sku: 'FLDL04-BN6', qty: 2 }, { sku: 'H123NL-BX6', qty: 4 }],
+  [
+    { productCode: 'FLDL04', itemId: 'sleeve', per: 1 },
+    { productCode: 'FL', itemId: 'sleeve', per: 1 },
+  ],
+  [{ productCode: 'FLDL04', code: 'BOX-22' }],
+);
+assert.deepEqual(fern, [{ code: 'BOX-22', qty: 2 }]);
+assert.equal(buyReason(26, null, fern), '26 still to ship · or BOX-22 ×2 instead of the sleeve set');
+assert.equal(buyReason(0, 1.4, []), 'under 4 weeks of stock');
 
 console.log('packaging reorder checks passed');
