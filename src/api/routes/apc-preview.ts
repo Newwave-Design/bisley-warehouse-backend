@@ -17,7 +17,7 @@ import { outcomeChange } from '../../lib/return-booking-rules.js';
 import { openReturnReplacement, releaseReturnReplacement } from '../../lib/return-replacement.js';
 import { markReturnRequestsBooked, reopenReturnRequests } from '../../lib/return-requests.js';
 import { collectionDateRefused, weekdayCollectionDates, weekdaysAfter } from '../../lib/apc-days.js';
-import { apcConsignmentSize, appropriateApcServices } from '../../lib/apc-service.js';
+import { apcAvailabilityItems, apcConsignmentSize, appropriateApcServices } from '../../lib/apc-service.js';
 import { createRoyalMailParcel, deleteRoyalMailOrders, fetchRoyalMailLabelPdf, quoteRoyalMailParcels, readRoyalMailTracking, RoyalMailError, royalMailConfigured, type RoyalMailParcelFormat } from '../../lib/royal-mail.js';
 
 async function dropReplacements(pickListId: string | undefined, waybill: string, orderNumber = '') {
@@ -245,13 +245,14 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
     heightCm: Number(item.Height),
   }));
   const candidates = requestedDate ? [requestedDate] : weekdayCollectionDates(8);
+  const quoteItems = apcAvailabilityItems(boxes, items);
 
   try {
     const byDate = new Map<string, QuotedService[]>();
     let message: unknown = null;
     let unreachable = 0;
     for (const collectionDate of candidates) {
-      const entry = await quoteCollectionDate(remoteUser, collectionDate, collectionPostcode, deliveryPostcode, items);
+      const entry = await quoteCollectionDate(remoteUser, collectionDate, collectionPostcode, deliveryPostcode, quoteItems);
       if (!entry.ok) {
         unreachable += 1;
         if (requestedDate) break;

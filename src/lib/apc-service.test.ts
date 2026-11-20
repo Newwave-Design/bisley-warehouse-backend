@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { apcConsignmentSize, appropriateApcServices } from './apc-service.ts'
+import { apcAvailabilityItems, apcConsignmentSize, appropriateApcServices } from './apc-service.ts'
 
 const services = [
   { code: 'APCND16', name: 'Next day parcel', ruleMatch: false, ruleName: '' },
@@ -18,6 +18,18 @@ test('four non-conveyable boxes stay one APC service', () => {
 test('more than four non-conveyable boxes still offer the service so they can be split', () => {
   const chosen = appropriateApcServices(services, Array.from({ length: 6 }, () => heavy))
   assert.equal(chosen[0]?.code, 'APCNC16')
+})
+
+test('six non-conveyable boxes are quoted as the four largest', () => {
+  const small = { weightKg: 4, lengthCm: 40, widthCm: 30, heightCm: 20 }
+  const boxes = [small, small, heavy, heavy, heavy, heavy]
+  assert.deepEqual(apcAvailabilityItems(boxes, [0, 1, 2, 3, 4, 5]), [2, 3, 4, 5])
+})
+
+test('six parcel boxes are quoted together', () => {
+  const small = { weightKg: 4, lengthCm: 40, widthCm: 30, heightCm: 20 }
+  const boxes = Array.from({ length: 6 }, () => small)
+  assert.deepEqual(apcAvailabilityItems(boxes, boxes.map((_, index) => index)).length, 6)
 })
 
 test('small boxes stay on the next day parcel', () => {

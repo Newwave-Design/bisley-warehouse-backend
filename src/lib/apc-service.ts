@@ -67,6 +67,31 @@ function fits(boxes: ApcBox[], family: Family): boolean {
   return family.label === 'Non-conveyable' || family.label === 'Non-conveyable extra'
 }
 
+function familyFor(boxes: ApcBox[]): Family | null {
+  for (const family of FAMILIES) {
+    if (!boxes.every((box) => boxFits(box, family))) continue
+    if (boxes.length <= family.maxPieces) return family
+    if (family.label === 'Non-conveyable' || family.label === 'Non-conveyable extra') return family
+  }
+  return null
+}
+
+/**
+ * APC will not offer a service when the availability call has more boxes than that
+ * product allows. Ask about the largest boxes that fit in one consignment. The
+ * booking still sends every box, split into consignments of that size.
+ */
+export function apcAvailabilityItems<T>(boxes: ApcBox[], items: T[]): T[] {
+  if (!items.length || items.length !== boxes.length) return items
+  const family = familyFor(boxes)
+  if (!family || boxes.length <= family.maxPieces) return items
+  const largest = boxes
+    .map((box, index) => ({ index, size: box.lengthCm * box.widthCm * box.heightCm }))
+    .sort((left, right) => right.size - left.size || left.index - right.index)
+    .slice(0, family.maxPieces)
+  return largest.map((row) => items[row.index])
+}
+
 /** How many boxes one APC order can carry for this product. Null when the booking stays as one consignment. */
 export function apcConsignmentSize(serviceCode: string): number | null {
   const code = serviceCode.trim().toUpperCase()
