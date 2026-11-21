@@ -344,12 +344,13 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.last_event_by,
          pl.last_event_summary,
          EXISTS (SELECT 1 FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL) AS has_flag,
-         (SELECT LEFT(pln.note_text, 120) FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL ORDER BY pln.created_at DESC LIMIT 1) AS flag_preview,
+         (SELECT pln.note_text FROM pick_list_notes pln WHERE pln.pick_list_id = pl.id AND pln.is_flagged AND pln.resolved_at IS NULL ORDER BY pln.created_at DESC LIMIT 1) AS flag_preview,
          COUNT(pli.id) as item_count,
          SUM(CASE WHEN pli.status = 'PICKED' THEN 1 ELSE 0 END) as items_picked,
          SUM(CASE WHEN pli.product_sku ILIKE '%SAMPLE%' THEN 1 ELSE 0 END) as sample_item_count,
          SUM(CASE WHEN pli.product_sku ILIKE '%SAMPLE%' AND pli.status = 'PICKED' THEN 1 ELSE 0 END) as sample_items_picked,
          json_agg(json_build_object(
+           'id', pli.id,
            'product_sku', pli.product_sku,
            'colour_code', pli.colour_code,
            'item_title', ${lite ? 'pli.item_title' : 'COALESCE(wp.product_title, pli.item_title)'},
@@ -1183,6 +1184,20 @@ router.post('/:pickListId/notes', authMiddleware, async (req: AuthRequest, res: 
  * Edits the note text, raises or clears a flag, and resolves or reopens it.
  * Body: { note_text?: string, is_flagged?: boolean, resolved?: boolean }
  */
+router.get('/:pickListId/notes', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT id, note_text, is_flagged, created_at, resolved_at
+       FROM pick_list_notes WHERE pick_list_id = $1 ORDER BY created_at DESC`,
+      [req.params.pickListId]
+    );
+    return res.json({ notes: result.rows });
+  } catch (error) {
+    console.error('Pick list notes error:', error);
+    return res.status(500).json({ error: 'Could not load notes' });
+  }
+});
+
 router.patch('/:pickListId/notes/:noteId', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { pickListId, noteId } = req.params;
@@ -1281,15 +1296,34 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
     const itemsResult = await query(`SELECT * FROM pick_list_items WHERE pick_list_id = $1 ORDER BY line_number`, [pickListId]);
     const items = itemsResult.rows;
     const outstanding = items.filter(i => i.quantity_required - i.quantity_picked > 0);
+    const pickedIds = Array.isArray(req.body?.pick_item_ids)
+      ? [...new Set(req.body.pick_item_ids.map((id: unknown) => String(id || '').trim()).filter(Boolean))]
+      : null;
 
-    // Work out the shortfall per outstanding line against current physical stock
+    // Work out which lines leave this list. A chosen set sends those lines now and moves the rest, whole.
+    // With no choice, the shortfall against physical stock moves, as before.
     const shortItems: { item: any; shortQty: number }[] = [];
-    for (const item of outstanding) {
-      const remaining = item.quantity_required - item.quantity_picked;
-      const stockRow = await query(`SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE product_sku = $1`, [item.product_sku]);
-      const available = stockRow.rows[0].qty;
-      const shortQty = Math.max(0, Math.min(remaining, remaining - available));
-      if (shortQty > 0) shortItems.push({ item, shortQty });
+    if (pickedIds) {
+      const outstandingIds = new Set(outstanding.map(item => String(item.id)));
+      if (pickedIds.some(id => !outstandingIds.has(id))) {
+        return res.status(400).json({ error: 'Those lines are not on this order' });
+      }
+      if (!pickedIds.length || pickedIds.length === outstanding.length) {
+        return res.status(400).json({ error: 'Tick at least one line to send now, and leave at least one waiting' });
+      }
+      const sending = new Set(pickedIds);
+      for (const item of outstanding) {
+        if (sending.has(String(item.id))) continue;
+        shortItems.push({ item, shortQty: item.quantity_required - item.quantity_picked });
+      }
+    } else {
+      for (const item of outstanding) {
+        const remaining = item.quantity_required - item.quantity_picked;
+        const stockRow = await query(`SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE product_sku = $1`, [item.product_sku]);
+        const available = stockRow.rows[0].qty;
+        const shortQty = Math.max(0, Math.min(remaining, remaining - available));
+        if (shortQty > 0) shortItems.push({ item, shortQty });
+      }
     }
 
     if (!shortItems.length) {
@@ -1374,6 +1408,9 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
         query(`SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE product_sku = $1`, [item.product_sku]),
         query(`SELECT product_title FROM wms_products WHERE variant_sku = $1`, [item.product_sku]),
       ]);
+      const onShelf = Number(stockRow.rows[0].qty) || 0;
+      const reorderQty = pickedIds ? Math.max(0, Math.min(shortQty, shortQty - onShelf)) : shortQty;
+      if (reorderQty <= 0) continue;
 
       // Check if pending_reorder already exists for this backorder
       const existing = await query(
@@ -1386,7 +1423,7 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
         // Update existing pending_reorder with additional qty
         await query(
           `UPDATE pending_reorders SET qty_to_order = qty_to_order + $1, updated_at = NOW() WHERE id = $2`,
-          [shortQty, existing.rows[0].id]
+          [reorderQty, existing.rows[0].id]
         );
         prId = existing.rows[0].id;
       } else {
@@ -1395,7 +1432,7 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
           `INSERT INTO pending_reorders (sku, product_name, qty_to_order, current_stock, reorder_point, source, origin_pick_list_id)
            VALUES ($1, $2, $3, $4, 0, 'BACKORDER', $5)
            RETURNING id`,
-          [item.product_sku, productRow.rows[0]?.product_title ?? null, shortQty, stockRow.rows[0].qty, pickListId]
+          [item.product_sku, productRow.rows[0]?.product_title ?? null, reorderQty, stockRow.rows[0].qty, pickListId]
         );
         prId = prResult.rows[0].id;
         reorderRequestsCreated++;
@@ -1433,14 +1470,14 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
         // Update existing line item quantity
         await query(
           `UPDATE supplier_order_items SET quantity_ordered = quantity_ordered + $1, updated_at = NOW() WHERE id = $2`,
-          [shortQty, existingLineItem.rows[0].id]
+          [reorderQty, existingLineItem.rows[0].id]
         );
       } else {
         // Create new line item
         await query(
           `INSERT INTO supplier_order_items (supplier_order_id, product_sku, quantity_ordered, status, created_at, updated_at)
            VALUES ($1, $2, $3, 'PENDING', NOW(), NOW())`,
-          [soId, item.product_sku, shortQty]
+          [soId, item.product_sku, reorderQty]
         );
       }
 
