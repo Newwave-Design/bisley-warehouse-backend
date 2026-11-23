@@ -75,3 +75,11 @@ export function customerFromOrder(order: any): { customerName: string | null; cu
     shippingAddress: snapshot(destination, text(shipping?.country_code) || text(billing?.country_code)),
   }
 }
+
+/** The shop email to write onto open pick lists, or null when every copy already matches. */
+export function customerEmailChanged(stored: string[], incoming: string | null): string | null {
+  const next = (incoming ?? '').trim()
+  if (!next) return null
+  const differs = stored.some((email) => email.trim().toLowerCase() !== next.toLowerCase())
+  return differs ? next : null
+}

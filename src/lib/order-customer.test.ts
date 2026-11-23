@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { customerFromOrder } from './order-customer.js'
+import { customerEmailChanged, customerFromOrder } from './order-customer.js'
 
 const billingOnly = customerFromOrder({
   email: 'judy.tellingisat@gmail.com',
@@ -29,5 +29,12 @@ assert.equal(shippingWins.shippingAddress.address_1, '1 Road')
 
 const emailOnly = customerFromOrder({ email: 'only@example.com', shipping_address: { country_code: 'gb' } })
 assert.equal(emailOnly.customerName, 'only@example.com')
+
+assert.equal(customerEmailChanged(['old@example.com'], 'new@example.com'), 'new@example.com')
+assert.equal(customerEmailChanged(['new@example.com'], 'new@example.com'), null)
+assert.equal(customerEmailChanged([' New@example.com '], 'new@example.com'), null)
+assert.equal(customerEmailChanged([''], 'new@example.com'), 'new@example.com')
+assert.equal(customerEmailChanged(['old@example.com'], '  '), null)
+assert.equal(customerEmailChanged(['old@example.com', 'new@example.com'], 'new@example.com'), 'new@example.com')
 
 console.log('order-customer ok')

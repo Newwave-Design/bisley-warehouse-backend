@@ -22,7 +22,7 @@ import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { logError, logWarning } from '../../lib/logger.js';
 import { createNotification, createNotificationOnce } from '../../lib/notifications.js';
 import { splitOrderMatch } from '../../lib/order-values.js';
-import { customerFromOrder } from '../../lib/order-customer.js';
+import { customerEmailChanged, customerFromOrder } from '../../lib/order-customer.js';
 
 const router = express.Router();
 
@@ -177,21 +177,23 @@ export function reconcileOrders(opts: { days?: number; dryRun?: boolean } = {}):
 /**
  * Open-order sync: cancel, edit and refund events from Medusa are fire-and-forget, so every few minutes the order behind
  * each open pick list is re-read from Medusa and any missed cancellation, payment change or quantity edit is applied
- * through the same handlers the webhooks use. Orders that are split, already dispatched or have lines the WMS cannot
- * match by line id are left to the webhook path.
+ * through the same handlers the webhooks use. The customer email is copied again too, because a change in the shop
+ * does not send an event. Dispatched and cancelled lists are left as they were. Orders that are split or have lines
+ * the WMS cannot match by line id are left to the webhook path for quantity edits.
  */
-export interface OpenOrderSyncResult { dryRun: boolean; checked: number; cancelled: string[]; paymentChanged: string[]; edited: string[]; failed: string[] }
-const SYNC_FIELDS = 'id,display_id,status,payment_status,items.id,items.title,items.quantity,items.variant_id,items.product_id,items.variant_sku';
+export interface OpenOrderSyncResult { dryRun: boolean; checked: number; cancelled: string[]; paymentChanged: string[]; edited: string[]; emailChanged: string[]; failed: string[] }
+const SYNC_FIELDS = 'id,display_id,email,customer.email,status,payment_status,items.id,items.title,items.quantity,items.variant_id,items.product_id,items.variant_sku';
 const editsSeen = new Map<string, string>();
 let openSyncRunning = false;
 
 export async function syncOpenOrders(dryRun = false): Promise<OpenOrderSyncResult> {
-  const result: OpenOrderSyncResult = { dryRun, checked: 0, cancelled: [], paymentChanged: [], edited: [], failed: [] };
+  const result: OpenOrderSyncResult = { dryRun, checked: 0, cancelled: [], paymentChanged: [], edited: [], emailChanged: [], failed: [] };
   if (openSyncRunning) return result;
   openSyncRunning = true;
   try {
     const open = (await query(
       `SELECT split_part(medusa_order_id, '-', 1) AS id, array_agg(DISTINCT COALESCE(payment_status, '')) AS pays,
+              array_agg(DISTINCT COALESCE(customer_email, '')) AS emails,
               count(*)::int AS lists, bool_or(medusa_order_id = split_part(medusa_order_id, '-', 1)) AS has_parent
        FROM pick_lists
        WHERE NOT is_sandbox AND NOT is_archived AND status NOT IN ('DISPATCHED', 'CANCELLED') AND medusa_order_id LIKE 'order\\_%'
@@ -227,6 +229,18 @@ export async function syncOpenOrders(dryRun = false): Promise<OpenOrderSyncResul
             result.paymentChanged.push(`${label} -> ${o.payment_status}`);
             if (!dryRun) await storePaymentStatus(o.id, o.payment_status);
           }
+          const nextEmail = customerEmailChanged(info.emails ?? [], customerFromOrder(o).customerEmail);
+          if (nextEmail) {
+            result.emailChanged.push(`${label} -> ${nextEmail}`);
+            if (!dryRun) {
+              await query(
+                `UPDATE pick_lists SET customer_email = $2, updated_at = NOW()
+                 WHERE NOT is_sandbox AND NOT is_archived AND status NOT IN ('DISPATCHED', 'CANCELLED')
+                   AND ${splitOrderMatch('medusa_order_id', '$1')}`,
+                [o.id, nextEmail]
+              );
+            }
+          }
           const mine = wmsLines.get(o.id) ?? [];
           if (info.lists !== 1 || !info.has_parent || !mine.length || mine.some((l) => !l.line_id)) continue;
           const theirs = new Map<string, number>((o.items ?? []).filter((it: any) => it.id && Number(it.quantity) > 0).map((it: any) => [it.id, Number(it.quantity)]));
@@ -242,7 +256,7 @@ export async function syncOpenOrders(dryRun = false): Promise<OpenOrderSyncResul
         }
       }
     }
-    if (!dryRun && (result.cancelled.length || result.edited.length || result.paymentChanged.length || result.failed.length)) {
+    if (!dryRun && (result.cancelled.length || result.edited.length || result.paymentChanged.length || result.emailChanged.length || result.failed.length)) {
       await logWarning('WEBHOOK', 'Open-order sync applied changes Medusa did not send an event for', { ...result });
     }
     return result;

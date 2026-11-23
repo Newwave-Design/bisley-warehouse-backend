@@ -323,12 +323,12 @@ async function start() {
       setTimeout(() => { void runPaymentRefresh(); }, 20 * 1000);
       console.log('✓ Payment status refresh scheduled (every 3 min)');
 
-      // Open orders: cancellations, refunds and quantity edits Medusa did not send an event for are picked up here
+      // Open orders: cancellations, refunds, quantity edits and customer-email changes Medusa did not send an event for
       const runOpenOrderSync = async () => {
         try {
           const r = await syncOpenOrders(false);
-          if (r.cancelled.length || r.edited.length || r.paymentChanged.length) {
-            console.log(`[scheduler] Open-order sync: ${r.cancelled.length} cancelled, ${r.edited.length} edited, ${r.paymentChanged.length} payment change(s)`);
+          if (r.cancelled.length || r.edited.length || r.paymentChanged.length || r.emailChanged.length) {
+            console.log(`[scheduler] Open-order sync: ${r.cancelled.length} cancelled, ${r.edited.length} edited, ${r.paymentChanged.length} payment change(s), ${r.emailChanged.length} email change(s)`);
           }
         } catch (err) { console.warn('[scheduler] Open-order sync error:', err); }
       };
