@@ -56,6 +56,44 @@ test('six parcel boxes are quoted together', () => {
   assert.deepEqual(apcAvailabilityItems(boxes, boxes.map((_, index) => index)).length, 6)
 })
 
+test('timed products in one family keep their delivery window', () => {
+  const parcel = [
+    { code: 'APCND16', name: 'NEXT DAY', ruleMatch: false, ruleName: '' },
+    { code: 'APCND12', name: 'NEXT DAY BY 12', ruleMatch: false, ruleName: '' },
+    { code: 'APCND10', name: 'NEXT DAY BY 10:30', ruleMatch: false, ruleName: '' },
+  ]
+  const small = { weightKg: 4, lengthCm: 40, widthCm: 30, heightCm: 20 }
+  const chosen = appropriateApcServices(parcel, [small])
+  assert.deepEqual(chosen.map((row) => row.ruleName), [
+    'Next day parcel',
+    'Next day parcel by noon',
+    'Next day parcel by 10:30',
+  ])
+})
+
+test('a slower APC product keeps APC\'s own name', () => {
+  const remote = [{ code: 'APCTDAY', name: '2-5 day parcel', ruleMatch: false, ruleName: '' }]
+  const small = { weightKg: 4, lengthCm: 40, widthCm: 30, heightCm: 20 }
+  const chosen = appropriateApcServices(remote, [small])
+  assert.equal(chosen[0]?.ruleName, '2-5 day parcel')
+})
+
+test('lightweight and non-conveyable timed products name the window too', () => {
+  const light = { weightKg: 2, lengthCm: 40, widthCm: 30, heightCm: 15 }
+  const lightweight = appropriateApcServices([
+    { code: 'APCLW16', name: 'LIGHTWEIGHT', ruleMatch: false, ruleName: '' },
+    { code: 'APCLW12', name: 'LIGHTWEIGHT BY 12', ruleMatch: false, ruleName: '' },
+  ], [light])
+  assert.deepEqual(lightweight.map((row) => row.ruleName), ['Lightweight', 'Lightweight by noon'])
+
+  const heavy = { weightKg: 12, lengthCm: 94, widthCm: 56, heightCm: 43 }
+  const nonConveyable = appropriateApcServices([
+    { code: 'APCNC16', name: 'NON CONVEYABLE', ruleMatch: false, ruleName: '' },
+    { code: 'APCNC10', name: 'NON CONVEYABLE BY 10:30', ruleMatch: false, ruleName: '' },
+  ], [heavy])
+  assert.deepEqual(nonConveyable.map((row) => row.ruleName), ['Non-conveyable', 'Non-conveyable by 10:30'])
+})
+
 test('small boxes stay on the next day parcel', () => {
   const small = { weightKg: 4, lengthCm: 40, widthCm: 30, heightCm: 20 }
   const chosen = appropriateApcServices(services, Array.from({ length: 6 }, () => small))

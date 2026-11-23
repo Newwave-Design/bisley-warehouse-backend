@@ -9,7 +9,8 @@
  * More than 4 boxes on either of those is separate consignments of 4.
  *
  * A mainland postcode is offered the next-day product (APCNC16 and the
- * 10:30 / 12:00 versions). A remote postcode is offered the same size as a
+ * 10:30 / 12:00 versions). The 12 and 10 codes keep that time on the label.
+ * A remote postcode is offered the same size as a
  * 2–5 day product (APCTDNC and the matching lightweight and parcel codes).
  * Northern Ireland is the road non-conveyable product, APCRDNC.
  * Those slower products are listed after the next-day codes, so a next-day
@@ -45,8 +46,18 @@ const FAMILIES: Family[] = [
   { label: 'Non-conveyable extra', codes: ['APCYC16', 'APCYC12', 'APCYC10'], maxPieces: 4, maxWeightKg: 30, limit: null },
 ]
 
+/** APC's 10 and 12 products are the same family, delivered earlier in the day. */
+function deliveryWindow(code: string): string {
+  const product = code.toUpperCase()
+  if (product.endsWith('10')) return 'by 10:30'
+  if (product.endsWith('12')) return 'by noon'
+  return ''
+}
+
 function serviceLabel(code: string, name: string, family: string): string {
-  return code.toUpperCase().startsWith('APCTD') ? (name || family) : family
+  if (code.toUpperCase().startsWith('APCTD')) return name || family
+  const window = deliveryWindow(code)
+  return window ? `${family} ${window}` : family
 }
 
 function sides(box: ApcBox): [number, number, number] {
