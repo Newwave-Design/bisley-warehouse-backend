@@ -68,6 +68,7 @@ import { scheduleAllocationRun } from './lib/allocation.js';
 import { reconcileAvailableStock } from './lib/medusa-inventory.js';
 import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
 import { query as dbQueryUtil } from './db/index.js';
+import { devAuthAllowed, jwtSecret } from './lib/auth-config.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -178,6 +179,7 @@ async function start() {
   console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`🔌 Port: ${PORT}`);
   console.log(`🔐 JWT_SECRET configured: ${process.env.JWT_SECRET ? 'Yes' : 'No'}`);
+  if (!process.env.JWT_SECRET && !devAuthAllowed()) console.error('JWT_SECRET is not set: every login will be refused until it is.');
   console.log(`📦 DATABASE_URL: ${process.env.DATABASE_URL ? 'Set' : 'MISSING'}`);
   console.log(`🗄️ Node version: ${process.version}`);
   console.log('');
@@ -251,7 +253,7 @@ async function start() {
             const jwtModule = await import('jsonwebtoken');
             const token = jwtModule.default.sign(
               { sub: 'scheduler', email: 'scheduler@wms', role: 'MANAGER' },
-              process.env.JWT_SECRET || 'your_secret',
+              jwtSecret(),
               { expiresIn: '5m' }
             );
             await fetch(`http://localhost:${PORT}/api/genero/poll`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });

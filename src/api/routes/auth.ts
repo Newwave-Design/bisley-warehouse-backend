@@ -16,6 +16,7 @@ import jwt from 'jsonwebtoken';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { getEffectivePermissions } from '../../lib/permissions.js';
+import { jwtSecret } from '../../lib/auth-config.js';
 
 const router = express.Router();
 
@@ -51,7 +52,7 @@ router.post('/login', async (req: Request, res: Response) => {
 
     const token = jwt.sign(
       { sub: user.id, name: user.name, email: user.email, role: user.role, ...(device ? { dev: true } : {}) },
-      process.env.JWT_SECRET || 'your_secret',
+      jwtSecret(),
       { expiresIn: device ? DEVICE_TOKEN_TTL : USER_TOKEN_TTL }
     );
 
@@ -72,7 +73,7 @@ router.post('/refresh', async (req: Request, res: Response) => {
 
     let decoded: any;
     try {
-      decoded = jwt.verify(old, process.env.JWT_SECRET || 'your_secret', { ignoreExpiration: true });
+      decoded = jwt.verify(old, jwtSecret(), { ignoreExpiration: true });
     } catch {
       return res.status(401).json({ error: 'Invalid token' });
     }
@@ -93,7 +94,7 @@ router.post('/refresh', async (req: Request, res: Response) => {
     const isDevice = decoded.dev === true;
     const token = jwt.sign(
       { sub: user.id, name: user.name, email: user.email, role: user.role, ...(isDevice ? { dev: true } : {}) },
-      process.env.JWT_SECRET || 'your_secret',
+      jwtSecret(),
       { expiresIn: isDevice ? DEVICE_TOKEN_TTL : USER_TOKEN_TTL }
     );
     res.json({ token });
@@ -155,7 +156,7 @@ router.post('/promote-to-admin', authMiddleware, async (req: AuthRequest, res: R
 
     const token = jwt.sign(
       { sub: user.id, name: user.name, email: user.email, role: user.role },
-      process.env.JWT_SECRET || 'your_secret',
+      jwtSecret(),
       { expiresIn: '30d' }
     );
 
@@ -250,7 +251,7 @@ router.post('/accept-invite', async (req: Request, res: Response) => {
 
     const jwtToken = jwt.sign(
       { sub: invite.id, name: invite.name, email: invite.email, role: invite.role },
-      process.env.JWT_SECRET || 'your_secret',
+      jwtSecret(),
       { expiresIn: '30d' }
     );
 

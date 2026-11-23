@@ -7,6 +7,7 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { getEffectivePermission } from '../lib/permissions.js';
 import { query } from '../db/index.js';
+import { demoToken, devAuthAllowed, jwtSecret } from '../lib/auth-config.js';
 
 export interface AuthRequest extends Request {
   user?: {
@@ -16,11 +17,7 @@ export interface AuthRequest extends Request {
   };
 }
 
-// Exact-match demo token used by internal scripts/tests (JWT_SECRET is not
-// known to callers using this). NOT a wildcard — any other token must pass
-// real jwt.verify() below. Overridable per-environment via DEMO_AUTH_TOKEN.
-const DEMO_TOKEN = process.env.DEMO_AUTH_TOKEN
-  || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJhZG1pbkBiaXNsZXkuY29tIiwicm9sZSI6Ik1BTkFHRVIifQ.demo';
+// Exact-match demo token for internal scripts, only when DEMO_AUTH_TOKEN is set (see lib/auth-config.ts).
 
 // The demo token and dev-mode fallback both attach this synthetic id — there's
 // no real warehouse_users row for it, so the active-status check below skips it.
@@ -31,8 +28,8 @@ export async function authMiddleware(req: AuthRequest, res: Response, next: Next
     const token = req.headers.authorization?.replace('Bearer ', '');
 
     if (!token) {
-      // In development, allow requests without token
-      if (process.env.NODE_ENV !== 'production') {
+      // Local development only: allow requests without token
+      if (devAuthAllowed()) {
         req.user = { id: '1', email: 'dev@bisley.com', role: 'MANAGER' };
         return next();
       }
@@ -41,13 +38,14 @@ export async function authMiddleware(req: AuthRequest, res: Response, next: Next
 
     // Exact-match demo token — not a shape-based bypass. Every other token,
     // including any other 3-part string, must pass signature verification.
-    if (token === DEMO_TOKEN) {
+    const demo = demoToken();
+    if (demo && token === demo) {
       req.user = { id: '1', email: 'admin@bisley.com', role: 'MANAGER' };
       return next();
     }
 
     // Standard JWT verification — validates the signature against JWT_SECRET
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your_secret') as any;
+    const decoded = jwt.verify(token, jwtSecret()) as any;
     const userId = decoded.id || decoded.sub;
 
     // A JWT stays cryptographically valid for up to 30 days regardless of what
@@ -70,8 +68,8 @@ export async function authMiddleware(req: AuthRequest, res: Response, next: Next
 
     next();
   } catch (error) {
-    // In development/non-production, allow the request to proceed without valid auth
-    if (process.env.NODE_ENV !== 'production') {
+    // Local development only: allow the request to proceed without valid auth
+    if (devAuthAllowed()) {
       console.warn('Auth error (allowed in dev):', error);
       req.user = { id: '1', email: 'dev@bisley.com', role: 'MANAGER' };
       return next();
