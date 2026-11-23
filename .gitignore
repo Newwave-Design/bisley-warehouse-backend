@@ -28,3 +28,6 @@ scripts/
 PHASE_*.md
 
 catalogue-sync-audit-report.json
+
+# Local one-off scripts (may hold carrier logins)
+tmp-*.mjs
