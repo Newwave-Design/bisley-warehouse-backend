@@ -1296,6 +1296,7 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
     const itemsResult = await query(`SELECT * FROM pick_list_items WHERE pick_list_id = $1 ORDER BY line_number`, [pickListId]);
     const items = itemsResult.rows;
     const outstanding = items.filter(i => i.quantity_required - i.quantity_picked > 0);
+    const sampleSplit = req.body?.samples === true;
     const pickedIds = Array.isArray(req.body?.pick_item_ids)
       ? [...new Set(req.body.pick_item_ids.map((id: unknown) => String(id || '').trim()).filter(Boolean))]
       : null;
@@ -1354,15 +1355,16 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
            is_sandbox, notes, created_at, updated_at,
            payment_status, purchase_order_number, named_delivery_on
          )
-         VALUES ($1, $2, 'AWAITING_STOCK', $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, NOW(), $12, $13, $14)
+         VALUES ($1, $2, $15, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, NOW(), $12, $13, $14)
          RETURNING id`,
         [
           childOrderId, childPickListNumber, pickListId,
           pl.customer_name, pl.customer_email, pl.shipping_method_name, pl.shipping_method_code,
           JSON.stringify(pl.shipping_address || {}), pl.is_sandbox,
-          `Split from ${baseNumber} — awaiting stock`,
+          sampleSplit ? `Split from ${baseNumber} — remaining colours` : `Split from ${baseNumber} — awaiting stock`,
           pl.created_at,
           pl.payment_status, pl.purchase_order_number, pl.named_delivery_on,
+          sampleSplit ? 'PENDING' : 'AWAITING_STOCK',
         ]
       );
       const childId = child.rows[0].id;
@@ -1392,9 +1394,9 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
       // The ready lines keep this list, now numbered as the pick-list part. The time moves so the scanner re-downloads it.
       await query(
         `UPDATE pick_lists
-         SET pick_list_number = $2, planned_at = COALESCE(planned_at, NOW()), updated_at = NOW()
+         SET pick_list_number = $2, planned_at = CASE WHEN $3 THEN planned_at ELSE COALESCE(planned_at, NOW()) END, updated_at = NOW()
          WHERE id = $1`,
-        [pickListId, pickPartNumber]
+        [pickListId, pickPartNumber, sampleSplit]
       );
     }
 
@@ -1403,7 +1405,7 @@ router.post('/:pickListId/split-backorder', authMiddleware, requirePermission('m
     let reorderRequestsCreated = 0;
     let supplierOrdersCreated = 0;
     
-    for (const { item, shortQty } of shortItems) {
+    for (const { item, shortQty } of sampleSplit ? [] : shortItems) {
       const [stockRow, productRow] = await Promise.all([
         query(`SELECT COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory WHERE product_sku = $1`, [item.product_sku]),
         query(`SELECT product_title FROM wms_products WHERE variant_sku = $1`, [item.product_sku]),
