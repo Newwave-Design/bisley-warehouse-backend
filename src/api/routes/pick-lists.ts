@@ -35,6 +35,7 @@ import { openPartsSend, PartsSendError } from '../../lib/parts-send.js';
 import { stockReservations, takeReservedItem } from '../../lib/stock-reservations.js';
 import { addReturnRequestImage, cancelReturnRequests, deleteReturnRequestImage, listReturnRequests, requestReturns, returnRequestImage, ReturnRequestError } from '../../lib/return-requests.js';
 import { isWorkingIsoDay } from '../../lib/working-days.js';
+import { loadHoldups } from '../../lib/order-holdup.js';
 
 const router = express.Router();
 
@@ -472,6 +473,24 @@ async function holdCoverage(groups: any[][]): Promise<any[][]> {
     return { ...item, assigned: lineCovered(sku, parts, bag) };
   }));
 }
+
+/**
+ * POST /api/pick-lists/holdup
+ * What is holding each order up: stage, whether it is on a pick list, missing stock or packaging, and the queue.
+ * Body: { ids: string[] } (at most 50). Read only.
+ */
+router.post('/holdup', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : [])
+      .map((id: unknown) => String(id || '').trim())
+      .filter((id: string) => PICK_LIST_ID.test(id)))].slice(0, 50) as string[];
+    if (!ids.length) return res.json({ holdups: {} });
+    return res.json({ holdups: await loadHoldups(ids) });
+  } catch (error) {
+    console.error('Pick list hold-up failed', error);
+    return res.status(500).json({ error: 'Failed to read what is holding these orders up' });
+  }
+});
 
 /**
  * POST /api/pick-lists/enrichment
