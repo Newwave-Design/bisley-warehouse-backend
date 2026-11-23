@@ -4,6 +4,8 @@
  * https://api.parcel.royalmail.com/api/v1
  */
 
+import { isWorkingDay } from './working-days.js';
+
 const BASE = 'https://api.parcel.royalmail.com/api/v1';
 
 export class RoyalMailError extends Error {
@@ -44,16 +46,28 @@ export function royalMailSampleWeightGrams(): number {
   return Math.min(750, Math.max(1, Math.round(weight)));
 }
 
+const TIMEOUT_MS = 30_000;
+
 async function royalMail(path: string, init: RequestInit = {}): Promise<Response> {
-  return fetch(`${BASE}${path}`, {
-    ...init,
-    headers: {
-      Authorization: authHeader(),
-      Accept: 'application/json',
-      ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-      ...(init.headers || {}),
-    },
-  });
+  try {
+    return await fetch(`${BASE}${path}`, {
+      ...init,
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+      headers: {
+        Authorization: authHeader(),
+        Accept: 'application/json',
+        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(init.headers || {}),
+      },
+    });
+  } catch (error) {
+    if (error instanceof RoyalMailError) throw error;
+    // A create that got no reply may still have been made, so never say nothing was booked.
+    if (init.method === 'POST' && path === '/orders') {
+      throw new RoyalMailError('Royal Mail did not reply. Check Click & Drop for this order before booking it again.');
+    }
+    throw new RoyalMailError('Could not reach Royal Mail.');
+  }
 }
 
 function errorText(payload: any, fallback: string): string {
@@ -274,7 +288,7 @@ function shiftLondon(day: { year: number; month: number; day: number }, days: nu
 
 function nextWeekday(day: ReturnType<typeof londonDay>) {
   let cursor = day;
-  do { cursor = { ...shiftLondon(cursor, 1), hour: 12 }; } while (cursor.weekday === 'Sat' || cursor.weekday === 'Sun');
+  do { cursor = { ...shiftLondon(cursor, 1), hour: 12 }; } while (!isWorkingDay(cursor));
   return cursor;
 }
 
@@ -354,7 +368,7 @@ export async function quoteRoyalMailParcels(input: { postcode: string; pieces: P
   const postcode = input.postcode.trim().toUpperCase();
   const heaviest = Math.max(...input.pieces.map((piece) => Math.round(Number(piece.weightKg) * 1000)));
   const today = londonDay();
-  const days = today.weekday === 'Sat' || today.weekday === 'Sun' || today.hour >= 16
+  const days = !isWorkingDay(today) || today.hour >= 16
     ? [nextWeekday(today)]
     : [today, nextWeekday(today)];
   const offered: RoyalMailQuotedService[] = [];

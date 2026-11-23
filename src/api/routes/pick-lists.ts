@@ -34,6 +34,7 @@ import { confirmPartFulfilment, inspectPartFulfilment, PartFulfilError } from '.
 import { openPartsSend, PartsSendError } from '../../lib/parts-send.js';
 import { stockReservations, takeReservedItem } from '../../lib/stock-reservations.js';
 import { addReturnRequestImage, cancelReturnRequests, deleteReturnRequestImage, listReturnRequests, requestReturns, returnRequestImage, ReturnRequestError } from '../../lib/return-requests.js';
+import { isWorkingIsoDay } from '../../lib/working-days.js';
 
 const router = express.Router();
 
@@ -613,11 +614,24 @@ router.post('/bulk-status', authMiddleware, async (req: AuthRequest, res: Respon
   try {
     const status = parseStatus(req.body?.status);
     if (!status) return res.status(400).json({ error: 'Unknown status' });
-    const ids = Array.isArray(req.body?.pickListIds)
+    let ids = Array.isArray(req.body?.pickListIds)
       ? [...new Set((req.body.pickListIds as unknown[]).map((id) => String(id || '').trim()).filter(Boolean))]
       : [];
     if (!ids.length) return res.status(400).json({ error: 'Select at least one pick list' });
-    if (status === 'DISPATCHED') await takeStockForShippedLists(ids, req.user?.id);
+    let unpaid: string[] = [];
+    if (status === 'DISPATCHED') {
+      // Same rule as PATCH /:id/dispatch: an unpaid order is not shipped.
+      const lists = await query(
+        `SELECT id, pick_list_number, is_sandbox, payment_status, purchase_order_number FROM pick_lists WHERE id = ANY($1::uuid[])`,
+        [ids],
+      );
+      const refused = lists.rows.filter((row) => !isPaid(row));
+      unpaid = refused.map((row) => row.pick_list_number || row.id);
+      const blocked = new Set(refused.map((row) => row.id));
+      ids = ids.filter((id) => !blocked.has(id));
+      if (!ids.length) return res.status(409).json({ error: `Not paid yet, so not marked shipped: ${unpaid.join(', ')}`, unpaid });
+      await takeStockForShippedLists(ids, req.user?.id);
+    }
     await recordPickListEvents({
       ids,
       actor: actorName(req.user),
@@ -629,7 +643,7 @@ router.post('/bulk-status', authMiddleware, async (req: AuthRequest, res: Respon
     if (status === 'DISPATCHED') {
       medusa_sync = await fulfillPickListsInMedusa(ids);
     }
-    return res.json({ success: true, updated: ids.length, status, medusa_sync });
+    return res.json({ success: true, updated: ids.length, status, medusa_sync, unpaid: unpaid.length ? unpaid : undefined });
   } catch (error) {
     console.error('Bulk status error:', error);
     return res.status(500).json({ error: 'Failed to update status' });
@@ -652,6 +666,11 @@ router.patch('/:pickListId/named-delivery', authMiddleware, async (req: AuthRequ
     const day = clearing ? null : String(raw).slice(0, 10)
     if (day && (!/^\d{4}-\d{2}-\d{2}$/.test(day) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day)) {
       return res.status(400).json({ error: 'Named delivery must be a date' })
+    }
+    // Saturday is allowed (collected Friday on a Saturday service). Sunday and bank holidays have no delivery.
+    const saturday = day ? new Date(`${day}T12:00:00Z`).getUTCDay() === 6 : false
+    if (day && !saturday && !isWorkingIsoDay(day)) {
+      return res.status(400).json({ error: 'Named delivery cannot be a Sunday or a bank holiday' })
     }
     const result = await query(
       `UPDATE pick_lists
@@ -693,9 +712,16 @@ router.patch('/:pickListId/status', authMiddleware, async (req: AuthRequest, res
   try {
     const status = parseStatus(req.body?.status);
     if (!status) return res.status(400).json({ error: 'Unknown status' });
-    const found = await query(`SELECT id FROM pick_lists WHERE id = $1`, [req.params.pickListId]);
+    const found = await query(
+      `SELECT id, is_sandbox, payment_status, purchase_order_number FROM pick_lists WHERE id = $1`,
+      [req.params.pickListId],
+    );
     if (!found.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
-    if (status === 'DISPATCHED') await takeStockForShippedLists([req.params.pickListId], req.user?.id);
+    if (status === 'DISPATCHED') {
+      // Same rule as PATCH /:id/dispatch: an unpaid order is not shipped.
+      if (!isPaid(found.rows[0])) return res.status(409).json({ error: 'This order has not been paid yet, so it cannot be marked shipped' });
+      await takeStockForShippedLists([req.params.pickListId], req.user?.id);
+    }
     await recordPickListEvents({
       ids: [req.params.pickListId],
       actor: actorName(req.user),
@@ -1723,11 +1749,24 @@ router.post('/:pickListId/mark-samples-picked', authMiddleware, async (req: Requ
 router.patch('/:pickListId/items/:itemId/pick', authMiddleware, async (req: Request, res: Response) => {
   try {
     const { pickListId, itemId } = req.params;
-    const { quantityPicked, pickedFromLocationCode, notes } = req.body;
+    const { pickedFromLocationCode, notes } = req.body;
+    const quantityPicked = Number(req.body?.quantityPicked);
 
     // Check if this is a sandbox pick list — skip real inventory updates if so
-    const plCheck = await query(`SELECT is_sandbox FROM pick_lists WHERE id = $1`, [pickListId]);
-    const isSandbox = plCheck.rows[0]?.is_sandbox ?? false;
+    const plCheck = await query(`SELECT is_sandbox, status FROM pick_lists WHERE id = $1`, [pickListId]);
+    if (!plCheck.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+    if (['DISPATCHED', 'CANCELLED'].includes(plCheck.rows[0].status)) {
+      return res.status(409).json({ error: 'This order is shipped or cancelled, so its picks cannot change' });
+    }
+    const isSandbox = plCheck.rows[0].is_sandbox ?? false;
+    const before = (await query(
+      `SELECT quantity_required, quantity_picked, picked_from_location_id FROM pick_list_items WHERE id = $1 AND pick_list_id = $2`,
+      [itemId, pickListId],
+    )).rows[0];
+    if (!before) return res.status(404).json({ error: 'Pick item not found' });
+    if (!Number.isInteger(quantityPicked) || quantityPicked < 0 || quantityPicked > Number(before.quantity_required)) {
+      return res.status(400).json({ error: `Picked quantity must be a whole number from 0 to ${before.quantity_required}` });
+    }
 
     if (!isSandbox && quantityPicked > 0) {
       const line = await query(
@@ -1764,20 +1803,22 @@ router.patch('/:pickListId/items/:itemId/pick', authMiddleware, async (req: Requ
       `UPDATE pick_list_items 
        SET status = 'PICKED', quantity_picked = $1, picked_from_location_id = $2,
            notes = $3, updated_at = NOW()
-       WHERE id = $4 RETURNING *`,
-      [quantityPicked, locationId, notes || null, itemId]
+       WHERE id = $4 AND pick_list_id = $5 RETURNING *`,
+      [quantityPicked, locationId, notes || null, itemId, pickListId]
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: 'Pick item not found' });
     await promotePickList(pickListId);
 
-    // Reserve inventory — skip for sandbox lists to protect real stock
-    if (!isSandbox && locationId && quantityPicked) {
+    // Reserve only the units added by this confirm, so confirming the same line again never reserves twice.
+    // Nothing is released here: other reservations share the column. Skipped for sandbox lists.
+    const added = quantityPicked - (Number(before.quantity_picked) || 0);
+    if (!isSandbox && locationId && added > 0) {
       await query(
-        `UPDATE warehouse_inventory 
+        `UPDATE warehouse_inventory
          SET quantity_reserved = quantity_reserved + $1, updated_at = NOW()
          WHERE location_id = $2 AND product_sku = (SELECT product_sku FROM pick_list_items WHERE id = $3)`,
-        [quantityPicked, locationId, itemId]
+        [added, locationId, itemId]
       );
     }
 
@@ -1841,15 +1882,17 @@ router.patch('/:pickListId/complete', authMiddleware, async (req: Request, res: 
     const { notes } = req.body;
 
     const result = await query(
-      `UPDATE pick_lists 
-       SET status = 'PICKED', completed_at = NOW(), notes = $1, updated_at = NOW()
-       WHERE id = $2
+      `UPDATE pick_lists
+       SET status = 'PICKED', completed_at = NOW(), notes = COALESCE($1, notes), updated_at = NOW()
+       WHERE id = $2 AND status IN ('PENDING', 'IN_PROGRESS', 'PICKED')
        RETURNING *`,
       [notes || null, pickListId]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Pick list not found' });
+      const exists = await query(`SELECT status FROM pick_lists WHERE id = $1`, [pickListId]);
+      if (!exists.rows[0]) return res.status(404).json({ error: 'Pick list not found' });
+      return res.status(409).json({ error: `This order is already ${String(exists.rows[0].status).toLowerCase().replace('_', ' ')}, so it cannot go back to picked` });
     }
 
     return res.json({ pickList: result.rows[0], message: 'Pick list completed' });
@@ -2291,113 +2334,6 @@ router.delete('/:pickListId', authMiddleware, requirePermission('manage_operatio
   } catch (error) {
     console.error('Permanent delete error:', error);
     res.status(500).json({ error: 'Failed to permanently delete pick list' });
-  }
-});
-
-/**
- * PATCH /api/pick-lists/:pickListId/dispatch
- * Mark pick list as shipped with tracking info, deduct stock, and notify Medusa
- *
- * Input: {
- *   tracking_number: "1Z999AA10123456784",
- *   carrier: "DHL",
- *   tracking_url?: "https://tracking.dhl.com/..."
- * }
- *
- * Flow:
- *   1. Update pick_lists table with tracking info and set status=DISPATCHED
- *   2. For each item, deduct quantity_available and release quantity_reserved
- *   3. POST to Medusa fulfillment API with tracking (if fulfillment ID exists)
- *   4. Set synced_to_medusa_at timestamp
- *
- * Response: { success: true, pick_list, medusa_sync }
- */
-router.patch('/:pickListId/dispatch', authMiddleware, requirePermission('manage_operations'), async (req: Request, res: Response) => {
-  try {
-    const { pickListId } = req.params;
-    const { tracking_number, carrier, tracking_url } = req.body;
-
-    if (!tracking_number || !carrier) {
-      return res.status(400).json({ error: 'tracking_number and carrier are required' });
-    }
-
-    // Get pick list and all items
-    const plResult = await query(
-      `SELECT id, medusa_order_id, medusa_fulfillment_id, status, is_return FROM pick_lists WHERE id = $1`,
-      [pickListId]
-    );
-
-    if (!plResult.rows[0]) {
-      return res.status(404).json({ error: 'Pick list not found' });
-    }
-
-    const pickList = plResult.rows[0];
-
-    // Get all items in this pick list
-    const itemsResult = await query(
-      `SELECT id, product_sku, quantity_required FROM pick_list_items WHERE pick_list_id = $1`,
-      [pickListId]
-    );
-
-    // Update pick list with tracking info
-    const updatedPL = await query(
-      `UPDATE pick_lists
-       SET tracking_number = $1, carrier = $2, tracking_url = $3, 
-           dispatched_at = NOW(), status = 'DISPATCHED', updated_at = NOW()
-       WHERE id = $4
-       RETURNING *`,
-      [tracking_number, carrier, tracking_url || null, pickListId]
-    );
-
-    // Deduct stock for each item (quantity_available down, quantity_reserved down)
-    for (const item of itemsResult.rows) {
-      await query(
-        `UPDATE warehouse_inventory
-         SET quantity_available = quantity_available - $1,
-             quantity_reserved = quantity_reserved - $1,
-             updated_at = NOW()
-         WHERE product_sku = $2 AND quantity_reserved >= $1`,
-        [item.quantity_required, item.product_sku]
-      );
-    }
-
-    let medusaSync = { success: false, message: 'No Medusa fulfillment ID found' };
-
-    // Returns are handled on the shop by hand. Do not write tracking back.
-    if (pickList.is_return) {
-      medusaSync = { success: true, message: 'Return left unchanged on the shop' };
-    } else if (pickList.medusa_fulfillment_id) {
-      try {
-        const { medusaPost } = await import('../../lib/medusa-client.js');
-        medusaSync = await medusaPost(
-          `/admin/fulfillments/${pickList.medusa_fulfillment_id}`,
-          {
-            tracking_numbers: [tracking_number],
-            no_notification: false, // let Medusa send the email
-          }
-        );
-
-        // Mark as synced
-        await query(
-          `UPDATE pick_lists SET synced_to_medusa_at = NOW() WHERE id = $1`,
-          [pickListId]
-        );
-      } catch (medusaErr) {
-        console.error(`Failed to sync to Medusa fulfillment ${pickList.medusa_fulfillment_id}:`, medusaErr);
-        medusaSync = { error: medusaErr instanceof Error ? medusaErr.message : String(medusaErr) };
-      }
-    }
-
-    console.log(`✓ Dispatched pick list ${pickListId} with tracking ${tracking_number} (${carrier})`);
-    res.json({
-      success: true,
-      pick_list: updatedPL.rows[0],
-      medusa_sync: medusaSync,
-      message: `Pick list dispatched with tracking ${tracking_number}`,
-    });
-  } catch (error) {
-    console.error('Dispatch error:', error);
-    res.status(500).json({ error: 'Failed to dispatch pick list' });
   }
 });
 

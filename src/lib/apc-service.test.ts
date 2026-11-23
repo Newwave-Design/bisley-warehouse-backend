@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { apcAvailabilityItems, apcConsignmentSize, apcDutyItem, appropriateApcServices, northernIrelandPostcode } from './apc-service.ts'
+import { apcAlreadyCancelled, apcAvailabilityItems, apcConsignmentSize, apcDutyItem, appropriateApcServices, northernIrelandPostcode } from './apc-service.ts'
 
 const services = [
   { code: 'APCND16', name: 'Next day parcel', ruleMatch: false, ruleName: '' },
@@ -99,4 +99,13 @@ test('small boxes stay on the next day parcel', () => {
   const chosen = appropriateApcServices(services, Array.from({ length: 6 }, () => small))
   assert.equal(chosen[0]?.code, 'APCND16')
   assert.equal(apcConsignmentSize('APCND16'), null)
+})
+
+test('a refused APC cancel is not treated as cancelled', () => {
+  assert.equal(apcAlreadyCancelled('Order cannot be cancelled as it has been collected'), false)
+  assert.equal(apcAlreadyCancelled('Unable to cancel this consignment'), false)
+  assert.equal(apcAlreadyCancelled('Order is already cancelled'), true)
+  assert.equal(apcAlreadyCancelled('Consignment not found'), true)
+  assert.equal(apcAlreadyCancelled('{"Orders":{"Order":{"Status":"CANCELLED"}}}'), true)
+  assert.equal(apcAlreadyCancelled('Validation failed'), false)
 })

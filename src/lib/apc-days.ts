@@ -1,10 +1,11 @@
-/** Weekdays APC can be asked to collect, starting with today when today is a weekday. */
+import { isWorkingDay } from './working-days.js'
 
+/** Working days APC can be asked to collect, starting with today when today is one. Bank holidays are skipped. */
 export function weekdayCollectionDates(count: number, now = new Date()): string[] {
   const dates: string[] = []
   for (let days = 0; dates.length < count && days < 21; days += 1) {
     const shifted = shiftLondonDate(days, now)
-    if (shifted.weekday === 'Sat' || shifted.weekday === 'Sun') continue
+    if (!isWorkingDay(shifted)) continue
     dates.push(apcDate(shifted.year, shifted.month, shifted.day))
   }
   return dates

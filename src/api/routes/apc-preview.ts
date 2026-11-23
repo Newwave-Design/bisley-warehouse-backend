@@ -17,8 +17,9 @@ import { outcomeChange } from '../../lib/return-booking-rules.js';
 import { openReturnReplacement, releaseReturnReplacement } from '../../lib/return-replacement.js';
 import { markReturnRequestsBooked, reopenReturnRequests } from '../../lib/return-requests.js';
 import { collectionDateRefused, weekdayCollectionDates, weekdaysAfter } from '../../lib/apc-days.js';
-import { apcAvailabilityItems, apcConsignmentSize, apcDutyItem, appropriateApcServices, northernIrelandPostcode } from '../../lib/apc-service.js';
+import { apcAlreadyCancelled, apcAvailabilityItems, apcConsignmentSize, apcDutyItem, appropriateApcServices, northernIrelandPostcode } from '../../lib/apc-service.js';
 import { createRoyalMailParcel, deleteRoyalMailOrders, fetchRoyalMailLabelPdf, quoteRoyalMailParcels, readRoyalMailTracking, RoyalMailError, royalMailConfigured, type RoyalMailParcelFormat } from '../../lib/royal-mail.js';
+import { isPaid } from '../../lib/payment-status.js';
 
 async function dropReplacements(pickListId: string | undefined, waybill: string, orderNumber = '') {
   if (!pickListId || (!waybill && !orderNumber)) return;
@@ -43,6 +44,9 @@ async function dropReplacements(pickListId: string | undefined, waybill: string,
 const router = express.Router();
 const QUOTE_URL = 'https://apc.hypaship.com/api/3.0/ServiceAvailability.json';
 const ORDER_URL = 'https://apc.hypaship.com/api/3.0/Orders.json';
+const APC_TIMEOUT_MS = 30_000;
+/** Orders being booked right now. One server runs the API, so this stops a double click booking twice. */
+const bookingsInFlight = new Set<string>();
 const WAREHOUSE_PHONE = '01873900095';
 const COLLECTION = {
   CompanyName: 'OVARA PRODUCTS LIMITED',
@@ -349,6 +353,7 @@ async function quoteCollectionDate(
   items: { Type: string; Weight: string; Length: string; Width: string; Height: string; Reference: string }[],
 ): Promise<{ ok: boolean; collectionDate: string; message: unknown; services: QuotedService[] }> {
   const response = await fetch(QUOTE_URL, {
+    signal: AbortSignal.timeout(APC_TIMEOUT_MS),
     method: 'POST',
     headers: {
       'remote-user': remoteUser,
@@ -560,33 +565,42 @@ async function placeApcOrder(input: {
   const shipped = duty
     ? input.items.map((item) => ({ ...item, DutyItems: { DutyItem: apcDutyItem(item.Reference) } }))
     : input.items
-  const response = await fetch(ORDER_URL, {
-    method: 'POST',
-    headers: {
-      'remote-user': input.remoteUser,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: JSON.stringify({
-      Orders: {
-        Order: {
-          CollectionDate: input.collectionDate,
-          ReadyAt: '09:00',
-          ClosedAt: '17:00',
-          ProductCode: input.serviceCode,
-          Reference: input.reference,
-          Collection: input.returning ? input.customerParty : COLLECTION,
-          Delivery: input.returning ? COLLECTION : input.customerParty,
-          GoodsInfo: { GoodsValue: String(duty ? 50 * input.items.length : 50), Fragile: 'false' },
-          ShipmentDetails: {
-            NumberOfPieces: String(shipped.length),
-            Items: { Item: shipped.length === 1 ? shipped[0] : shipped },
+  const unsure = 'APC did not give a clear reply. Check Hypaship for this order before booking it again.'
+  let response: globalThis.Response
+  let raw: string
+  try {
+    response = await fetch(ORDER_URL, {
+      signal: AbortSignal.timeout(APC_TIMEOUT_MS),
+      method: 'POST',
+      headers: {
+        'remote-user': input.remoteUser,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        Orders: {
+          Order: {
+            CollectionDate: input.collectionDate,
+            ReadyAt: '09:00',
+            ClosedAt: '17:00',
+            ProductCode: input.serviceCode,
+            Reference: input.reference,
+            Collection: input.returning ? input.customerParty : COLLECTION,
+            Delivery: input.returning ? COLLECTION : input.customerParty,
+            GoodsInfo: { GoodsValue: String(duty ? 50 * input.items.length : 50), Fragile: 'false' },
+            ShipmentDetails: {
+              NumberOfPieces: String(shipped.length),
+              Items: { Item: shipped.length === 1 ? shipped[0] : shipped },
+            },
           },
         },
-      },
-    }),
-  });
-  const raw = await response.text();
+      }),
+    });
+    raw = await response.text();
+  } catch {
+    // No reply: APC may still have booked it.
+    return { ok: false, accepted: false, status: 504, detail: unsure, order: null, waybill: '' };
+  }
   let payload: any = null;
   try { payload = JSON.parse(raw); } catch { payload = null; }
   const order = asList<any>(payload?.Orders?.Order || payload?.Order)[0] || payload;
@@ -596,7 +610,7 @@ async function placeApcOrder(input: {
     ok: response.ok && Boolean(payload) && message.ok && Boolean(waybill),
     accepted: response.ok && Boolean(payload) && message.ok,
     status: response.status,
-    detail: message.detail,
+    detail: payload ? message.detail : unsure,
     order: payload ? order : null,
     waybill,
   };
@@ -611,6 +625,7 @@ function chunkRows<T>(rows: T[], size: number): T[][] {
 async function cancelApcWaybill(remoteUser: string, waybill: string) {
   if (!waybill) return;
   await fetch(`https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(waybill)}.json?searchtype=CarrierWaybill`, {
+    signal: AbortSignal.timeout(APC_TIMEOUT_MS),
     method: 'PUT',
     headers: { 'remote-user': remoteUser, 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({ Orders: { Order: { Status: 'CANCELLED' } } }),
@@ -677,14 +692,25 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   })).filter((piece) => piece.weightKg && piece.lengthCm && piece.widthCm && piece.heightCm);
   if (!pieces.length) return res.status(400).json({ error: 'Add at least one box' });
 
+  // One booking per order at a time, so a double click cannot buy two collections.
+  if (bookingsInFlight.has(pickListId)) {
+    return res.status(409).json({ error: 'This order is already being booked. Wait a moment, then refresh.' });
+  }
+  bookingsInFlight.add(pickListId);
+
   try {
     const found = await query(
-      `SELECT id, pick_list_number, customer_name, customer_email, shipping_address, medusa_order_id
+      `SELECT id, pick_list_number, customer_name, customer_email, shipping_address, medusa_order_id,
+              is_sandbox, payment_status, purchase_order_number
          FROM pick_lists WHERE id = $1`,
       [pickListId]
     );
-    const list = found.rows[0] as { pick_list_number?: string; customer_name?: string; customer_email?: string; shipping_address?: any; medusa_order_id?: string } | undefined;
+    const list = found.rows[0] as { pick_list_number?: string; customer_name?: string; customer_email?: string; shipping_address?: any; medusa_order_id?: string; is_sandbox?: boolean; payment_status?: string | null; purchase_order_number?: string | null } | undefined;
     if (!list) return res.status(404).json({ error: 'Unknown order' });
+    // Booking an outbound collection ships the order, so it follows the same payment rule as dispatch.
+    if (!returning && !isPaid(list)) {
+      return res.status(409).json({ error: 'This order has not been paid yet, so a collection cannot be booked' });
+    }
 
     const requestedSkus = [...new Set(asList<any>(req.body?.skus).map((sku) => text(sku).trim()).filter(Boolean))];
     const skus = requestedSkus.length ? requestedSkus : [...new Set(pieces.map((piece) => piece.sku).filter(Boolean))];
@@ -903,7 +929,8 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         items: groupItems,
       });
       tried.add(attemptDate);
-      while (!placed.ok && !returning && collectionDateRefused(placed.detail) && tried.size < 6) {
+      // Only the first consignment may move to a later day. The rest must go with it, or the booking is undone below.
+      while (group === 0 && !placed.ok && !returning && collectionDateRefused(placed.detail) && tried.size < 6) {
         const next = await nextBookableApcDate({
           remoteUser: remoteUser || '',
           after: attemptDate,
@@ -982,7 +1009,11 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         ]
       : rowSkus.map((sku) => ({ sku, waybill, orderNumber, pieces: savedPieces }));
 
-    const client = await getPool().connect();
+    const client = await getPool().connect().catch(() => null);
+    if (!client) {
+      console.error('Saving collection failed', 'no database connection');
+      return res.status(500).json({ error: `${courier === 'RM' ? 'Royal Mail' : courier} created tracking ${waybill}, but it could not be saved here. Do not book it again.` });
+    }
     const saved = [];
     try {
       await client.query('BEGIN');
@@ -1072,7 +1103,10 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     return;
   } catch (error) {
     console.error('Collection booking failed', error instanceof Error ? error.message : 'request failed');
-    return res.status(502).json({ error: `Could not reach ${courier}. Nothing was saved.` });
+    if (res.headersSent) return;
+    return res.status(502).json({ error: `Could not finish the ${courier} booking. Check ${courier} for this order before booking it again.` });
+  } finally {
+    bookingsInFlight.delete(pickListId);
   }
 });
 
@@ -1209,6 +1243,7 @@ async function loadBookingLabels(id: string, format: 'ZPL' | 'PDF'): Promise<Pri
   for (const number of waybills) {
     const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(number)}.json?labelformat=${format}&markprinted=True&searchtype=CarrierWaybill&labels=True`;
     const response = await fetch(url, {
+      signal: AbortSignal.timeout(APC_TIMEOUT_MS),
       headers: {
         'remote-user': remoteUser,
         Accept: 'application/json',
@@ -1355,6 +1390,7 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
     for (const number of waybills) {
       const url = `https://apc.hypaship.com/api/3.0/Orders/${encodeURIComponent(number)}.json?searchtype=CarrierWaybill`;
       const response = await fetch(url, {
+        signal: AbortSignal.timeout(APC_TIMEOUT_MS),
         method: 'PUT',
         headers: {
           'remote-user': remoteUser,
@@ -1369,7 +1405,7 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
       const order = payload ? (asList<any>(payload?.Orders?.Order || payload?.Order)[0] || payload) : null;
       const message = order ? apcMessages(order) : { ok: false, detail: '' };
       const detail = `${message.detail} ${raw}`.toLowerCase();
-      const alreadyGone = /cancel|not found|does not exist/.test(detail);
+      const alreadyGone = apcAlreadyCancelled(detail);
       if ((!response.ok || !message.ok) && !alreadyGone) {
         cancelError = message.detail || `APC did not cancel consignment ${number}. It is still booked here.`;
         continue;

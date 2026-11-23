@@ -144,3 +144,13 @@ export function appropriateApcServices<T extends ApcServiceChoice>(services: T[]
   }
   return []
 }
+
+/**
+ * APC refused a cancel because the consignment is already cancelled or gone.
+ * A refusal such as "cannot be cancelled" or "already collected" means it is still live.
+ */
+export function apcAlreadyCancelled(detail: string): boolean {
+  const text = String(detail || '').toLowerCase();
+  if (/can.?not|can't|unable|not allowed|not permitted|too late|collected|in transit|manifested|despatched|dispatched/.test(text)) return false;
+  return /already cancel|been cancel|\bis cancel|"status"\s*:\s*"cancelled"|not found|does not exist/.test(text);
+}

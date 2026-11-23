@@ -16,3 +16,7 @@ test('a same-day refusal is a date problem, not an address problem', () => {
   assert.equal(collectionDateRefused('Order Cut Off Time Has Passed For Today'), true)
   assert.equal(collectionDateRefused('Address Line 1 is too long'), false)
 })
+
+test('Christmas and Boxing Day bank holidays are not collection days', () => {
+  assert.deepEqual(weekdayCollectionDates(3, new Date('2026-12-24T10:00:00Z')), ['24/12/2026', '29/12/2026', '30/12/2026'])
+})

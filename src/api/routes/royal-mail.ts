@@ -28,6 +28,9 @@ function idsFrom(body: unknown): string[] {
   return [...new Set(raw.map((id) => String(id || '').trim()).filter((id) => UUID.test(id)))];
 }
 
+/** Sample orders being booked right now. One server runs the API. */
+const samplesInFlight = new Set<string>();
+
 function clean(value: unknown): string {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
@@ -47,6 +50,11 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   const ids = idsFrom(req.body);
   if (!ids.length) return res.status(400).json({ error: 'Select at least one sample order' });
   if (ids.length > 100) return res.status(400).json({ error: 'Book at most 100 sample orders at a time' });
+  // One booking per order at a time, so a double click cannot buy postage twice.
+  if (ids.some((id) => samplesInFlight.has(id))) {
+    return res.status(409).json({ error: 'Some of these orders are already being booked. Wait a moment, then refresh.' });
+  }
+  for (const id of ids) samplesInFlight.add(id);
 
   try {
     const found = await query(
@@ -258,9 +266,12 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   } catch (error) {
     const message = error instanceof RoyalMailError
       ? error.message
-      : 'Could not reach Royal Mail. Nothing new was booked.';
+      : 'Could not finish the Royal Mail booking. Check Click & Drop for these orders before booking them again.';
     console.error('Royal Mail booking failed', error instanceof Error ? error.message : 'request failed');
+    if (res.headersSent) return;
     return res.status(502).json({ error: message });
+  } finally {
+    for (const id of ids) samplesInFlight.delete(id);
   }
 });
 

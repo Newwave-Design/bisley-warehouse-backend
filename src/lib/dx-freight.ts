@@ -4,6 +4,8 @@
  * Release is not called: the manifest date is sent with the consignment.
  */
 
+import { isWorkingDay } from './working-days.js';
+
 const LIVE_URL = 'https://dm6api.dxfreight.co.uk/DespatchManager.API.Service.DM6Lite/DM6LiteService.svc';
 const FALLBACK_PHONE = '01873900095';
 
@@ -128,10 +130,6 @@ function shift(parts: { year: number; month: number; day: number }, days: number
   return londonParts(atLondonNoon(parts.year, parts.month, parts.day + days));
 }
 
-function isWeekend(weekday: string): boolean {
-  return weekday === 'Sat' || weekday === 'Sun';
-}
-
 function formatDmy(parts: { year: number; month: number; day: number }): string {
   return `${String(parts.day).padStart(2, '0')}/${String(parts.month).padStart(2, '0')}/${parts.year}`;
 }
@@ -156,7 +154,7 @@ function addWeekdays(parts: { year: number; month: number; day: number; weekday:
   let left = count;
   while (left > 0) {
     cursor = shift(cursor, 1);
-    if (!isWeekend(cursor.weekday)) left -= 1;
+    if (isWorkingDay(cursor)) left -= 1;
   }
   return cursor;
 }
@@ -174,7 +172,7 @@ function comingSaturday(parts: { year: number; month: number; day: number; weekd
 export function dxCollectionDays(now = new Date(), count = 4) {
   const today = londonParts(now);
   const pastCutoff = today.hour > 13 || (today.hour === 13 && today.minute > 0);
-  const start = !isWeekend(today.weekday) && !pastCutoff ? today : nextWeekday(today);
+  const start = isWorkingDay(today) && !pastCutoff ? today : nextWeekday(today);
   const days = [start];
   let cursor = start;
   while (days.length < count) {
@@ -188,7 +186,7 @@ function nextWeekday(parts: { year: number; month: number; day: number; weekday:
   let cursor = parts;
   do {
     cursor = shift(cursor, 1);
-  } while (isWeekend(cursor.weekday));
+  } while (!isWorkingDay(cursor));
   return cursor;
 }
 
@@ -236,7 +234,7 @@ export function quoteDxCollection(input: {
   const pieceCount = Array.isArray(input.pieces) ? input.pieces.length : input.pieces;
   const requested = input.collectionDate ? parseDmy(input.collectionDate) : null;
   if (input.collectionDate && !requested) throw new DxError('Choose a collection date');
-  if (requested && isWeekend(requested.weekday)) throw new DxError('DX collects on a weekday');
+  if (requested && !isWorkingDay(requested)) throw new DxError('DX collects on a working day, not a weekend or bank holiday');
   const today = londonParts(input.now || new Date());
   if (requested && dateKey(requested) < dateKey(today)) throw new DxError('That collection date has passed');
 
@@ -366,17 +364,26 @@ async function call(path: string, body: unknown, session?: string): Promise<any>
   const { base } = account();
   const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: 'application/json' };
   if (session) headers.AuthHeader = `<AuthHeader><SessionKey>${session}</SessionKey></AuthHeader>`;
+  // A booking that got no reply, or a reply we cannot read, may still exist at DX.
+  const creates = path === 'AddConsignment' || path === 'AddCollection';
+  const unsure = 'DX did not give a clear reply. Check DX for this order before booking it again.';
   let response: Response;
+  let raw: string;
   try {
-    response = await fetch(`${base}/${path}`, { method: 'POST', headers, body: JSON.stringify(body) });
+    response = await fetch(`${base}/${path}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    });
+    raw = await response.text();
   } catch {
-    throw new DxError('Could not reach DX. Nothing was saved.', 502);
+    throw new DxError(creates ? unsure : 'Could not reach DX.', 502);
   }
-  const raw = await response.text();
   try {
     return JSON.parse(raw);
   } catch {
-    throw new DxError('DX did not return a booking', 502);
+    throw new DxError(creates ? unsure : 'DX did not return a readable reply', 502);
   }
 }
 
@@ -413,7 +420,7 @@ export async function addDxConsignment(input: {
   const service = SERVICES.find((entry) => entry.code === input.serviceCode);
   if (!service) throw new DxError('Choose a DX service');
   const day = parseDmy(input.collectionDate);
-  if (!day || isWeekend(day.weekday)) throw new DxError('DX collects on a weekday');
+  if (!day || !isWorkingDay(day)) throw new DxError('DX collects on a working day, not a weekend or bank holiday');
   if (service.saturday && day.weekday !== 'Fri') throw new DxError('Saturday delivery is collected on Friday');
   const today = londonParts();
   if (dateKey(day) < dateKey(today)) throw new DxError('That collection date has passed');
@@ -529,7 +536,7 @@ export async function addDxCollection(input: {
   const service = SERVICES.find((entry) => entry.code === input.serviceCode);
   if (!service) throw new DxError('Choose a DX service');
   const day = parseDmy(input.collectionDate);
-  if (!day || isWeekend(day.weekday)) throw new DxError('DX collects on a weekday');
+  if (!day || !isWorkingDay(day)) throw new DxError('DX collects on a working day, not a weekend or bank holiday');
   if (dateKey(day) < dateKey(londonParts())) throw new DxError('That collection date has passed');
   if (!input.pieces.length) throw new DxError('Add at least one box');
   if (!dxBoxesFit(input.pieces)) throw new DxError('No DX service fits this box. DX takes one-person items up to 50 kg and 6 m.');
@@ -572,7 +579,7 @@ export async function addDxCollection(input: {
     DeliveryCountry: 'GB',
     DeliveryEmail: '',
     DeliveryName: dxAscii(clipWords(WAREHOUSE_DELIVERY.company, 25)[0] || '').slice(0, 25),
-    DeliveryPhoneNumber: dxPhone(input.collection.phone),
+    DeliveryPhoneNumber: dxPhone(WAREHOUSE_DELIVERY.phone),
     DeliveryPostcode: WAREHOUSE_DELIVERY.postcode,
     DeliveryType: 2,
     DescriptionOfGoods: dxGoodsDescription(input.pieces.map((piece) => piece.title).filter(Boolean).join(', ') || 'Furniture'),
