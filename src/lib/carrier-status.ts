@@ -44,6 +44,8 @@ export function stageFromEvents(courier: string, events: string[]): { stage: Car
 
 const CACHE_MS = 5 * 60_000;
 const DONE_MS = 6 * 60 * 60_000;
+/** An order with no booking is looked at again soon, so a booking made a moment ago shows up at once. */
+const NONE_MS = 10_000;
 const cache = new Map<string, { at: number; value: CarrierStatus | null }>();
 
 interface BookingRow {
@@ -93,7 +95,7 @@ export async function loadCarrierStatus(ids: string[]): Promise<Record<string, C
   const now = Date.now();
   for (const id of wanted) {
     const hit = cache.get(id);
-    if (hit && now - hit.at < (hit.value?.delivered ? DONE_MS : CACHE_MS)) {
+    if (hit && now - hit.at < (!hit.value ? NONE_MS : hit.value.delivered ? DONE_MS : CACHE_MS)) {
       if (hit.value) result[id] = hit.value;
     } else missing.push(id);
   }
@@ -133,7 +135,7 @@ export async function loadReturnCollections(ids: string[]): Promise<Record<strin
   const now = Date.now();
   for (const id of wanted) {
     const hit = returnCache.get(id);
-    if (hit && now - hit.at < (hit.value.length && hit.value.every(row => row.delivered) ? DONE_MS : CACHE_MS)) {
+    if (hit && now - hit.at < (!hit.value.length ? NONE_MS : hit.value.every(row => row.delivered) ? DONE_MS : CACHE_MS)) {
       if (hit.value.length) result[id] = hit.value;
     } else missing.push(id);
   }
