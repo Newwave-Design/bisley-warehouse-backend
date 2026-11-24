@@ -531,8 +531,11 @@ export async function addDxCollection(input: {
   serviceCode: string;
   collectionDate: string;
   collection: DxDelivery;
+  /** Where it is delivered. The warehouse when left out. */
+  delivery?: DxDelivery;
   pieces: DxPiece[];
 }): Promise<DxBooked> {
+  const dest = input.delivery || WAREHOUSE_DELIVERY;
   const service = SERVICES.find((entry) => entry.code === input.serviceCode);
   if (!service) throw new DxError('Choose a DX service');
   const day = parseDmy(input.collectionDate);
@@ -545,7 +548,7 @@ export async function addDxCollection(input: {
   if (/^BT/i.test(postcode)) throw new DxError('Northern Ireland needs a customs declaration before DX can collect it');
   if (postcode.length < 5 || postcode.length > 8) throw new DxError('DX needs a UK postcode');
   const from = packAddress(input.collection);
-  const to = packAddress(WAREHOUSE_DELIVERY);
+  const to = packAddress(dest);
   const name = clipWords(input.collection.company || input.collection.name, 25)[0] || '';
   const contact = clipWords(input.collection.name || name, 25)[0] || name;
   if (!from[0] || !name || !contact) throw new DxError('This order needs a name and street before it can be booked');
@@ -568,19 +571,19 @@ export async function addDxCollection(input: {
     CollectionPostcode: postcode,
     CollectionReference: dxReference(input.reference),
     DXAccountNumber: accountNumber,
-    // CF delivers this collection to the warehouse address below. CT would send it to the DX depot instead.
+    // CF delivers this collection to the delivery address below (the warehouse unless another was given). CT would send it to the DX depot instead.
     DeliverTo: 'CF',
     DeliveryAddress1: dxAscii(to[0] || '').slice(0, 25),
     DeliveryAddress2: dxAscii(to[1] || '').slice(0, 30),
     DeliveryAddress3: dxAscii(to[2] || '').slice(0, 30),
     DeliveryAddress4: dxAscii(to[3] || '').slice(0, 30),
     DeliveryAddress5: dxAscii(to[4] || '').slice(0, 30),
-    DeliveryContact: dxAscii(WAREHOUSE_DELIVERY.name).slice(0, 25),
+    DeliveryContact: dxAscii(dest.name).slice(0, 25),
     DeliveryCountry: 'GB',
-    DeliveryEmail: '',
-    DeliveryName: dxAscii(clipWords(WAREHOUSE_DELIVERY.company, 25)[0] || '').slice(0, 25),
-    DeliveryPhoneNumber: dxPhone(WAREHOUSE_DELIVERY.phone),
-    DeliveryPostcode: WAREHOUSE_DELIVERY.postcode,
+    DeliveryEmail: dxAscii(dest.email || '').slice(0, 50),
+    DeliveryName: dxAscii(clipWords(dest.company, 25)[0] || '').slice(0, 25),
+    DeliveryPhoneNumber: dxPhone(dest.phone),
+    DeliveryPostcode: dest.postcode,
     DeliveryType: 2,
     DescriptionOfGoods: dxGoodsDescription(input.pieces.map((piece) => piece.title).filter(Boolean).join(', ') || 'Furniture'),
     // DX rejects the routing stream "F" here. Kilos is the carton charged by weight; CartonKG is not enabled on this account.

@@ -498,6 +498,33 @@ function apcStreet(line1: string, line2: string): [string, string] {
   return [lines[0] || source.slice(0, max), lines[1] || ''];
 }
 
+type CustomAddress = { person: string; company: string; email: string; phone: string; line1: string; line2: string; city: string; county: string; postcode: string; country: string };
+
+/** An address typed in on the desk, for collecting from, or delivering to, somewhere other than the order's address and the warehouse. */
+function customAddress(value: unknown, label: string): CustomAddress | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as Record<string, unknown>;
+  const address: CustomAddress = {
+    person: text(row.name ?? row.person).replace(/\s+/g, ' ').trim().slice(0, 60),
+    company: text(row.company).replace(/\s+/g, ' ').trim().slice(0, 80),
+    email: text(row.email).trim().slice(0, 120),
+    phone: text(row.phone).trim().slice(0, 30),
+    line1: text(row.line1).replace(/\s+/g, ' ').trim().slice(0, 100),
+    line2: text(row.line2).replace(/\s+/g, ' ').trim().slice(0, 100),
+    city: text(row.city).replace(/\s+/g, ' ').trim().slice(0, 60),
+    county: text(row.county).replace(/\s+/g, ' ').trim().slice(0, 60),
+    postcode: text(row.postcode).replace(/\s+/g, ' ').trim().toUpperCase().slice(0, 10),
+    country: (text(row.country, 'GB').trim().toUpperCase() || 'GB'),
+  };
+  if (!address.line1 || !address.city || !address.postcode || !(address.person || address.company)) {
+    throw new Error(`${label} needs a name, street, town and postcode`);
+  }
+  if (!['GB', 'UK'].includes(address.country)) throw new Error(`${label} has to be a UK address`);
+  if (!/^[A-Z]{1,2}\d[A-Z\d]? ?\d[A-Z]{2}$/.test(address.postcode)) throw new Error(`${label}: that does not look like a UK postcode`);
+  address.company = address.company || address.person;
+  return address;
+}
+
 function deliveryFrom(row: { customer_name?: string; customer_email?: string; shipping_address?: any }) {
   const address = row.shipping_address || {};
   const person = text(`${address.first_name || ''} ${address.last_name || ''}`).trim() || text(row.customer_name).trim();
@@ -558,9 +585,12 @@ async function placeApcOrder(input: {
   reference: string;
   returning: boolean;
   customerParty: Record<string, unknown>;
+  /** Where a return is delivered. The warehouse when left out. */
+  destination?: Record<string, unknown>;
   items: { Type: string; Weight: string; Length: string; Width: string; Height: string; Reference: string }[];
 }): Promise<{ ok: boolean; accepted: boolean; status: number; detail: string; order: any; waybill: string }> {
-  const deliveringTo = input.returning ? COLLECTION.PostalCode : String(input.customerParty.PostalCode || '')
+  const home = input.destination || COLLECTION;
+  const deliveringTo = input.returning ? String(home.PostalCode || '') : String(input.customerParty.PostalCode || '')
   const duty = northernIrelandPostcode(deliveringTo)
   const shipped = duty
     ? input.items.map((item) => ({ ...item, DutyItems: { DutyItem: apcDutyItem(item.Reference) } }))
@@ -586,7 +616,7 @@ async function placeApcOrder(input: {
             ProductCode: input.serviceCode,
             Reference: input.reference,
             Collection: input.returning ? input.customerParty : COLLECTION,
-            Delivery: input.returning ? COLLECTION : input.customerParty,
+            Delivery: input.returning ? home : input.customerParty,
             GoodsInfo: { GoodsValue: String(duty ? 50 * input.items.length : 50), Fragile: 'false' },
             ShipmentDetails: {
               NumberOfPieces: String(shipped.length),
@@ -672,6 +702,14 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   if (returning && !agreedDate) {
     return res.status(400).json({ error: 'Enter the collection date agreed with the customer. It has to be a weekday that has not passed.' });
   }
+  let customFrom: CustomAddress | null = null;
+  let customTo: CustomAddress | null = null;
+  try {
+    customFrom = returning ? customAddress(req.body?.collectionAddress, 'The collection address') : null;
+    customTo = returning ? customAddress(req.body?.deliveryAddress, 'The delivery address') : null;
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : 'That address is not usable' });
+  }
   const remoteUser = courier === 'APC' ? authHeader() : null;
   if (courier === 'APC' && !remoteUser) return res.status(500).json({ error: 'APC login is not configured' });
   if (courier === 'DX' && !dxConfigured()) return res.status(500).json({ error: 'DX login is not configured' });
@@ -743,6 +781,8 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
 
     const delivery = deliveryFrom(list);
     delivery.phone = collectionPhone(text(list.shipping_address?.phone), text(req.body?.phone));
+    // Collecting from an address other than the order's: the typed address replaces it.
+    if (customFrom) Object.assign(delivery, { ...customFrom, phone: customFrom.phone ? collectionPhone('', customFrom.phone) : delivery.phone });
     if (!['GB', 'UK'].includes(delivery.country)) {
       return res.status(400).json({ error: returning ? 'A return can only be collected from a UK address' : `${courier} collections are only booked to a UK address` });
     }
@@ -834,6 +874,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
                 county: delivery.county,
                 postcode: delivery.postcode,
               },
+              ...(customTo ? { delivery: { name: customTo.person || customTo.company, company: customTo.company, email: customTo.email, phone: customTo.phone, line1: customTo.line1, line2: customTo.line2, city: customTo.city, county: customTo.county, postcode: customTo.postcode } } : {}),
               pieces: pieces.map((piece) => ({
                 title: piece.title,
                 weightKg: Number(piece.weightKg),
@@ -902,6 +943,24 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       ...(Object.keys(contact).length ? { Contact: contact } : {}),
     };
 
+    const [toLine1, toLine2] = customTo ? apcStreet(customTo.line1, customTo.line2) : ['', ''];
+    const destination: Record<string, unknown> | undefined = customTo
+      ? {
+          CompanyName: clipApc(customTo.company, 34),
+          AddressLine1: toLine1,
+          AddressLine2: toLine2,
+          PostalCode: customTo.postcode,
+          City: clipApc(customTo.city, 31),
+          County: clipApc(customTo.county, 31),
+          CountryCode: 'GB',
+          Contact: {
+            PersonName: clipApc(customTo.person || customTo.company, 63),
+            ...apcContactNumbers(customTo.phone || WAREHOUSE_PHONE),
+            ...(customTo.email ? { Email: customTo.email } : {}),
+          },
+        }
+      : undefined;
+
     let attemptDate = returning ? agreedDate : collectionDateOf(req.body?.collectionDate);
     const tried = new Set<string>();
     const boxes = items.map((item) => ({
@@ -926,6 +985,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         reference: groupReference,
         returning,
         customerParty,
+        destination,
         items: groupItems,
       });
       tried.add(attemptDate);
@@ -952,6 +1012,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
           reference: groupReference,
           returning,
           customerParty,
+          destination,
           items: groupItems,
         });
       }
@@ -998,9 +1059,10 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     orderNumber = placedOrders[0]?.orderNumber || '';
     savedPieces = placedOrders.flatMap((placed) => placed.pieces);
     }
-    const summary = [delivery.company, delivery.line1, delivery.city, delivery.postcode].filter(Boolean).join(', ');
+    const toLine = customTo ? [customTo.company, customTo.line1, customTo.city, customTo.postcode].filter(Boolean).join(', ') : '';
+    const summary = [[delivery.company, delivery.line1, delivery.city, delivery.postcode].filter(Boolean).join(', '), toLine ? `to ${toLine}` : ''].filter(Boolean).join(' → ');
     const collectionPostcode = returning ? delivery.postcode : COLLECTION.PostalCode;
-    const deliveryPostcode = returning ? COLLECTION.PostalCode : delivery.postcode;
+    const deliveryPostcode = returning ? (customTo ? customTo.postcode : COLLECTION.PostalCode) : delivery.postcode;
     const rowSkus = skus.length ? skus : [`extra-${Date.now().toString(36)}`];
     const bookingRows = apcConsignments.length > 1
       ? [
