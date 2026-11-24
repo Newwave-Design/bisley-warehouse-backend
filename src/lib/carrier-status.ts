@@ -116,3 +116,44 @@ export async function loadCarrierStatus(ids: string[]): Promise<Record<string, C
   }));
   return result;
 }
+
+export interface ReturnCollection extends CarrierStatus {
+  sku: string;
+  /** What the return is for: refund or replace. */
+  outcome: string | null;
+}
+
+const returnCache = new Map<string, { at: number; value: ReturnCollection[] }>();
+
+/** Collections booked to bring goods back from the customer. Same carrier scans as a delivery, read the other way round. */
+export async function loadReturnCollections(ids: string[]): Promise<Record<string, ReturnCollection[]>> {
+  const wanted = [...new Set(ids)].slice(0, 50);
+  const result: Record<string, ReturnCollection[]> = {};
+  const missing: string[] = [];
+  const now = Date.now();
+  for (const id of wanted) {
+    const hit = returnCache.get(id);
+    if (hit && now - hit.at < (hit.value.length && hit.value.every(row => row.delivered) ? DONE_MS : CACHE_MS)) {
+      if (hit.value.length) result[id] = hit.value;
+    } else missing.push(id);
+  }
+  if (!missing.length) return result;
+  const rows = await query(
+    `SELECT DISTINCT ON (b.pick_list_id, b.sku)
+            b.pick_list_id, b.sku, b.outcome, b.courier, b.service_name, b.collection_date, b.waybill, b.delivery_postcode, NULL::text AS tracking_url
+     FROM collection_bookings b
+     WHERE b.pick_list_id = ANY($1::uuid[]) AND b.status <> 'cancelled' AND b.direction = 'return'
+     ORDER BY b.pick_list_id, b.sku, b.created_at DESC`,
+    [missing]
+  );
+  const grouped = new Map<string, (BookingRow & { sku: string; outcome: string | null })[]>();
+  for (const row of rows.rows as (BookingRow & { sku: string; outcome: string | null })[]) {
+    grouped.set(row.pick_list_id, [...(grouped.get(row.pick_list_id) || []), row]);
+  }
+  await Promise.all(missing.map(async id => {
+    const value = await Promise.all((grouped.get(id) || []).map(async row => ({ ...(await read(row)), sku: row.sku, outcome: row.outcome || null })));
+    returnCache.set(id, { at: Date.now(), value });
+    if (value.length) result[id] = value;
+  }));
+  return result;
+}
