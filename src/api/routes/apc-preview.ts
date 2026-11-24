@@ -500,6 +500,21 @@ function apcStreet(line1: string, line2: string): [string, string] {
 
 type CustomAddress = { person: string; company: string; email: string; phone: string; line1: string; line2: string; city: string; county: string; postcode: string; country: string };
 
+type ContactInput = { phone: string; email: string };
+
+/** A phone and email typed in for one end of the collection. Empty when neither was given. */
+function contactInput(value: unknown, label: string): ContactInput | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as Record<string, unknown>;
+  const phone = text(row.phone).trim().slice(0, 30);
+  const email = text(row.email).trim().slice(0, 120);
+  if (!phone && !email) return null;
+  if (phone && !/^[0-9+()\s-]{10,20}$/.test(phone)) throw new Error(`${label}: that does not look like a phone number`);
+  if (phone && phone.replace(/\D/g, '').length < 10) throw new Error(`${label}: the phone number is too short`);
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error(`${label}: that does not look like an email address`);
+  return { phone, email };
+}
+
 /** An address typed in on the desk, for collecting from, or delivering to, somewhere other than the order's address and the warehouse. */
 function customAddress(value: unknown, label: string): CustomAddress | null {
   if (!value || typeof value !== 'object') return null;
@@ -704,9 +719,13 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   }
   let customFrom: CustomAddress | null = null;
   let customTo: CustomAddress | null = null;
+  let collectContact: ContactInput | null = null;
+  let deliverContact: ContactInput | null = null;
   try {
     customFrom = returning ? customAddress(req.body?.collectionAddress, 'The collection address') : null;
     customTo = returning ? customAddress(req.body?.deliveryAddress, 'The delivery address') : null;
+    collectContact = returning ? contactInput(req.body?.collectionContact, 'The collection contact') : null;
+    deliverContact = returning ? contactInput(req.body?.deliveryContact, 'The delivery contact') : null;
   } catch (error) {
     return res.status(400).json({ error: error instanceof Error ? error.message : 'That address is not usable' });
   }
@@ -783,6 +802,9 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     delivery.phone = collectionPhone(text(list.shipping_address?.phone), text(req.body?.phone));
     // Collecting from an address other than the order's: the typed address replaces it.
     if (customFrom) Object.assign(delivery, { ...customFrom, phone: customFrom.phone ? collectionPhone('', customFrom.phone) : delivery.phone });
+    // A new phone or email for whoever is there to hand it over, over the address on file.
+    if (collectContact?.phone) delivery.phone = collectionPhone('', collectContact.phone);
+    if (collectContact?.email) delivery.email = collectContact.email;
     if (!['GB', 'UK'].includes(delivery.country)) {
       return res.status(400).json({ error: returning ? 'A return can only be collected from a UK address' : `${courier} collections are only booked to a UK address` });
     }
@@ -874,6 +896,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
                 county: delivery.county,
                 postcode: delivery.postcode,
               },
+              ...(deliverContact ? { deliveryContact: deliverContact } : {}),
               ...(customTo ? { delivery: { name: customTo.person || customTo.company, company: customTo.company, email: customTo.email, phone: customTo.phone, line1: customTo.line1, line2: customTo.line2, city: customTo.city, county: customTo.county, postcode: customTo.postcode } } : {}),
               pieces: pieces.map((piece) => ({
                 title: piece.title,
@@ -944,6 +967,8 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     };
 
     const [toLine1, toLine2] = customTo ? apcStreet(customTo.line1, customTo.line2) : ['', ''];
+    const toPhone = deliverContact?.phone || customTo?.phone || '';
+    const toEmail = deliverContact?.email || customTo?.email || '';
     const destination: Record<string, unknown> | undefined = customTo
       ? {
           CompanyName: clipApc(customTo.company, 34),
@@ -955,11 +980,13 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
           CountryCode: 'GB',
           Contact: {
             PersonName: clipApc(customTo.person || customTo.company, 63),
-            ...apcContactNumbers(customTo.phone || WAREHOUSE_PHONE),
-            ...(customTo.email ? { Email: customTo.email } : {}),
+            ...apcContactNumbers(toPhone || WAREHOUSE_PHONE),
+            ...(toEmail ? { Email: toEmail } : {}),
           },
         }
-      : undefined;
+      : deliverContact
+        ? { ...COLLECTION, Contact: { ...COLLECTION.Contact, ...apcContactNumbers(toPhone || WAREHOUSE_PHONE), ...(toEmail ? { Email: toEmail } : {}) } }
+        : undefined;
 
     let attemptDate = returning ? agreedDate : collectionDateOf(req.body?.collectionDate);
     const tried = new Set<string>();

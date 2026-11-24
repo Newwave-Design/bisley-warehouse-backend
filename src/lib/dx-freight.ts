@@ -533,9 +533,12 @@ export async function addDxCollection(input: {
   collection: DxDelivery;
   /** Where it is delivered. The warehouse when left out. */
   delivery?: DxDelivery;
+  /** A phone or email for the delivery end, over whichever address it is. */
+  deliveryContact?: { phone?: string; email?: string };
   pieces: DxPiece[];
 }): Promise<DxBooked> {
-  const dest = input.delivery || WAREHOUSE_DELIVERY;
+  const base = input.delivery || WAREHOUSE_DELIVERY;
+  const dest: DxDelivery = { ...base, ...(input.deliveryContact?.phone ? { phone: input.deliveryContact.phone } : {}), ...(input.deliveryContact?.email ? { email: input.deliveryContact.email } : {}) };
   const service = SERVICES.find((entry) => entry.code === input.serviceCode);
   if (!service) throw new DxError('Choose a DX service');
   const day = parseDmy(input.collectionDate);
