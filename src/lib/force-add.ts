@@ -188,3 +188,92 @@ export async function undoForceAdd(input: { pickListId: string; itemId: string; 
   await recordPickListEvents({ ids: [input.pickListId], actor: input.actor, action: 'force-add', summary: `Took the forced ${row.quantity_required} x ${row.product_sku} back off` });
   return { removed: true };
 }
+
+export interface ForcePlanResult {
+  planned_at: string | null;
+  forced_lines: number;
+  losses: Loss[];
+  warnings: string[];
+}
+
+/**
+ * Force an order onto the pick list from Plan picks, however it is blocked: no stock, no box, on hold.
+ * Every line still to pick is marked forced, so the planners serve this order before the others and take what it needs from
+ * newer orders. The order is planned, taken off hold, and the orders that lost something are named and flagged.
+ */
+export async function forcePlan(input: { pickListId: string; actor: string; note?: string }): Promise<ForcePlanResult> {
+  const found = await query(
+    `SELECT id, pick_list_number, status, is_archived, deferred_at, payment_status, purchase_order_number FROM pick_lists WHERE id = $1`,
+    [input.pickListId]
+  );
+  const list = found.rows[0];
+  if (!list) throw new ForceAddError(404, 'Pick list not found');
+  if (list.is_archived || ['DISPATCHED', 'CANCELLED'].includes(list.status)) {
+    throw new ForceAddError(409, `This order is ${list.is_archived ? 'archived' : String(list.status).toLowerCase()}, so nothing can be picked for it.`);
+  }
+  const warnings: string[] = [];
+  const paid = ['captured', 'partially_refunded'].includes(String(list.payment_status || '')) || String(list.purchase_order_number || '').trim() !== '';
+  if (!paid) warnings.push('This order is not marked paid. It was planned anyway and given stock.');
+  if (list.deferred_at) warnings.push('The order was on hold. It has been taken off hold.');
+
+  await ensureForcedColumns();
+  await ensureStockHolds(true);
+  const before = await holdSnapshot();
+
+  const marked = await query(
+    `UPDATE pick_list_items SET forced_at = COALESCE(forced_at, NOW()), forced_by = COALESCE(forced_by, $2), updated_at = NOW()
+      WHERE pick_list_id = $1 AND NOT is_archived AND quantity_required > COALESCE(quantity_picked, 0) AND product_sku NOT ILIKE '%SAMPLE%'
+      RETURNING id`,
+    [list.id, input.actor.slice(0, 255)]
+  );
+  const itemIds = marked.rows.map((row: { id: string }) => row.id);
+  const planned = await query(
+    `UPDATE pick_lists
+        SET planned_at = COALESCE(planned_at, NOW()), deferred_at = NULL,
+            status = CASE WHEN status = 'AWAITING_STOCK' THEN 'PENDING' ELSE status END, updated_at = NOW()
+      WHERE id = $1 RETURNING planned_at`,
+    [list.id]
+  );
+
+  await ensureStockHolds(true);
+  const after = await holdSnapshot();
+  const mine = new Set(itemIds);
+  const losses = [...mine].flatMap((id) => lossesBetween(before, after, id)).filter((loss, index, all) => all.findIndex((other) => other.pick_list_id === loss.pick_list_id && other.what === loss.what && other.kind === loss.kind) === index);
+  const heldSkus = new Set([...after.stock.values()].filter((row) => mine.has(row.item_id)).map((row) => row.sku));
+  if (!heldSkus.size && itemIds.length) warnings.push('There is no stock in the warehouse to reserve for this order, so it is on the pick list but cannot be picked yet.');
+  const outBoxes = await query(
+    `SELECT DISTINCT pi.code FROM order_box_holds h JOIN packaging_items pi ON pi.id = h.packaging_item_id WHERE h.pick_list_item_id = ANY($1::uuid[]) AND pi.stock_on_hand <= 0`,
+    [itemIds]
+  );
+  for (const row of outBoxes.rows) warnings.push(`${row.code} shows no stock on the shelf. The box is reserved for this order, but check there is one to use.`);
+
+  const byList = new Map<string, Loss[]>();
+  for (const loss of losses) byList.set(loss.pick_list_id, [...(byList.get(loss.pick_list_id) || []), loss]);
+  for (const [listId, rows] of byList) {
+    const what = rows.map((row) => `${row.qty} x ${row.what}${row.kind === 'box' ? ' (box)' : ''}`).join(', ');
+    const text = `Stock reassigned: ${what} now reserved for ${list.pick_list_number} (forced onto the pick list by ${input.actor}). This order is short until more arrives.`;
+    await query(
+      `INSERT INTO pick_list_notes (pick_list_id, note_text, is_flagged, created_by)
+       SELECT $1, $2, true, 'Force add' WHERE NOT EXISTS (SELECT 1 FROM pick_list_notes WHERE pick_list_id = $1 AND note_text = $2 AND resolved_at IS NULL)`,
+      [listId, text]
+    );
+    await recordPickListEvents({ ids: [listId], actor: input.actor, action: 'force-add', summary: `Lost ${what} to ${list.pick_list_number}, forced onto the pick list` });
+  }
+  const took = [...new Set(losses.map((loss) => loss.pick_list_number))];
+  await recordPickListEvents({
+    ids: [list.id],
+    actor: input.actor,
+    action: 'force-add',
+    summary: `Forced onto the pick list${took.length ? `, taking stock from ${took.join(', ')}` : ', nothing needed taking from other orders'}${input.note ? `. ${String(input.note).slice(0, 200)}` : ''}`,
+  });
+  return { planned_at: planned.rows[0]?.planned_at ?? null, forced_lines: itemIds.length, losses, warnings };
+}
+
+/** Takes the order back off the pick list and gives the other orders their reservations back. */
+export async function undoForcePlan(input: { pickListId: string; actor: string }): Promise<{ undone: boolean }> {
+  await query(`UPDATE pick_list_items SET forced_at = NULL, forced_by = NULL, updated_at = NOW() WHERE pick_list_id = $1 AND forced_at IS NOT NULL AND COALESCE(quantity_picked, 0) = 0`, [input.pickListId]);
+  await query(`UPDATE pick_lists SET planned_at = NULL, updated_at = NOW() WHERE id = $1 AND status IN ('PENDING', 'AWAITING_STOCK')`, [input.pickListId]);
+  await ensureStockHolds(true);
+  await recordPickListEvents({ ids: [input.pickListId], actor: input.actor, action: 'force-add', summary: 'Took the force-add off and back out of the pick list' });
+  return { undone: true };
+}

@@ -38,7 +38,7 @@ import { isWorkingIsoDay } from '../../lib/working-days.js';
 import { loadHoldups } from '../../lib/order-holdup.js';
 import { loadCarrierStatus, loadReturnCollections } from '../../lib/carrier-status.js';
 import { AddressError, cleanAddressPatch, describeAddressChange } from '../../lib/delivery-address.js';
-import { forceAdd, ForceAddError, undoForceAdd } from '../../lib/force-add.js';
+import { forceAdd, forcePlan, ForceAddError, undoForceAdd, undoForcePlan } from '../../lib/force-add.js';
 import { issueRefund, listRefunds, refundPosition, RefundError, REFUND_REASONS } from '../../lib/refunds.js';
 
 const router = express.Router();
@@ -646,6 +646,34 @@ router.post('/:pickListId/force-add', authMiddleware, requirePermission('manage_
     if (error instanceof ForceAddError) return res.status(error.status).json({ error: error.message });
     console.error('Force add failed', error);
     return res.status(500).json({ error: 'The item was not added' });
+  }
+});
+
+/**
+ * POST /api/pick-lists/:pickListId/force-plan
+ * Body: { note? }
+ * Puts this whole order on the pick list however it is blocked (no stock, no box, on hold) and gives it the stock and boxes before
+ * every other order. The result names each order that lost something; those orders are flagged. X-Actor names who did it.
+ */
+router.post('/:pickListId/force-plan', authMiddleware, requirePermission('manage_operations'), async (req: AuthRequest, res: Response) => {
+  try {
+    const actor = String(req.headers['x-actor'] || '').trim().slice(0, 120) || actorName(req.user);
+    return res.status(201).json(await forcePlan({ pickListId: req.params.pickListId, actor, note: req.body?.note ? String(req.body.note) : undefined }));
+  } catch (error) {
+    if (error instanceof ForceAddError) return res.status(error.status).json({ error: error.message });
+    console.error('Force plan failed', error);
+    return res.status(500).json({ error: 'The order was not added to the pick list' });
+  }
+});
+
+/** DELETE /api/pick-lists/:pickListId/force-plan — takes it back off. */
+router.delete('/:pickListId/force-plan', authMiddleware, requirePermission('manage_operations'), async (req: AuthRequest, res: Response) => {
+  try {
+    const actor = String(req.headers['x-actor'] || '').trim().slice(0, 120) || actorName(req.user);
+    return res.json(await undoForcePlan({ pickListId: req.params.pickListId, actor }));
+  } catch (error) {
+    console.error('Undo force plan failed', error);
+    return res.status(500).json({ error: 'It was not taken back off' });
   }
 });
 
