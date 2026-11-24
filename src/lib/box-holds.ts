@@ -4,6 +4,7 @@
  * The box stays on the shelf until the order ships. This does not change stock_on_hand.
  */
 import { getPool, query } from '../db/index.js';
+import { ensureForcedColumns } from './forced-columns.js';
 
 export interface BoxDemand {
   itemId: string;
@@ -56,7 +57,7 @@ const DEMAND = `
            CASE WHEN COALESCE(pl.is_return, false) THEN pl.created_at
                 ELSE COALESCE(parent.created_at, pl.created_at) END AS ordered_at,
            CASE WHEN pli.quantity_picked > 0 THEN pli.quantity_picked ELSE pli.quantity_required END AS line_qty,
-           upper(pli.product_sku) AS product_sku, wp.is_kit, wp.kit_components
+           regexp_replace(upper(pli.product_sku), '^PLINTH-', 'MDHP-') AS product_sku, wp.is_kit, wp.kit_components
     FROM pick_list_items pli
     JOIN pick_lists pl ON pl.id = pli.pick_list_id
     LEFT JOIN pick_lists parent ON parent.id = pl.parent_pick_list_id
@@ -69,7 +70,7 @@ const DEMAND = `
       AND NOT pli.is_archived AND NOT COALESCE(pl.is_archived, false)
       AND NOT COALESCE(pl.is_return, false)
       AND pl.status NOT IN ('DISPATCHED', 'CANCELLED')
-      AND (pl.payment_status IN ('captured', 'partially_refunded') OR COALESCE(pl.purchase_order_number, '') <> '')
+      AND (pl.payment_status IN ('captured', 'partially_refunded') OR COALESCE(pl.purchase_order_number, '') <> '' OR pli.forced_at IS NOT NULL)
       AND pli.quantity_required > 0
       AND NOT COALESCE(pli.is_custom, false)
       AND pli.product_sku NOT ILIKE '%SAMPLE%'
@@ -82,12 +83,12 @@ const DEMAND = `
   ),
   parts AS (
     SELECT u.item_id, u.pick_list_number, u.line_number, u.status, u.ordered_at, u.forced,
-           upper(sd.component_sku) AS sku, (u.line_qty * sd.per_unit_qty)::numeric AS qty
+           regexp_replace(upper(sd.component_sku), '^PLINTH-', 'MDHP-') AS sku, (u.line_qty * sd.per_unit_qty)::numeric AS qty
     FROM units u
     JOIN sale_demand sd ON sd.pick_list_item_id = u.item_id AND NOT COALESCE(sd.is_custom, false)
     UNION ALL
     SELECT u.item_id, u.pick_list_number, u.line_number, u.status, u.ordered_at, u.forced,
-           upper(comp.sku), (u.line_qty * COALESCE(comp.required_quantity, 1))::numeric
+           regexp_replace(upper(comp.sku), '^PLINTH-', 'MDHP-'), (u.line_qty * COALESCE(comp.required_quantity, 1))::numeric
     FROM units u
     CROSS JOIN LATERAL jsonb_to_recordset(u.kit_components) AS comp(sku text, required_quantity numeric)
     WHERE COALESCE(u.is_kit, false)
@@ -144,6 +145,7 @@ async function ensureBoxHoldTable(): Promise<void> {
 
 /** Rewrites which open order holds each box. */
 export async function computeBoxHolds(): Promise<void> {
+  await ensureForcedColumns();
   await ensureBoxHoldTable();
   const demand = await query(DEMAND);
   const lines: BoxDemand[] = demand.rows

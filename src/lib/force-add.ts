@@ -1,12 +1,17 @@
 /**
  * Force-add an item to a pick list.
- * The line is marked forced, and the stock and box planners serve a forced line before every other order, so it takes what it
- * needs from newer orders. Units already picked or scanned for another order stay with that order; only what that order had
- * reserved but not yet picked moves. The orders that lose out are named, flagged and recorded, and the add can be undone.
+ * The line is marked forced, and the stock and box planners serve a forced line before every other order, whether or not the
+ * order is paid, so it takes what it needs from newer orders. Units already picked or scanned for another order stay with that
+ * order; only what that order had reserved but not yet picked moves. The orders that lose out are named, flagged and recorded,
+ * and the add can be undone.
+ * Only an order that has already shipped or been cancelled is refused, because nothing can be picked for it. Everything else
+ * goes through, and anything worth knowing comes back as a warning.
  */
 import { query } from '../db/index.js';
 import { ensureStockHolds } from './stock-holds.js';
 import { recordPickListEvents } from './pick-list-events.js';
+import { ensureForcedColumns } from './forced-columns.js';
+import { canonicalSku } from './colour-names.js';
 
 export class ForceAddError extends Error {
   constructor(public status: number, message: string) {
@@ -14,7 +19,8 @@ export class ForceAddError extends Error {
   }
 }
 
-const OPEN_FOR_ADD = ['PENDING', 'IN_PROGRESS', 'AWAITING_STOCK', 'PICKED'];
+/** Past picking: adding an item means it has to be picked, and packed again. */
+const BACK_TO_PICKING = ['PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED'];
 
 interface HoldRow { item_id: string; pick_list_id: string; pick_list_number: string; customer_name: string | null; sku: string; qty: number }
 
@@ -67,28 +73,40 @@ export interface ForceAddResult {
   holds: { stock: { sku: string; qty: number }[]; boxes: { name: string; qty: number }[] };
   /** The other orders that lost reserved stock or boxes to it. */
   losses: Loss[];
+  /** Things worth knowing that did not stop it: unpaid, not in the catalogue, already booked, and so on. */
+  warnings: string[];
 }
 
 export async function forceAdd(input: { pickListId: string; sku: string; quantity: number; actor: string; note?: string }): Promise<ForceAddResult> {
-  const sku = String(input.sku || '').trim();
+  // A plinth is stocked as PLINTH-{colour} but sold as MDHP-{colour}. Either can be typed; the order line is the sold one, which has its own box.
+  const typed = String(input.sku || '').trim();
+  const sku = canonicalSku(typed);
   const quantity = Math.floor(Number(input.quantity));
   if (!sku) throw new ForceAddError(400, 'Say which item to add');
   if (!Number.isFinite(quantity) || quantity < 1 || quantity > 99) throw new ForceAddError(400, 'The quantity must be between 1 and 99');
-  if (/SAMPLE/i.test(sku)) throw new ForceAddError(400, 'Samples do not use stock, so there is nothing to force');
 
-  const found = await query(`SELECT id, pick_list_number, status, is_archived, is_return, payment_status, purchase_order_number FROM pick_lists WHERE id = $1`, [input.pickListId]);
+  const found = await query(`SELECT id, pick_list_number, status, is_archived, payment_status, purchase_order_number, label_printed_at FROM pick_lists WHERE id = $1`, [input.pickListId]);
   const list = found.rows[0];
   if (!list) throw new ForceAddError(404, 'Pick list not found');
-  if (list.is_archived || !OPEN_FOR_ADD.includes(list.status)) {
-    throw new ForceAddError(409, `An order that is ${String(list.status).toLowerCase().replace(/_/g, ' ')} cannot take another item. Add it before it is packed.`);
+  if (list.is_archived || ['DISPATCHED', 'CANCELLED'].includes(list.status)) {
+    throw new ForceAddError(409, `This order is ${list.is_archived ? 'archived' : String(list.status).toLowerCase()}, so nothing can be picked for it. Use a new order or a replacement.`);
   }
+
+  const warnings: string[] = [];
   const paid = ['captured', 'partially_refunded'].includes(String(list.payment_status || '')) || String(list.purchase_order_number || '').trim() !== '';
-  if (!paid) throw new ForceAddError(409, 'This order has not been paid, and stock is only reserved for paid orders.');
-
+  if (!paid) warnings.push('This order is not marked paid. It was added anyway and given stock.');
   const product = await query(`SELECT variant_sku FROM wms_products WHERE upper(variant_sku) = upper($1) AND NOT is_archived LIMIT 1`, [sku]);
-  if (!product.rows[0]) throw new ForceAddError(404, `${sku} is not a product in the warehouse catalogue`);
-  const exactSku = String(product.rows[0].variant_sku);
+  const exactSku = product.rows[0] ? String(product.rows[0].variant_sku) : sku;
+  if (!product.rows[0]) warnings.push(`${typed} is not in the warehouse catalogue. The line was added, but no stock or box can be reserved for an unknown item.`);
+  if (/SAMPLE/i.test(exactSku)) warnings.push('Samples do not use stock, so there is nothing to take from other orders.');
+  const booked = await query(
+    `SELECT courier FROM collection_bookings WHERE pick_list_id = $1 AND status <> 'cancelled' AND COALESCE(direction, 'outbound') <> 'return' ORDER BY created_at DESC LIMIT 1`,
+    [list.id]
+  );
+  if (booked.rows[0]) warnings.push(`A ${booked.rows[0].courier} collection is already booked for this order. It does not include the new item: check the box count and rebook if needed.`);
+  if (list.label_printed_at) warnings.push('A label has already been printed for this order. Reprint it once the new item is packed.');
 
+  await ensureForcedColumns();
   await ensureStockHolds(true);
   const before = await holdSnapshot();
 
@@ -117,8 +135,11 @@ export async function forceAdd(input: { pickListId: string; sku: string; quantit
     );
     item = created.rows[0];
   }
-  // A picked order with a new unpicked line is not picked any more.
-  if (list.status === 'PICKED') await query(`UPDATE pick_lists SET status = 'IN_PROGRESS', updated_at = NOW() WHERE id = $1 AND status = 'PICKED'`, [list.id]);
+  // An order that was already picked or packed has a new line that is not, so it goes back to picking.
+  if (BACK_TO_PICKING.includes(list.status)) {
+    await query(`UPDATE pick_lists SET status = 'IN_PROGRESS', updated_at = NOW() WHERE id = $1 AND status = ANY($2::text[])`, [list.id, BACK_TO_PICKING]);
+    warnings.push(`The order was ${String(list.status).toLowerCase().replace(/_/g, ' ')} and has gone back to In progress, because the new item has to be picked.`);
+  }
 
   await ensureStockHolds(true);
   const after = await holdSnapshot();
@@ -127,6 +148,7 @@ export async function forceAdd(input: { pickListId: string; sku: string; quantit
     stock: [...after.stock.values()].filter((row) => row.item_id === item.id).map((row) => ({ sku: row.sku, qty: row.qty })),
     boxes: [...after.boxes.values()].filter((row) => row.item_id === item.id).map((row) => ({ name: row.sku, qty: row.qty })),
   };
+  if (!/SAMPLE/i.test(exactSku) && product.rows[0] && !holds.stock.length) warnings.push('There is no stock to reserve for this item in the warehouse, so the line is waiting for stock.');
 
   // Each order that lost something is flagged, so the people picking it know why it is short.
   const byList = new Map<string, Loss[]>();
@@ -149,7 +171,7 @@ export async function forceAdd(input: { pickListId: string; sku: string; quantit
     summary: `Force added ${quantity} x ${exactSku}${took.length ? `, taking stock from ${took.join(', ')}` : ', nothing needed taking from other orders'}${input.note ? `. ${String(input.note).slice(0, 200)}` : ''}`,
   });
 
-  return { item, increased, holds, losses };
+  return { item, increased, holds, losses, warnings };
 }
 
 /** Takes a forced line back off, if nothing has been picked on it. Other orders get their reservations back on the next rebuild. */

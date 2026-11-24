@@ -9,6 +9,8 @@
  */
 import { getPool, query } from '../db/index.js';
 import { computeBoxHolds } from './box-holds.js';
+import { ensureForcedColumns } from './forced-columns.js';
+import { canonicalSku } from './colour-names.js';
 
 export interface HoldPart { sku: string; per: number }
 
@@ -156,6 +158,7 @@ let lastDone = 0;
 let timer: ReturnType<typeof setTimeout> | null = null;
 
 async function computeHolds(): Promise<void> {
+  await ensureForcedColumns();
   const demand = await query(
     `SELECT pli.id AS item_id, pli.line_number, pli.product_sku, pli.quantity_required, pli.quantity_picked,
             pli.is_custom, wp.kit_components, (pli.forced_at IS NOT NULL) AS forced,
@@ -171,7 +174,7 @@ async function computeHolds(): Promise<void> {
       WHERE NOT pl.is_sandbox AND NOT COALESCE(pli.is_sandbox, false)
         AND NOT pli.is_archived AND NOT pl.is_archived
         AND pl.status NOT IN ('DISPATCHED', 'CANCELLED')
-        AND (pl.payment_status IN ('captured', 'partially_refunded') OR COALESCE(pl.purchase_order_number, '') <> '')
+        AND (pl.payment_status IN ('captured', 'partially_refunded') OR COALESCE(pl.purchase_order_number, '') <> '' OR pli.forced_at IS NOT NULL)
         AND pli.quantity_required > 0
         AND NOT pli.is_custom
         AND pli.product_sku NOT ILIKE '%SAMPLE%'`
@@ -207,7 +210,10 @@ async function computeHolds(): Promise<void> {
     );
     for (const row of scans.rows) {
       const line = byId.get(row.pick_list_item_id);
-      if (line && row.sku) line.scanned.set(row.sku, Number(row.qty) || 0);
+      if (line && row.sku) {
+        const sku = canonicalSku(row.sku);
+        line.scanned.set(sku, (line.scanned.get(sku) ?? 0) + (Number(row.qty) || 0));
+      }
     }
   }
 
@@ -218,6 +224,8 @@ async function computeHolds(): Promise<void> {
     for (const sku of line.scanned.keys()) skus.add(sku);
   }
   for (const sku of [...skus]) {
+    const plinth = /^MDHP-(.+)$/i.exec(sku);
+    if (plinth) skus.add(`PLINTH-${plinth[1]}`);
     const single = /^(.+)P1-000$/i.exec(sku);
     if (single) skus.add(`${single[1]}P5-000`);
     for (const part of trayPackParts(sku)) skus.add(part.sku);
@@ -229,7 +237,11 @@ async function computeHolds(): Promise<void> {
          FROM warehouse_inventory WHERE product_sku = ANY($1::text[]) GROUP BY product_sku`,
       [[...skus]]
     );
-    for (const row of stock.rows) onHand.set(row.product_sku, Number(row.qty) || 0);
+    // Plinth stock is kept as PLINTH-{colour}; the order line is MDHP-{colour}. Both count for the one product.
+    for (const row of stock.rows) {
+      const sku = canonicalSku(row.product_sku);
+      onHand.set(sku, (onHand.get(sku) ?? 0) + (Number(row.qty) || 0));
+    }
   }
   const packs = [...onHand.keys()]
     .map((sku) => ({ sku, parts: trayPackParts(sku) }))

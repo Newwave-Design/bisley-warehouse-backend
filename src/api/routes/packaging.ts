@@ -2,6 +2,7 @@
  * Packaging inventory, bills of packaging, links, stock, and shipping rate cards.
  * Full CRUD so a bot or the dashboard can keep the catalogue current.
  */
+import { canonicalSku } from '../../lib/colour-names.js';
 import express, { Request, Response } from 'express';
 import { v4 as uuid } from 'uuid';
 import { query } from '../../db/index.js';
@@ -354,7 +355,7 @@ router.get('/boms', async (req: Request, res: Response) => {
 
 router.get('/resolve', async (req: Request, res: Response) => {
   try {
-    const sku = String(req.query.sku || '').trim();
+    const sku = canonicalSku(String(req.query.sku || '').trim());
     if (!sku) return res.status(400).json({ error: 'sku is required' });
     const prefix = sku.includes('-') ? sku.slice(0, sku.lastIndexOf('-')) : sku;
     const skuBoms = await query(

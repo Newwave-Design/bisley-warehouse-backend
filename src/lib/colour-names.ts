@@ -21,9 +21,13 @@ export function extractColourCode(sku: string): string | null {
  * Plinth barcodes and bay stock use PLINTH-{colour}. The catalogue variant the
  * warehouse product list shows is MDHP-{colour}. Emerald is already MDHP-da8.
  */
+export function canonicalSku(sku: string): string {
+  const match = /^PLINTH-([a-z0-9]+)$/i.exec(String(sku || '').trim());
+  return match ? `MDHP-${match[1].toLowerCase()}` : String(sku || '').trim();
+}
+
 export function componentDisplaySku(sku: string): string {
-  const match = /^PLINTH-([a-z0-9]+)$/i.exec(sku || '');
-  return match ? `MDHP-${match[1].toLowerCase()}` : sku;
+  return canonicalSku(sku);
 }
 
 export function isSampleSku(sku: string | null | undefined): boolean {

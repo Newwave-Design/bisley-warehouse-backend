@@ -282,6 +282,26 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
   }
 });
 
+// ── GET /api/products/plinth-audit ────────────────────────────────────────────
+// Where the stock code PLINTH-{colour} still lives next to the sold code MDHP-{colour}. Read only.
+router.get('/plinth-audit', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    const count = async (sql: string) => (await query(sql)).rows;
+    const inventory = await count(`SELECT CASE WHEN product_sku ILIKE 'PLINTH-%' THEN 'PLINTH' ELSE 'MDHP' END AS code, COUNT(*)::int AS rows, COALESCE(SUM(quantity), 0)::int AS qty
+                                     FROM warehouse_inventory WHERE product_sku ILIKE 'PLINTH-%' OR product_sku ILIKE 'MDHP-%' GROUP BY 1`);
+    const barcodes = await count(`SELECT CASE WHEN product_sku ILIKE 'PLINTH-%' THEN 'PLINTH' ELSE 'MDHP' END AS code, COUNT(*)::int AS rows, COUNT(*) FILTER (WHERE is_active)::int AS active
+                                    FROM barcode_mappings WHERE product_sku ILIKE 'PLINTH-%' OR product_sku ILIKE 'MDHP-%' GROUP BY 1`);
+    const scans = await count(`SELECT COUNT(*)::int AS rows FROM pick_scans WHERE component_sku ILIKE 'PLINTH-%'`);
+    const lines = await count(`SELECT COUNT(*)::int AS rows FROM pick_list_items WHERE product_sku ILIKE 'PLINTH-%'`);
+    const moves = await count(`SELECT COUNT(*)::int AS rows FROM warehouse_movements WHERE product_sku ILIKE 'PLINTH-%'`);
+    const skus = await count(`SELECT product_sku, SUM(quantity)::int AS qty FROM warehouse_inventory WHERE product_sku ILIKE 'PLINTH-%' GROUP BY 1 ORDER BY 1`);
+    res.json({ inventory, barcodes, pick_scans_with_plinth_component: scans[0]?.rows ?? 0, order_lines_with_plinth_code: lines[0]?.rows ?? 0, movements_with_plinth_code: moves[0]?.rows ?? 0, plinth_stock_by_code: skus });
+  } catch (error) {
+    console.error('Plinth audit failed', error);
+    res.status(500).json({ error: 'The plinth audit failed' });
+  }
+});
+
 // ── GET /api/products/wms-cache ───────────────────────────────────────────────
 router.get('/wms-cache', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {

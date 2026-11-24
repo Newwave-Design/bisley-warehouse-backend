@@ -1,4 +1,5 @@
 import { query } from '../db/index.js';
+import { canonicalSku } from './colour-names.js';
 
 /** Codes to try for one scan: the text itself, without a trailing -001, and with slashes written as hyphens. */
 export function scanKeys(value: string): string[] {
@@ -6,7 +7,7 @@ export function scanKeys(value: string): string[] {
   if (!raw) return [];
   const stripped = raw.replace(/-001$/, '');
   const hyphen = stripped.replace(/\//g, '-');
-  return [...new Set([raw, stripped, hyphen])];
+  return [...new Set([raw, stripped, hyphen, canonicalSku(raw).toUpperCase(), canonicalSku(stripped).toUpperCase(), canonicalSku(hyphen).toUpperCase()])];
 }
 
 export type ResolvedScan = {
@@ -34,7 +35,7 @@ export async function resolveScan(raw: string): Promise<ResolvedScan | null> {
     `SELECT bm.product_sku, bm.colour_code, bm.colour_name, bm.product_name, bm.thumbnail_url,
             wp.variant_sku, wp.product_title, wp.colour_name AS wp_colour_name, wp.variant_thumbnail
        FROM barcode_mappings bm
-       LEFT JOIN wms_products wp ON upper(wp.variant_sku) = upper(bm.product_sku)
+       LEFT JOIN wms_products wp ON upper(wp.variant_sku) = upper(regexp_replace(bm.product_sku, '^PLINTH-', 'MDHP-', 'i'))
       WHERE upper(bm.barcode) = $1 AND bm.is_active = true
       ORDER BY wp.is_archived ASC NULLS LAST
       LIMIT 1`,
@@ -42,7 +43,7 @@ export async function resolveScan(raw: string): Promise<ResolvedScan | null> {
   );
   const bar = barcode.rows[0];
   if (bar) {
-    const sku = bar.product_sku || bar.variant_sku || q;
+    const sku = canonicalSku(bar.product_sku || bar.variant_sku || q);
     return {
       matched: true,
       source: 'barcode',
