@@ -83,3 +83,29 @@ export function customerEmailChanged(stored: string[], incoming: string | null):
   const differs = stored.some((email) => email.trim().toLowerCase() !== next.toLowerCase())
   return differs ? next : null
 }
+
+const NEVER_BLANKED: (keyof AddressSnapshot)[] = ['first_name', 'last_name', 'phone', 'address_1', 'city', 'postal_code', 'country_code']
+
+function sameValue(field: keyof AddressSnapshot, a: string, b: string): boolean {
+  if (field === 'postal_code') return a.replace(/\s+/g, '').toUpperCase() === b.replace(/\s+/g, '').toUpperCase()
+  if (field === 'country_code') return a.toLowerCase() === b.toLowerCase()
+  return a === b
+}
+
+/**
+ * The fields of the stored delivery address that the shop now says differently, to be copied onto an open pick list.
+ * A shop address with no street, town or postcode is ignored, so a half-filled edit never wipes a good address.
+ * The name, phone, street, town, postcode and country are never blanked; a second line, county or company can be cleared.
+ */
+export function addressChanges(stored: Record<string, unknown> | null | undefined, incoming: AddressSnapshot): Partial<Record<keyof AddressSnapshot, string>> {
+  if (!incoming.address_1 || !incoming.postal_code || !incoming.city) return {}
+  const changes: Partial<Record<keyof AddressSnapshot, string>> = {}
+  for (const field of Object.keys(incoming) as (keyof AddressSnapshot)[]) {
+    const next = String(incoming[field] ?? '').trim()
+    const was = String(stored?.[field] ?? '').trim()
+    if (sameValue(field, next, was)) continue
+    if (!next && NEVER_BLANKED.includes(field)) continue
+    changes[field] = next
+  }
+  return changes
+}

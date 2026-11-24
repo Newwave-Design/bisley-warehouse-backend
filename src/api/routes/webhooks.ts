@@ -22,7 +22,9 @@ import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { logError, logWarning } from '../../lib/logger.js';
 import { createNotification, createNotificationOnce } from '../../lib/notifications.js';
 import { splitOrderMatch } from '../../lib/order-values.js';
-import { customerEmailChanged, customerFromOrder } from '../../lib/order-customer.js';
+import { addressChanges, customerEmailChanged, customerFromOrder } from '../../lib/order-customer.js';
+import { describeAddressChange } from '../../lib/delivery-address.js';
+import { recordPickListEvents } from '../../lib/pick-list-events.js';
 
 const router = express.Router();
 
@@ -181,13 +183,13 @@ export function reconcileOrders(opts: { days?: number; dryRun?: boolean } = {}):
  * does not send an event. Dispatched and cancelled lists are left as they were. Orders that are split or have lines
  * the WMS cannot match by line id are left to the webhook path for quantity edits.
  */
-export interface OpenOrderSyncResult { dryRun: boolean; checked: number; cancelled: string[]; paymentChanged: string[]; edited: string[]; emailChanged: string[]; failed: string[] }
-const SYNC_FIELDS = 'id,display_id,email,customer.email,status,payment_status,items.id,items.title,items.quantity,items.variant_id,items.product_id,items.variant_sku';
+export interface OpenOrderSyncResult { dryRun: boolean; checked: number; cancelled: string[]; paymentChanged: string[]; edited: string[]; emailChanged: string[]; addressChanged: string[]; addressFlagged: string[]; failed: string[] }
+const SYNC_FIELDS = 'id,display_id,email,customer.email,customer.first_name,customer.last_name,customer.company_name,*shipping_address,*billing_address,status,payment_status,items.id,items.title,items.quantity,items.variant_id,items.product_id,items.variant_sku';
 const editsSeen = new Map<string, string>();
 let openSyncRunning = false;
 
 export async function syncOpenOrders(dryRun = false): Promise<OpenOrderSyncResult> {
-  const result: OpenOrderSyncResult = { dryRun, checked: 0, cancelled: [], paymentChanged: [], edited: [], emailChanged: [], failed: [] };
+  const result: OpenOrderSyncResult = { dryRun, checked: 0, cancelled: [], paymentChanged: [], edited: [], emailChanged: [], addressChanged: [], addressFlagged: [], failed: [] };
   if (openSyncRunning) return result;
   openSyncRunning = true;
   try {
@@ -200,6 +202,18 @@ export async function syncOpenOrders(dryRun = false): Promise<OpenOrderSyncResul
        GROUP BY 1`
     )).rows;
     const ids = open.map((r: any) => r.id);
+    // The open lists of these orders with the address each holds, and whether a collection or label already uses it.
+    const addressLists = (await query(
+      `SELECT pl.id, split_part(pl.medusa_order_id, '-', 1) AS order_id, pl.pick_list_number, pl.shipping_address, pl.customer_name,
+              (pl.label_printed_at IS NOT NULL OR EXISTS (
+                 SELECT 1 FROM collection_bookings b
+                  WHERE b.pick_list_id = pl.id AND b.status <> 'cancelled' AND COALESCE(b.direction, 'outbound') <> 'return'
+              )) AS booked
+         FROM pick_lists pl
+        WHERE NOT pl.is_sandbox AND NOT pl.is_archived AND NOT COALESCE(pl.is_return, false)
+          AND pl.status NOT IN ('DISPATCHED', 'CANCELLED') AND pl.medusa_order_id LIKE 'order\\_%'
+          AND split_part(pl.medusa_order_id, '-', 1) = ANY($1::text[])`, [ids]
+    )).rows as { id: string; order_id: string; pick_list_number: string; shipping_address: Record<string, unknown> | null; customer_name: string | null; booked: boolean }[];
     const lines = (await query(
       `SELECT split_part(pl.medusa_order_id, '-', 1) AS id, pli.medusa_order_line_item_id AS line_id, pli.quantity_required AS qty
        FROM pick_list_items pli JOIN pick_lists pl ON pl.id = pli.pick_list_id
@@ -241,6 +255,38 @@ export async function syncOpenOrders(dryRun = false): Promise<OpenOrderSyncResul
               );
             }
           }
+          const fromShop = customerFromOrder(o);
+          for (const list of addressLists.filter((row) => row.order_id === o.id)) {
+            const changes = addressChanges(list.shipping_address, fromShop.shippingAddress);
+            if (!Object.keys(changes).length) continue;
+            const summary = describeAddressChange(list.shipping_address, changes as Record<string, string>);
+            if (list.booked) {
+              // The collection or label was made with the old address, so changing the copy quietly would hide that. Say so instead.
+              const flag = `Shop address changed after the collection was booked, so the booking still has the old address. Cancel and rebook the collection, then correct the address here. ${summary}`;
+              result.addressFlagged.push(`${label} ${list.pick_list_number}`);
+              if (!dryRun) {
+                await query(
+                  `INSERT INTO pick_list_notes (pick_list_id, note_text, is_flagged, created_by)
+                   SELECT $1, $2, true, 'Shop sync'
+                   WHERE NOT EXISTS (SELECT 1 FROM pick_list_notes WHERE pick_list_id = $1 AND note_text = $2 AND resolved_at IS NULL)`,
+                  [list.id, flag]
+                );
+              }
+              continue;
+            }
+            result.addressChanged.push(`${label} ${list.pick_list_number}`);
+            if (!dryRun) {
+              const nameChanged = ('first_name' in changes || 'last_name' in changes) && fromShop.customerName;
+              await query(
+                `UPDATE pick_lists
+                    SET shipping_address = COALESCE(shipping_address, '{}'::jsonb) || $2::jsonb,
+                        customer_name = COALESCE($3, customer_name), updated_at = NOW()
+                  WHERE id = $1 AND status NOT IN ('DISPATCHED', 'CANCELLED') AND NOT is_archived`,
+                [list.id, JSON.stringify(changes), nameChanged ? fromShop.customerName : null]
+              );
+              await recordPickListEvents({ ids: [list.id], actor: 'Shop sync', action: 'address', summary: `${summary} (copied from the shop)` });
+            }
+          }
           const mine = wmsLines.get(o.id) ?? [];
           if (info.lists !== 1 || !info.has_parent || !mine.length || mine.some((l) => !l.line_id)) continue;
           const theirs = new Map<string, number>((o.items ?? []).filter((it: any) => it.id && Number(it.quantity) > 0).map((it: any) => [it.id, Number(it.quantity)]));
@@ -256,7 +302,7 @@ export async function syncOpenOrders(dryRun = false): Promise<OpenOrderSyncResul
         }
       }
     }
-    if (!dryRun && (result.cancelled.length || result.edited.length || result.paymentChanged.length || result.emailChanged.length || result.failed.length)) {
+    if (!dryRun && (result.cancelled.length || result.edited.length || result.paymentChanged.length || result.emailChanged.length || result.addressChanged.length || result.addressFlagged.length || result.failed.length)) {
       await logWarning('WEBHOOK', 'Open-order sync applied changes Medusa did not send an event for', { ...result });
     }
     return result;
