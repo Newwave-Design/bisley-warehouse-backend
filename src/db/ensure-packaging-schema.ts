@@ -312,6 +312,7 @@ export async function ensurePackagingSchema() {
       created_at TIMESTAMP DEFAULT NOW(),
       issued_at TIMESTAMP
     )`,
+    `ALTER TABLE order_refunds ADD COLUMN IF NOT EXISTS approved_by VARCHAR(255)`,
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_order_refunds_key ON order_refunds (idempotency_key) WHERE idempotency_key IS NOT NULL`,
     `CREATE INDEX IF NOT EXISTS idx_order_refunds_pick ON order_refunds (pick_list_id, created_at DESC)`,
   ];
