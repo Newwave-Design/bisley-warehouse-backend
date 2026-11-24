@@ -170,6 +170,56 @@ async function deliveredCourier(pickListId: string): Promise<'APC' | 'DX'> {
 }
 
 /**
+ * GET /api/apc/sent-boxes?pickListId=...
+ * The consignments an order was sent on, with every box in each: its tracking number, contents, weight and size.
+ * The boxes are recorded for the whole consignment, so each item row repeats them; they are returned once per consignment,
+ * with the items that were on it. Read only.
+ */
+router.get('/sent-boxes', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const pickListId = text(req.query.pickListId).trim();
+  if (!/^[0-9a-f-]{36}$/i.test(pickListId)) return res.status(400).json({ error: 'Choose an order' });
+  try {
+    const rows = await query(
+      `SELECT sku, courier, service_name, waybill, collection_date, pieces, created_at
+         FROM collection_bookings
+        WHERE pick_list_id = $1 AND status <> 'cancelled' AND COALESCE(direction, 'outbound') <> 'return'
+        ORDER BY created_at, sku`,
+      [pickListId]
+    );
+    const byWaybill = new Map<string, { waybill: string; courier: string; service: string | null; collection_date: string | null; skus: string[]; pieces: { reference: string; title: string; tracking: string; weightKg: number; lengthCm: number; widthCm: number; heightCm: number }[] }>();
+    for (const row of rows.rows as any[]) {
+      const key = text(row.waybill).trim() || `row-${text(row.sku)}`;
+      let entry = byWaybill.get(key);
+      if (!entry) {
+        entry = {
+          waybill: text(row.waybill).trim(),
+          courier: text(row.courier).trim(),
+          service: row.service_name || null,
+          collection_date: row.collection_date || null,
+          skus: [],
+          pieces: asList<any>(row.pieces).map((piece) => ({
+            reference: text(piece?.reference).trim(),
+            title: text(piece?.title || piece?.reference).trim() || 'Box',
+            tracking: text(piece?.trackingNumber).trim(),
+            weightKg: Number(piece?.weightKg) || 0,
+            lengthCm: Number(piece?.lengthCm) || 0,
+            widthCm: Number(piece?.widthCm) || 0,
+            heightCm: Number(piece?.heightCm) || 0,
+          })),
+        };
+        byWaybill.set(key, entry);
+      }
+      const sku = text(row.sku).trim();
+      if (sku && !entry.skus.includes(sku)) entry.skus.push(sku);
+    }
+    return res.json({ consignments: [...byWaybill.values()] });
+  } catch (error) {
+    console.error('Sent boxes failed', error instanceof Error ? error.message : 'query failed');
+    return res.status(500).json({ error: 'Could not load the boxes that were sent' });
+  }
+});
+
+/**
  * GET /api/apc/collection-days?count=30
  * The days a courier will collect, from today: weekdays that are not bank holidays. Read only.
  */
@@ -1104,8 +1154,9 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     orderNumber = placedOrders[0]?.orderNumber || '';
     savedPieces = placedOrders.flatMap((placed) => placed.pieces);
     }
+    const sentAs = asList<any>(req.body?.originalTracking).map((value) => text(value).trim()).filter(Boolean).slice(0, 12);
     const toLine = customTo ? [customTo.company, customTo.line1, customTo.city, customTo.postcode].filter(Boolean).join(', ') : '';
-    const summary = [[delivery.company, delivery.line1, delivery.city, delivery.postcode].filter(Boolean).join(', '), toLine ? `to ${toLine}` : ''].filter(Boolean).join(' → ');
+    const summary = [[delivery.company, delivery.line1, delivery.city, delivery.postcode].filter(Boolean).join(', '), toLine ? `to ${toLine}` : ''].filter(Boolean).join(' → ') + (returning && sentAs.length ? ` · sent as ${sentAs.join(', ')}` : '');
     const collectionPostcode = returning ? delivery.postcode : COLLECTION.PostalCode;
     const deliveryPostcode = returning ? (customTo ? customTo.postcode : COLLECTION.PostalCode) : delivery.postcode;
     const rowSkus = skus.length ? skus : [`extra-${Date.now().toString(36)}`];
