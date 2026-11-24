@@ -797,6 +797,12 @@ router.patch('/:pickListId/defer', authMiddleware, async (req: AuthRequest, res:
       [req.params.pickListId]
     )
     if (!result.rows.length) return res.status(404).json({ error: 'Pick list not found' })
+    await recordPickListEvents({
+      ids: [req.params.pickListId],
+      actor: String(req.headers['x-actor'] || '').trim().slice(0, 120) || actorName(req.user),
+      action: deferred ? 'hold' : 'release',
+      summary: deferred ? 'Put on hold' : 'Taken off hold',
+    })
     res.json({ pickList: result.rows[0] })
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to update deferral', details: error.message })
