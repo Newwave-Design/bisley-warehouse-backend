@@ -122,6 +122,13 @@ export async function issueRefund(input: {
       const found = await query(`SELECT * FROM order_refunds WHERE idempotency_key = $1`, [key]);
       if (found.rows[0]) return { refund: found.rows[0] as RefundRow, position: await refundPosition(orderId), repeated: true };
     }
+    const replacing = await query(
+      `SELECT sku FROM return_requests WHERE pick_list_id = $1 AND outcome = 'replace' AND status <> 'cancelled'`,
+      [pick.id]
+    );
+    if (replacing.rows.length && request.reason !== 'goodwill') {
+      throw new RefundError(409, `A replacement is open for ${replacing.rows.map((row: { sku: string }) => row.sku).join(', ')}. Refunding as well would pay the customer twice. Cancel the replacement first, or refund the difference as goodwill.`);
+    }
     const position = await refundPosition(orderId);
     if (request.amount > position.left + 1e-9) {
       throw new RefundError(400, `The most that can still be refunded is £${position.left.toFixed(2)} (paid £${position.paid.toFixed(2)}, refunded £${position.refunded.toFixed(2)})`);

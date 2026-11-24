@@ -522,7 +522,11 @@ router.get('/:pickListId/refunds', authMiddleware, async (req: Request, res: Res
     if (!pick.rows[0]) return res.status(404).json({ error: 'Order not found' });
     const orderId = String(pick.rows[0].medusa_order_id || '');
     const position = orderId.startsWith('order_') ? await refundPosition(orderId).catch(() => null) : null;
-    return res.json({ position, refunds: await listRefunds(req.params.pickListId), reasons: REFUND_REASONS });
+    const returns = (await listReturnRequests(req.params.pickListId)).map((row: any) => ({
+      sku: row.sku, title: row.item_title || null, status: row.status, outcome: row.outcome || null,
+      replacement_number: row.replacement_number || null, replacement_status: row.replacement_status || null,
+    }));
+    return res.json({ position, refunds: await listRefunds(req.params.pickListId), returns, reasons: REFUND_REASONS });
   } catch (error) {
     console.error('Refund list failed', error);
     return res.status(500).json({ error: 'Failed to read the refunds' });
@@ -1078,7 +1082,7 @@ router.get('/return-requests', authMiddleware, async (req: Request, res: Respons
 router.post('/:pickListId/return-requests', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const body = Array.isArray(req.body?.skus) ? req.body.skus.map((sku: unknown) => String(sku)) : null;
-    const requests = await requestReturns(req.params.pickListId, body, req.user?.email || '', String(req.body?.outcome || ''));
+    const requests = await requestReturns(req.params.pickListId, body, String(req.headers['x-actor'] || '').trim().slice(0, 120) || req.user?.email || '', String(req.body?.outcome || ''));
     return res.status(201).json({ requests });
   } catch (error) {
     if (error instanceof ReturnRequestError) return res.status(error.status).json({ error: error.message });
