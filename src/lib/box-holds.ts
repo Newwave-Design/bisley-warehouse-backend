@@ -13,6 +13,8 @@ export interface BoxDemand {
   boxId: string;
   required: number;
   started: boolean;
+  /** Force-added: served before every other order, started or not. */
+  forced?: boolean;
 }
 
 export interface PlannedBoxHold {
@@ -41,12 +43,16 @@ export function planBoxHolds(lines: BoxDemand[], onHand: Map<string, number>): P
     return holds;
   };
 
-  return [...grant(lines.filter((line) => line.started)), ...grant(lines.filter((line) => !line.started))];
+  return [
+    ...grant(lines.filter((line) => line.forced)),
+    ...grant(lines.filter((line) => !line.forced && line.started)),
+    ...grant(lines.filter((line) => !line.forced && !line.started)),
+  ];
 }
 
 const DEMAND = `
   WITH units AS (
-    SELECT pli.id AS item_id, pl.pick_list_number, pli.line_number, pl.status,
+    SELECT pli.id AS item_id, pl.pick_list_number, pli.line_number, pl.status, (pli.forced_at IS NOT NULL) AS forced,
            CASE WHEN COALESCE(pl.is_return, false) THEN pl.created_at
                 ELSE COALESCE(parent.created_at, pl.created_at) END AS ordered_at,
            CASE WHEN pli.quantity_picked > 0 THEN pli.quantity_picked ELSE pli.quantity_required END AS line_qty,
@@ -75,12 +81,12 @@ const DEMAND = `
       )
   ),
   parts AS (
-    SELECT u.item_id, u.pick_list_number, u.line_number, u.status, u.ordered_at,
+    SELECT u.item_id, u.pick_list_number, u.line_number, u.status, u.ordered_at, u.forced,
            upper(sd.component_sku) AS sku, (u.line_qty * sd.per_unit_qty)::numeric AS qty
     FROM units u
     JOIN sale_demand sd ON sd.pick_list_item_id = u.item_id AND NOT COALESCE(sd.is_custom, false)
     UNION ALL
-    SELECT u.item_id, u.pick_list_number, u.line_number, u.status, u.ordered_at,
+    SELECT u.item_id, u.pick_list_number, u.line_number, u.status, u.ordered_at, u.forced,
            upper(comp.sku), (u.line_qty * COALESCE(comp.required_quantity, 1))::numeric
     FROM units u
     CROSS JOIN LATERAL jsonb_to_recordset(u.kit_components) AS comp(sku text, required_quantity numeric)
@@ -92,7 +98,7 @@ const DEMAND = `
         WHERE sd.pick_list_item_id = u.item_id AND NOT COALESCE(sd.is_custom, false)
       )
     UNION ALL
-    SELECT u.item_id, u.pick_list_number, u.line_number, u.status, u.ordered_at,
+    SELECT u.item_id, u.pick_list_number, u.line_number, u.status, u.ordered_at, u.forced,
            u.product_sku, u.line_qty
     FROM units u
     WHERE NOT EXISTS (
@@ -105,7 +111,7 @@ const DEMAND = `
         AND jsonb_array_length(u.kit_components) > 0
       )
   )
-  SELECT p.item_id, p.pick_list_number, p.line_number, p.status, p.ordered_at,
+  SELECT p.item_id, p.pick_list_number, p.line_number, p.status, p.ordered_at, bool_or(p.forced) AS forced,
          box.packaging_item_id, ROUND(SUM(p.qty * box.per))::int AS qty
   FROM parts p
   JOIN LATERAL (
@@ -150,6 +156,7 @@ export async function computeBoxHolds(): Promise<void> {
       boxId: row.packaging_item_id,
       required: Number(row.qty) || 0,
       started: STARTED.has(String(row.status || '')),
+      forced: Boolean(row.forced),
     }));
 
   const boxIds = [...new Set(lines.map((line) => line.boxId))];

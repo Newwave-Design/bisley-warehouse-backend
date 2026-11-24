@@ -38,6 +38,7 @@ import { isWorkingIsoDay } from '../../lib/working-days.js';
 import { loadHoldups } from '../../lib/order-holdup.js';
 import { loadCarrierStatus, loadReturnCollections } from '../../lib/carrier-status.js';
 import { AddressError, cleanAddressPatch, describeAddressChange } from '../../lib/delivery-address.js';
+import { forceAdd, ForceAddError, undoForceAdd } from '../../lib/force-add.js';
 import { issueRefund, listRefunds, refundPosition, RefundError, REFUND_REASONS } from '../../lib/refunds.js';
 
 const router = express.Router();
@@ -627,6 +628,36 @@ router.patch('/:pickListId/shipping-address', authMiddleware, async (req: AuthRe
     if (error instanceof AddressError) return res.status(error.status).json({ error: error.message });
     console.error('Address correction failed', error);
     return res.status(500).json({ error: 'The address was not changed' });
+  }
+});
+
+/**
+ * POST /api/pick-lists/:pickListId/force-add
+ * Body: { sku, quantity, note? }
+ * Adds the item to this order and gives it stock and boxes before every other order, taking what other orders had reserved
+ * but not picked. The result names each order that lost something. Those orders are flagged and their history records it.
+ * Not for an order that is packed or shipped, or unpaid. X-Actor names who did it.
+ */
+router.post('/:pickListId/force-add', authMiddleware, requirePermission('manage_operations'), async (req: AuthRequest, res: Response) => {
+  try {
+    const actor = String(req.headers['x-actor'] || '').trim().slice(0, 120) || actorName(req.user);
+    return res.status(201).json(await forceAdd({ pickListId: req.params.pickListId, sku: String(req.body?.sku || ''), quantity: Number(req.body?.quantity), actor, note: req.body?.note ? String(req.body.note) : undefined }));
+  } catch (error) {
+    if (error instanceof ForceAddError) return res.status(error.status).json({ error: error.message });
+    console.error('Force add failed', error);
+    return res.status(500).json({ error: 'The item was not added' });
+  }
+});
+
+/** DELETE /api/pick-lists/:pickListId/force-add/:itemId — takes a forced line back off if none of it is picked. */
+router.delete('/:pickListId/force-add/:itemId', authMiddleware, requirePermission('manage_operations'), async (req: AuthRequest, res: Response) => {
+  try {
+    const actor = String(req.headers['x-actor'] || '').trim().slice(0, 120) || actorName(req.user);
+    return res.json(await undoForceAdd({ pickListId: req.params.pickListId, itemId: req.params.itemId, actor }));
+  } catch (error) {
+    if (error instanceof ForceAddError) return res.status(error.status).json({ error: error.message });
+    console.error('Undo force add failed', error);
+    return res.status(500).json({ error: 'The line was not taken off' });
   }
 });
 

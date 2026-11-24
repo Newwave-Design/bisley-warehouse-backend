@@ -22,6 +22,8 @@ export interface HoldDemand {
   picked: number;
   parts: HoldPart[];
   scanned: Map<string, number>;
+  /** Force-added: served before every other order, so it takes unpicked stock from newer ones. */
+  forced?: boolean;
 }
 
 export interface PlannedHold { itemId: string; sku: string; qty: number }
@@ -125,7 +127,7 @@ export function planHolds(lines: HoldDemand[], onHand: Map<string, number>, clai
     free.set(sku, (free.get(sku) ?? 0) - give);
   }
 
-  const ordered = [...lines].sort((a, b) => a.orderedAt - b.orderedAt || a.pickListNumber.localeCompare(b.pickListNumber) || a.lineNumber - b.lineNumber);
+  const ordered = [...lines].sort((a, b) => Number(!!b.forced) - Number(!!a.forced) || a.orderedAt - b.orderedAt || a.pickListNumber.localeCompare(b.pickListNumber) || a.lineNumber - b.lineNumber);
   const holds: PlannedHold[] = [];
   for (const line of ordered) {
     if (line.parts.length) {
@@ -156,7 +158,7 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 async function computeHolds(): Promise<void> {
   const demand = await query(
     `SELECT pli.id AS item_id, pli.line_number, pli.product_sku, pli.quantity_required, pli.quantity_picked,
-            pli.is_custom, wp.kit_components,
+            pli.is_custom, wp.kit_components, (pli.forced_at IS NOT NULL) AS forced,
             pl.pick_list_number,
             CASE WHEN COALESCE(pl.is_return, false) THEN pl.created_at
                  ELSE COALESCE(parent.created_at, pl.created_at) END AS ordered_at
@@ -187,6 +189,7 @@ async function computeHolds(): Promise<void> {
       picked: Number(row.quantity_picked) || 0,
       parts: stored.length ? stored : trayPackParts(row.product_sku),
       scanned: new Map<string, number>(),
+      forced: Boolean(row.forced),
     };
   });
   const byId = new Map(lines.map((line) => [line.itemId, line]));

@@ -451,6 +451,9 @@ ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS is_sandbox BOOLEAN NOT NULL
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS liability_status VARCHAR(20);
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS unit_price_gbp DECIMAL(10,2);
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS unit_cost_gbp DECIMAL(10,2);
+-- A line someone force-added: it is served stock and boxes before every other order.
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS forced_at TIMESTAMP;
+ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS forced_by VARCHAR(255);
 -- Medusa order line item IDs — required for fulfillment sync to Medusa Admin API
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS medusa_order_line_item_id VARCHAR(100);
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS medusa_variant_id VARCHAR(100);

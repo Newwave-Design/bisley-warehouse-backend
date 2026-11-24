@@ -87,3 +87,21 @@ test('loose singles and a pack together cover both orders', () => {
   assert.equal(qty('singles'), 2)
   assert.equal(qty('pack'), 5)
 })
+
+test('a forced line takes unpicked stock from an older order', () => {
+  const lines = [
+    line({ itemId: 'older', sku: 'A', orderedAt: 1 }),
+    line({ itemId: 'forced', sku: 'A', orderedAt: 9, forced: true }),
+  ]
+  const holds = planHolds(lines, new Map([['A', 1]]))
+  assert.deepEqual(holds, [{ itemId: 'forced', sku: 'A', qty: 1 }])
+})
+
+test('a forced line cannot take what is already picked for another order', () => {
+  const lines = [
+    line({ itemId: 'older', sku: 'A', orderedAt: 1, picked: 1 }),
+    line({ itemId: 'forced', sku: 'A', orderedAt: 9, forced: true }),
+  ]
+  const holds = planHolds(lines, new Map([['A', 1]]))
+  assert.deepEqual(holds, [{ itemId: 'older', sku: 'A', qty: 1 }])
+})

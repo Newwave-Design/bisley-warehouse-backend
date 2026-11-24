@@ -58,3 +58,11 @@ test('two box codes are reserved separately', () => {
   assert.equal(qty('box-3'), 1)
   assert.equal(qty('box-5'), 0)
 })
+
+test('a forced line gets the box before a started order', () => {
+  const holds = planBoxHolds([
+    line({ itemId: 'started', boxId: 'box', orderedAt: 1, started: true }),
+    line({ itemId: 'forced', boxId: 'box', orderedAt: 9, forced: true }),
+  ], new Map([['box', 1]]))
+  assert.deepEqual(holds, [{ itemId: 'forced', boxId: 'box', qty: 1 }])
+})
