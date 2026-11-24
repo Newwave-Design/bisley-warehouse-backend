@@ -68,7 +68,7 @@ function apcScans(payload: any): ApcScan[] {
   );
 }
 
-async function apcScansFor(waybill: string): Promise<ApcScan[]> {
+export async function apcScansFor(waybill: string): Promise<ApcScan[]> {
   const number = waybill.replace(/\s+/g, '');
   const user = process.env.APC_USER;
   const password = process.env.APC_PASSWORD;
@@ -90,7 +90,7 @@ async function apcScansFor(waybill: string): Promise<ApcScan[]> {
   return apcScans(await response.json());
 }
 
-async function dxStatusesFor(consignment: string, postcode: string): Promise<string[]> {
+export async function dxStatusesFor(consignment: string, postcode: string): Promise<string[]> {
   const number = consignment.replace(/\s+/g, '').toUpperCase();
   const compact = postcode.toUpperCase().replace(/\s+/g, '');
   if (!/^[A-Z]\d{7}$|^\d{8}$/.test(number) || compact.length < 5) return [];

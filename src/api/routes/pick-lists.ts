@@ -36,6 +36,7 @@ import { stockReservations, takeReservedItem } from '../../lib/stock-reservation
 import { addReturnRequestImage, cancelReturnRequests, deleteReturnRequestImage, listReturnRequests, requestReturns, returnRequestImage, ReturnRequestError } from '../../lib/return-requests.js';
 import { isWorkingIsoDay } from '../../lib/working-days.js';
 import { loadHoldups } from '../../lib/order-holdup.js';
+import { loadCarrierStatus } from '../../lib/carrier-status.js';
 
 const router = express.Router();
 
@@ -489,6 +490,24 @@ router.post('/holdup', authMiddleware, async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Pick list hold-up failed', error);
     return res.status(500).json({ error: 'Failed to read what is holding these orders up' });
+  }
+});
+
+/**
+ * POST /api/pick-lists/carrier-status
+ * Booking and carrier scans for each order: courier, service, collection day, whether the carrier has it at a depot, delivered.
+ * Body: { ids: string[] } (at most 50). Read only. Scans are cached for five minutes.
+ */
+router.post('/carrier-status', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : [])
+      .map((id: unknown) => String(id || '').trim())
+      .filter((id: string) => PICK_LIST_ID.test(id)))].slice(0, 50) as string[];
+    if (!ids.length) return res.json({ carriers: {} });
+    return res.json({ carriers: await loadCarrierStatus(ids) });
+  } catch (error) {
+    console.error('Pick list carrier status failed', error);
+    return res.status(500).json({ error: 'Failed to read the carrier status' });
   }
 });
 
