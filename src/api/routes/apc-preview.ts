@@ -20,6 +20,7 @@ import { collectionDateRefused, weekdayCollectionDates, weekdaysAfter } from '..
 import { apcAlreadyCancelled, apcAvailabilityItems, apcConsignmentSize, apcDutyItem, appropriateApcServices, northernIrelandPostcode } from '../../lib/apc-service.js';
 import { createRoyalMailParcel, deleteRoyalMailOrders, fetchRoyalMailLabelPdf, quoteRoyalMailParcels, readRoyalMailTracking, RoyalMailError, royalMailConfigured, type RoyalMailParcelFormat } from '../../lib/royal-mail.js';
 import { isPaid } from '../../lib/payment-status.js';
+import { isWorkingDay, isWorkingIsoDay } from '../../lib/working-days.js';
 
 async function dropReplacements(pickListId: string | undefined, waybill: string, orderNumber = '') {
   if (!pickListId || (!waybill && !orderNumber)) return;
@@ -168,6 +169,23 @@ async function deliveredCourier(pickListId: string): Promise<'APC' | 'DX'> {
   return blob.includes('DX') ? 'DX' : 'APC';
 }
 
+/**
+ * GET /api/apc/collection-days?count=30
+ * The days a courier will collect, from today: weekdays that are not bank holidays. Read only.
+ */
+router.get('/collection-days', authMiddleware, (req: AuthRequest, res: Response) => {
+  const count = Math.min(Math.max(Math.floor(Number(req.query.count)) || 30, 1), 60);
+  const days: { date: string; label: string }[] = [];
+  for (let offset = 0; offset < 180 && days.length < count; offset += 1) {
+    const day = shiftLondonDate(offset);
+    const date = `${day.year}-${String(day.month).padStart(2, '0')}-${String(day.day).padStart(2, '0')}`;
+    if (!isWorkingIsoDay(date)) continue;
+    const label = new Intl.DateTimeFormat('en-GB', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short' }).format(new Date(`${date}T12:00:00Z`));
+    days.push({ date, label });
+  }
+  res.json({ days });
+});
+
 router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) => {
   const pieces = asList<PieceInput>(req.body?.pieces).slice(0, 20);
   const collectionPostcode = text(req.body?.collectionPostcode).trim();
@@ -186,7 +204,7 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
     return res.status(409).json({ error: 'Staging can book DX on the UAT service only.' });
   }
   if (returning && !agreedDate) {
-    return res.status(400).json({ error: 'Enter the collection date agreed with the customer. It has to be a weekday that has not passed.' });
+    return res.status(400).json({ error: 'Enter the collection date agreed with the customer. It has to be a collection day: a weekday that is not a bank holiday and has not passed.' });
   }
   if (courier === 'RM') {
     if (returning) return res.status(400).json({ error: 'A return is collected by the courier that delivered it.' });
@@ -421,7 +439,7 @@ function agreedCollectionDate(value: unknown, now = new Date()): string {
   if (!day || !month || !year) return '';
   const parts = londonParts(new Date(Date.UTC(year, month - 1, day, 12)));
   if (parts.year !== year || parts.month !== month || parts.day !== day) return '';
-  if (weekend(parts.weekday)) return '';
+  if (weekend(parts.weekday) || !isWorkingDay(parts)) return '';
   const today = londonParts(now);
   const key = year * 10000 + month * 100 + day;
   const todayKey = today.year * 10000 + today.month * 100 + today.day;
@@ -715,7 +733,7 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     return res.status(400).json({ error: 'Choose whether this return is a refund, a replacement, or a collection only.' });
   }
   if (returning && !agreedDate) {
-    return res.status(400).json({ error: 'Enter the collection date agreed with the customer. It has to be a weekday that has not passed.' });
+    return res.status(400).json({ error: 'Enter the collection date agreed with the customer. It has to be a collection day: a weekday that is not a bank holiday and has not passed.' });
   }
   let customFrom: CustomAddress | null = null;
   let customTo: CustomAddress | null = null;
