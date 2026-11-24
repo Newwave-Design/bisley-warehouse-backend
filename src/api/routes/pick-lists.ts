@@ -37,6 +37,7 @@ import { addReturnRequestImage, cancelReturnRequests, deleteReturnRequestImage, 
 import { isWorkingIsoDay } from '../../lib/working-days.js';
 import { loadHoldups } from '../../lib/order-holdup.js';
 import { loadCarrierStatus, loadReturnCollections } from '../../lib/carrier-status.js';
+import { AddressError, cleanAddressPatch, describeAddressChange } from '../../lib/delivery-address.js';
 import { issueRefund, listRefunds, refundPosition, RefundError, REFUND_REASONS } from '../../lib/refunds.js';
 
 const router = express.Router();
@@ -567,6 +568,65 @@ router.post('/:pickListId/refund', authMiddleware, async (req: AuthRequest, res:
     if (error instanceof RefundError) return res.status(error.status).json({ error: error.message });
     console.error('Refund failed', error);
     return res.status(500).json({ error: 'The refund failed' });
+  }
+});
+
+/**
+ * PATCH /api/pick-lists/:pickListId/shipping-address
+ * Body: the address fields to change: first_name, last_name, company, address_1, address_2, city, province, postal_code, country_code, phone,
+ * and acknowledge_booking: true to change it even though a collection is already booked.
+ * Corrects the warehouse's copy of the delivery address, which is taken once when the order is placed and never refreshed.
+ * Only an order that has not shipped. The history records what changed and who did it (X-Actor).
+ */
+router.patch('/:pickListId/shipping-address', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { acknowledge_booking, ...fields } = (req.body || {}) as Record<string, unknown>;
+    const patch = cleanAddressPatch(fields);
+    const found = await query(
+      `SELECT id, status, is_archived, is_return, shipping_address, customer_name FROM pick_lists WHERE id = $1`,
+      [req.params.pickListId]
+    );
+    const list = found.rows[0];
+    if (!list) return res.status(404).json({ error: 'Pick list not found' });
+    if (list.status === 'DISPATCHED' || list.status === 'CANCELLED' || list.is_archived) {
+      return res.status(409).json({ error: 'This order has already shipped or been cancelled, so its delivery address cannot be changed here' });
+    }
+    const booked = await query(
+      `SELECT courier, waybill FROM collection_bookings
+        WHERE pick_list_id = $1 AND status <> 'cancelled' AND COALESCE(direction, 'outbound') <> 'return' ORDER BY created_at DESC LIMIT 1`,
+      [list.id]
+    );
+    if (booked.rows[0] && acknowledge_booking !== true) {
+      return res.status(409).json({
+        error: `A ${booked.rows[0].courier} collection is already booked for this order with the old address. Changing it here does not change the booking: cancel and rebook the collection, then correct the address.`,
+        booked: true,
+      });
+    }
+    const before = (list.shipping_address && typeof list.shipping_address === 'object') ? list.shipping_address : {};
+    const name = patch.first_name != null || patch.last_name != null
+      ? [patch.first_name ?? before.first_name, patch.last_name ?? before.last_name].filter(Boolean).join(' ').trim() || null
+      : null;
+    const saved = await query(
+      `UPDATE pick_lists
+          SET shipping_address = COALESCE(shipping_address, '{}'::jsonb) || $2::jsonb,
+              customer_name = COALESCE($3, customer_name),
+              updated_at = NOW()
+        WHERE id = $1 AND status NOT IN ('DISPATCHED', 'CANCELLED') AND NOT is_archived
+        RETURNING id, shipping_address, customer_name`,
+      [list.id, JSON.stringify(patch), name]
+    );
+    if (!saved.rows[0]) return res.status(409).json({ error: 'The order changed while this was being saved. Try again.' });
+    await recordPickListEvents({
+      ids: [list.id],
+      actor: String(req.headers['x-actor'] || '').trim().slice(0, 120) || actorName(req.user),
+      action: 'address',
+      summary: describeAddressChange(before, patch),
+    });
+    return res.json({ pickList: saved.rows[0], changed: describeAddressChange(before, patch) });
+  } catch (error) {
+    if (error instanceof AddressError) return res.status(error.status).json({ error: error.message });
+    console.error('Address correction failed', error);
+    return res.status(500).json({ error: 'The address was not changed' });
   }
 });
 
