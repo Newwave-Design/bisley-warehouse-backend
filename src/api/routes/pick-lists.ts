@@ -37,7 +37,7 @@ import { addReturnRequestImage, cancelReturnRequests, deleteReturnRequestImage, 
 import { isWorkingIsoDay } from '../../lib/working-days.js';
 import { loadHoldups } from '../../lib/order-holdup.js';
 import { loadCarrierStatus } from '../../lib/carrier-status.js';
-import { decideRefund, issueRefund, listRefunds, proposeRefund, proposedRefunds, refundPosition, RefundError, REFUND_REASONS } from '../../lib/refunds.js';
+import { issueRefund, listRefunds, refundPosition, RefundError, REFUND_REASONS } from '../../lib/refunds.js';
 
 const router = express.Router();
 
@@ -565,71 +565,6 @@ router.post('/:pickListId/refund', authMiddleware, async (req: AuthRequest, res:
     if (error instanceof RefundError) return res.status(error.status).json({ error: error.message });
     console.error('Refund failed', error);
     return res.status(500).json({ error: 'The refund failed' });
-  }
-});
-
-/**
- * POST /api/pick-lists/:pickListId/refund-proposal
- * Body: { amount, reason, note (required), includes_shipping?, idempotency_key? }
- * Asks for a refund without paying it. An admin approves or declines it on the customer desk. X-Actor names who asked.
- */
-router.post('/:pickListId/refund-proposal', authMiddleware, async (req: AuthRequest, res: Response) => {
-  try {
-    const actor = String(req.headers['x-actor'] || '').trim().slice(0, 120) || actorName(req.user);
-    const result = await proposeRefund({
-      pickListId: req.params.pickListId,
-      amount: req.body?.amount,
-      reason: req.body?.reason,
-      note: req.body?.note,
-      includesShipping: req.body?.includes_shipping === true,
-      idempotencyKey: req.body?.idempotency_key || null,
-      actor,
-    });
-    if (!result.repeated) {
-      await recordPickListEvents({ ids: [req.params.pickListId], actor, action: 'refund-proposed', summary: `Proposed a refund of £${Number(result.refund.amount_gbp).toFixed(2)} (${result.refund.reason.replace(/_/g, ' ')}), waiting for approval` });
-    }
-    return res.status(result.repeated ? 200 : 201).json(result);
-  } catch (error) {
-    if (error instanceof RefundError) return res.status(error.status).json({ error: error.message });
-    console.error('Refund proposal failed', error);
-    return res.status(500).json({ error: 'The refund request was not saved' });
-  }
-});
-
-/** POST /api/pick-lists/refund-proposals — refunds waiting for approval. Body: { ids: string[] } (at most 50). Read only. */
-router.post('/refund-proposals', authMiddleware, async (req: Request, res: Response) => {
-  try {
-    const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : [])
-      .map((id: unknown) => String(id || '').trim())
-      .filter((id: string) => PICK_LIST_ID.test(id)))].slice(0, 50) as string[];
-    if (!ids.length) return res.json({ proposals: {} });
-    return res.json({ proposals: await proposedRefunds(ids) });
-  } catch (error) {
-    console.error('Refund proposals failed', error);
-    return res.status(500).json({ error: 'Failed to read the refunds waiting for approval' });
-  }
-});
-
-/**
- * POST /api/pick-lists/refunds/:refundId/decision
- * Body: { decision: 'approve' | 'reject', reason? }
- * Approving checks the order again and then pays through the shop. X-Actor names the approver.
- */
-router.post('/refunds/:refundId/decision', authMiddleware, async (req: AuthRequest, res: Response) => {
-  try {
-    const decision = req.body?.decision === 'approve' ? 'approve' : req.body?.decision === 'reject' ? 'reject' : '';
-    if (!decision) return res.status(400).json({ error: 'decision must be approve or reject' });
-    if (!PICK_LIST_ID.test(req.params.refundId)) return res.status(400).json({ error: 'Unknown refund' });
-    const actor = String(req.headers['x-actor'] || '').trim().slice(0, 120) || actorName(req.user);
-    const result = await decideRefund(req.params.refundId, decision, actor, req.body?.reason);
-    if (result.refund.pick_list_id) {
-      await recordPickListEvents({ ids: [String(result.refund.pick_list_id)], actor, action: decision === 'approve' ? 'refund' : 'refund-declined', summary: decision === 'approve' ? `Approved and refunded £${Number(result.refund.amount_gbp).toFixed(2)}` : `Declined a proposed refund of £${Number(result.refund.amount_gbp).toFixed(2)}` });
-    }
-    return res.json(result);
-  } catch (error) {
-    if (error instanceof RefundError) return res.status(error.status).json({ error: error.message });
-    console.error('Refund decision failed', error);
-    return res.status(500).json({ error: 'The decision was not saved' });
   }
 });
 
