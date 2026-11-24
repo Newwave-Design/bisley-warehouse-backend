@@ -37,6 +37,7 @@ import { addReturnRequestImage, cancelReturnRequests, deleteReturnRequestImage, 
 import { isWorkingIsoDay } from '../../lib/working-days.js';
 import { loadHoldups } from '../../lib/order-holdup.js';
 import { loadCarrierStatus } from '../../lib/carrier-status.js';
+import { issueRefund, listRefunds, refundPosition, RefundError, REFUND_REASONS } from '../../lib/refunds.js';
 
 const router = express.Router();
 
@@ -508,6 +509,58 @@ router.post('/carrier-status', authMiddleware, async (req: Request, res: Respons
   } catch (error) {
     console.error('Pick list carrier status failed', error);
     return res.status(500).json({ error: 'Failed to read the carrier status' });
+  }
+});
+
+/**
+ * GET /api/pick-lists/:pickListId/refunds
+ * What was paid, what has been refunded and can still be, and each refund on this order. Read only.
+ */
+router.get('/:pickListId/refunds', authMiddleware, async (req: Request, res: Response) => {
+  try {
+    const pick = await query(`SELECT medusa_order_id FROM pick_lists WHERE id = $1`, [req.params.pickListId]);
+    if (!pick.rows[0]) return res.status(404).json({ error: 'Order not found' });
+    const orderId = String(pick.rows[0].medusa_order_id || '');
+    const position = orderId.startsWith('order_') ? await refundPosition(orderId).catch(() => null) : null;
+    return res.json({ position, refunds: await listRefunds(req.params.pickListId), reasons: REFUND_REASONS });
+  } catch (error) {
+    console.error('Refund list failed', error);
+    return res.status(500).json({ error: 'Failed to read the refunds' });
+  }
+});
+
+/**
+ * POST /api/pick-lists/:pickListId/refund
+ * Body: { amount (GBP), reason, note?, includes_shipping?, return_id?, idempotency_key? }
+ * Refunds that amount to the customer's original payment through the shop. The row is issued only when the shop confirms.
+ * Refuses more than is left to refund. The caller names the person in X-Actor.
+ */
+router.post('/:pickListId/refund', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const actor = String(req.headers['x-actor'] || '').trim().slice(0, 120) || actorName(req.user);
+    const result = await issueRefund({
+      pickListId: req.params.pickListId,
+      amount: req.body?.amount,
+      reason: req.body?.reason,
+      note: req.body?.note,
+      includesShipping: req.body?.includes_shipping === true,
+      returnAuthorizationId: req.body?.return_id || null,
+      idempotencyKey: req.body?.idempotency_key || null,
+      actor,
+    });
+    if (!result.repeated) {
+      await recordPickListEvents({
+        ids: [req.params.pickListId],
+        actor,
+        action: 'refund',
+        summary: `Refunded £${Number(result.refund.amount_gbp).toFixed(2)} (${result.refund.reason.replace(/_/g, ' ')})`,
+      });
+    }
+    return res.status(result.repeated ? 200 : 201).json(result);
+  } catch (error) {
+    if (error instanceof RefundError) return res.status(error.status).json({ error: error.message });
+    console.error('Refund failed', error);
+    return res.status(500).json({ error: 'The refund failed' });
   }
 });
 

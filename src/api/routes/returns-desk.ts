@@ -7,6 +7,7 @@
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { issueRefund, RefundError } from '../../lib/refunds.js';
 import { isStaging } from '../../lib/staging.js';
 import { canScanIntoStock, claimFileName, decisionChangesStock, refundWaitsForInspection, soldStockTreatment, zipStore, RETURN_REASONS } from '../../lib/returns-desk-rules.js';
 
@@ -210,32 +211,34 @@ router.post('/:id/refund', async (req: AuthRequest, res: Response) => {
   if (refundWaitsForInspection({ courierProblem: row.courier_problem, holdRefund: row.hold_refund }) && !row.received_at && row.desk_status === 'due_back') {
     return res.status(400).json({ error: 'The refund waits until the item is inspected' });
   }
-  const partial = req.body?.partial === true;
+  if (!row.pick_list_id) return res.status(400).json({ error: 'This return is not linked to a warehouse order, so the shop cannot be refunded from here' });
   const shipping = req.body?.shipping === true;
-  let sent = false;
-  let shopError = '';
-  if (isStaging() || !process.env.MEDUSA_BACKEND_URL) {
-    shopError = 'The shop refund was not sent. Staging does not call the live shop.';
+  const reasonMap: Record<string, string> = { 'Change of mind': 'change_of_mind', Damaged: 'damaged', 'Wrong item': 'wrong_item', Faulty: 'faulty', 'Courier problem': 'lost' };
+  try {
+    const result = await issueRefund({
+      pickListId: row.pick_list_id,
+      amount: req.body?.amount,
+      reason: req.body?.reason || reasonMap[String(row.return_reason)] || 'other',
+      note: req.body?.note || `${row.rma_number}`,
+      includesShipping: shipping,
+      returnAuthorizationId: row.id,
+      idempotencyKey: req.body?.idempotency_key || null,
+      actor: String(req.user?.email || 'returns desk'),
+    });
+    const left = result.position.left;
     await query(
-      `INSERT INTO wms_error_log (source, message, context, created_at)
-       VALUES ('returns', $1, $2::jsonb, NOW())`,
-      [shopError, JSON.stringify({ return_id: row.id, partial, shipping })]
-    ).catch(() => undefined);
-  } else {
-    shopError = 'The shop refund call is not connected from this desk yet.';
-    await query(
-      `INSERT INTO wms_error_log (source, message, context, created_at)
-       VALUES ('returns', $1, $2::jsonb, NOW())`,
-      [shopError, JSON.stringify({ return_id: row.id, partial, shipping })]
-    ).catch(() => undefined);
+      `UPDATE return_authorizations
+       SET status = CASE WHEN $3::numeric <= 0 OR $4::boolean THEN 'REFUNDED' ELSE status END,
+           desk_status = CASE WHEN $3::numeric <= 0 OR $4::boolean THEN 'closed' ELSE desk_status END,
+           refund_shipping = refund_shipping OR $2, refunded_at = NOW(), updated_at = NOW()
+       WHERE id = $1`,
+      [row.id, shipping, left, req.body?.close === true]
+    );
+    return res.json({ refunded: true, amount: Number(result.refund.amount_gbp), left, payment: 'original', refund: result.refund });
+  } catch (error) {
+    if (error instanceof RefundError) return res.status(error.status).json({ error: error.message });
+    throw error;
   }
-  await query(
-    `UPDATE return_authorizations
-     SET status = 'REFUNDED', desk_status = 'closed', refund_shipping = $2, refunded_at = NOW(), updated_at = NOW()
-     WHERE id = $1`,
-    [row.id, shipping]
-  );
-  res.json({ refunded: true, sent_to_shop: sent, shop_error: shopError, partial, payment: 'original' });
 });
 
 router.post('/:id/claim-report', async (req: AuthRequest, res: Response) => {

@@ -295,6 +295,25 @@ export async function ensurePackagingSchema() {
       created_by VARCHAR(255),
       created_at TIMESTAMP DEFAULT NOW()
     )`,
+    `CREATE TABLE IF NOT EXISTS order_refunds (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      pick_list_id UUID REFERENCES pick_lists(id) ON DELETE SET NULL,
+      return_authorization_id UUID REFERENCES return_authorizations(id) ON DELETE SET NULL,
+      medusa_order_id VARCHAR(100) NOT NULL,
+      medusa_payment_id VARCHAR(100),
+      amount_gbp NUMERIC(10,2) NOT NULL CHECK (amount_gbp > 0),
+      reason VARCHAR(30) NOT NULL,
+      note TEXT,
+      includes_shipping BOOLEAN NOT NULL DEFAULT false,
+      status VARCHAR(10) NOT NULL DEFAULT 'pending',
+      requested_by VARCHAR(255),
+      shop_error TEXT,
+      idempotency_key VARCHAR(80),
+      created_at TIMESTAMP DEFAULT NOW(),
+      issued_at TIMESTAMP
+    )`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_order_refunds_key ON order_refunds (idempotency_key) WHERE idempotency_key IS NOT NULL`,
+    `CREATE INDEX IF NOT EXISTS idx_order_refunds_pick ON order_refunds (pick_list_id, created_at DESC)`,
   ];
 
   for (const sql of statements) {
