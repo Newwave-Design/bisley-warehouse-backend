@@ -297,6 +297,7 @@ export async function ensurePackagingSchema() {
     )`,
     `ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS forced_at TIMESTAMP`,
     `ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS forced_by VARCHAR(255)`,
+    `ALTER TABLE IF EXISTS delivery_notes ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ, ADD COLUMN IF NOT EXISTS closed_by VARCHAR(255), ADD COLUMN IF NOT EXISTS close_note TEXT`,
     `CREATE TABLE IF NOT EXISTS order_refunds (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       pick_list_id UUID REFERENCES pick_lists(id) ON DELETE SET NULL,

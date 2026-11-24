@@ -7,6 +7,7 @@
  * DELETE /api/dispatch-notes/:id
  */
 
+import { closeDeliveryNote, reopenDeliveryNote } from '../../lib/delivery-note-close.js';
 import express, { Response } from 'express';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { deleteDispatchNote, DispatchNoteError, listDeliveryNotes, saveDispatchNote } from '../../lib/delivery-notes.js';
@@ -42,6 +43,30 @@ router.put('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
     res.json({ id });
   } catch (err) {
     sendError(res, err, 'Failed to save the dispatch note');
+  }
+});
+
+// Close a delivery off as received. Needs everything scanned in, or acceptShortfall with a reason. X-Actor names who did it.
+router.post('/:id/close', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const notes = await listDeliveryNotes();
+    const note = notes.find((row) => row.id === req.params.id);
+    if (!note) return res.status(404).json({ error: 'Delivery not found' });
+    const actor = String(req.headers['x-actor'] || '').trim().slice(0, 120) || req.user?.email || req.user?.id || 'unknown';
+    const result = await closeDeliveryNote(note, actor, { acceptShortfall: req.body?.accept_shortfall === true, note: req.body?.note });
+    if (!result.ok) return res.status(result.status).json({ error: result.error, short: result.short || [] });
+    return res.json({ closed: true, summary: result.summary, short: result.short, over: result.over });
+  } catch (err) {
+    sendError(res, err, 'Failed to close the delivery');
+  }
+});
+
+router.post('/:id/reopen', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (!(await reopenDeliveryNote(req.params.id))) return res.status(404).json({ error: 'That delivery is not closed' });
+    return res.json({ reopened: true });
+  } catch (err) {
+    sendError(res, err, 'Failed to reopen the delivery');
   }
 });
 

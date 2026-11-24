@@ -4,6 +4,7 @@
  */
 import { readFileSync } from 'fs';
 import { getPool, query } from '../db/index.js';
+import { ensureCloseColumns } from './delivery-note-close.js';
 
 interface NoteLine { sku: string; quantity: number }
 interface NoteFile {
@@ -58,9 +59,12 @@ async function scannedByNote(noteId: string): Promise<Map<string, number>> {
   return scanned;
 }
 
-export async function listDeliveryNotes() {
+/** includeClosed is on for the desk. The handheld asks without it, so a closed delivery drops off its check-in list. */
+export async function listDeliveryNotes(options: { includeClosed?: boolean } = {}) {
+  await ensureCloseColumns();
   const notes = await query(
-    `SELECT id, arrives_on::text AS arrives_on, title, reference FROM delivery_notes ORDER BY arrives_on`,
+    `SELECT id, arrives_on::text AS arrives_on, title, reference, closed_at, closed_by, close_note FROM delivery_notes
+      ${options.includeClosed === false ? 'WHERE closed_at IS NULL' : ''} ORDER BY arrives_on`,
   );
   const lines = await query(
     `SELECT delivery_note_id, sku, quantity FROM delivery_note_lines ORDER BY sku`,
@@ -80,6 +84,7 @@ export async function listDeliveryNotes() {
     const received = noteLines.reduce((sum, line) => sum + Math.min(line.received, line.quantity), 0);
     out.push({
       ...note,
+      closed: Boolean(note.closed_at),
       session_id: openByNote.get(note.id) || null,
       expected,
       received,

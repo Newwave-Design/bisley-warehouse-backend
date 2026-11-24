@@ -17,7 +17,8 @@ const router = express.Router();
 
 router.get('/notes', authMiddleware, async (_req: AuthRequest, res: Response) => {
   try {
-    res.json({ notes: await listDeliveryNotes() });
+    // The handheld reads this list. A delivery that has been closed off is left out.
+    res.json({ notes: await listDeliveryNotes({ includeClosed: false }) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to load delivery notes' });
