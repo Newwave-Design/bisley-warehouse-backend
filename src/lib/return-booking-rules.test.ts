@@ -27,3 +27,9 @@ test('an unbooked replacement can be changed to a refund, which drops the order'
     releaseOrder: true,
   })
 })
+
+test('collect only creates no order and releases any replacement', () => {
+  assert.deepEqual(outcomeChange(null, 'collect'), { ok: true, createOrder: false, releaseOrder: true })
+  assert.equal(outcomeChange({ status: 'booked', outcome: 'collect' }, 'collect').ok, true)
+  assert.equal(outcomeChange({ status: 'booked', outcome: 'collect' }, 'replace').ok, false)
+})

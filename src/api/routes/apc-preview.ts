@@ -666,8 +666,8 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   if (process.env.WAREHOUSE_ENV === 'staging' && courier !== 'DX') {
     return res.status(409).json({ error: 'Staging can book DX on the UAT service only.' });
   }
-  if (returning && outcome && outcome !== 'refund' && outcome !== 'replace') {
-    return res.status(400).json({ error: 'Choose whether this return is a refund or a replacement.' });
+  if (returning && outcome && outcome !== 'refund' && outcome !== 'replace' && outcome !== 'collect') {
+    return res.status(400).json({ error: 'Choose whether this return is a refund, a replacement, or a collection only.' });
   }
   if (returning && !agreedDate) {
     return res.status(400).json({ error: 'Enter the collection date agreed with the customer. It has to be a weekday that has not passed.' });
@@ -726,8 +726,8 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
       }
     }
     const replacementActions = new Map<string, { createOrder: boolean; releaseOrder: boolean }>();
-    if (returning && (outcome === 'refund' || outcome === 'replace')) {
-      const choice = outcome === 'replace' ? 'replace' : 'refund';
+    if (returning && (outcome === 'refund' || outcome === 'replace' || outcome === 'collect')) {
+      const choice = outcome === 'replace' ? 'replace' : outcome === 'collect' ? 'collect' : 'refund';
       for (const sku of skus) {
         const current = await query(
           `SELECT status, outcome FROM return_requests

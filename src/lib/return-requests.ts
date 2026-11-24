@@ -71,8 +71,8 @@ async function skusOnList(pickListId: string): Promise<string[]> {
 
 /** Mark the whole order, or the given items, as waiting for a return collection. A replacement is created for Plan picks and is not put on a pick list. */
 export async function requestReturns(pickListId: string, skus: string[] | null, actor: string, outcome: string) {
-  const choice = outcome === 'replace' ? 'replace' : outcome === 'refund' ? 'refund' : '';
-  if (!choice) throw new ReturnRequestError('Choose whether this return is a refund or a replacement.');
+  const choice = outcome === 'replace' ? 'replace' : outcome === 'refund' ? 'refund' : outcome === 'collect' ? 'collect' : '';
+  if (!choice) throw new ReturnRequestError('Choose whether this return is a refund, a replacement, or a collection only.');
   const found = await query(`SELECT id, status FROM pick_lists WHERE id = $1`, [pickListId]);
   const list = found.rows[0];
   if (!list) throw new ReturnRequestError('Unknown order', 404);
