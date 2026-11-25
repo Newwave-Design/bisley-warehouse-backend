@@ -14,6 +14,7 @@ import { initializePool, closePool } from './db/index.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureFulfillmentSchema } from './db/ensure-fulfillment-schema.js';
 import { ensurePickListEvents } from './db/ensure-pick-list-events.js';
+import { ensureBondedStock } from './lib/bonded-stock.js';
 import { ensureStockSoldAudit } from './db/ensure-stock-sold-audit.js';
 import { ensurePackagingSchema } from './db/ensure-packaging-schema.js';
 import { ensureDeliveryNotes } from './lib/delivery-notes.js';
@@ -236,6 +237,12 @@ async function start() {
       await ensurePickListEvents();
     } catch (eventError) {
       console.warn('⚠️  Pick list events bootstrap warning:', (eventError as Error).message);
+    }
+
+    try {
+      await ensureBondedStock();
+    } catch (bondedError) {
+      console.warn('⚠️  Bonded stock bootstrap warning:', (bondedError as Error).message);
     }
 
     // Start server

@@ -6,7 +6,8 @@
 
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
-import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
+import { bondableUnits, ensureBondedStock } from '../../lib/bonded-stock.js';
 import { createNotificationOnce } from '../../lib/notifications.js';
 import { getOrderValues } from '../../lib/order-values.js';
 import { COLOUR_NAMES, extractColourCode, sampleColourLabel } from '../../lib/colour-names.js';
@@ -396,6 +397,7 @@ function round2(n: number): number {
  * Daily net sales (ex VAT) against the £90k/month target. Defaults to the current calendar month (London).
  */
 router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => {
+  await ensureBondedStock().catch((error) => console.warn('[reports/sales] bonded list not ready:', error instanceof Error ? error.message : error));
   try {
     const fallback = currentMonthRange();
     const from = (req.query.from as string) || fallback.from;
@@ -564,8 +566,8 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
         console.warn('[reports/sales] conversion query failed:', err instanceof Error ? err.message : err);
         return { rows: [{ sample_customers: '0', converted: '0' }] };
       }),
-      // Bonded stock only: on-hand units tagged Bisley (still Bisley's, held here) × net cost (wms_products.unit_cost_gbp),
-      // not the shop price. Stock tagged Ovara is Ovara's own and is left out.
+      // Bonded stock only: the units on the bonded list (the two starting orders), counted up to what is on the shelf,
+      // × net cost (wms_products.unit_cost_gbp), not the shop price. Everything bought since is left out.
       // Kits have no bin of their own, so this is physical stock only.
       // Some bays are labelled with the Medusa SKU while the cost sits on the supplier code;
       // sku_mappings bridges those.
@@ -575,10 +577,11 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
            COALESCE(SUM(s.qty), 0)::int AS units,
            COALESCE(SUM(s.qty) FILTER (WHERE p.unit_cost_gbp IS NULL AND m.unit_cost_gbp IS NULL), 0)::int AS uncosted_units
          FROM (
-           SELECT product_sku, SUM(quantity)::numeric AS qty
-           FROM warehouse_inventory
-           WHERE quantity > 0 AND COALESCE(liability_status, 'Bisley') = 'Bisley'
-           GROUP BY product_sku
+           SELECT wi.product_sku, LEAST(SUM(wi.quantity), MAX(b.units))::numeric AS qty
+           FROM warehouse_inventory wi
+           JOIN bonded_stock b ON b.product_sku = wi.product_sku
+           WHERE wi.quantity > 0
+           GROUP BY wi.product_sku
          ) s
          LEFT JOIN (
            SELECT variant_sku, MAX(unit_cost_gbp) AS unit_cost_gbp
@@ -733,6 +736,75 @@ router.get('/inventory-value', authMiddleware, async (req: AuthRequest, res: Res
   } catch (err) {
     console.error('Inventory value report error:', err);
     res.status(500).json({ error: 'Failed to generate inventory value report' });
+  }
+});
+
+/**
+ * GET /api/reports/bonded-stock: the bonded list with what is on the shelf and what counts as bonded, and the net cost of it.
+ */
+router.get('/bonded-stock', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    await ensureBondedStock();
+    const result = await query(
+      `SELECT b.product_sku AS sku, b.units AS listed, COALESCE(s.onhand, 0)::int AS on_hand,
+              LEAST(b.units, COALESCE(s.onhand, 0))::int AS bonded_units,
+              COALESCE(p.unit_cost_gbp, 0)::float8 AS unit_cost_gbp, b.source
+         FROM bonded_stock b
+         LEFT JOIN (SELECT product_sku, SUM(quantity)::int AS onhand FROM warehouse_inventory WHERE quantity > 0 GROUP BY product_sku) s
+                ON s.product_sku = b.product_sku
+         LEFT JOIN (SELECT variant_sku, MAX(unit_cost_gbp) AS unit_cost_gbp FROM wms_products GROUP BY variant_sku) p
+                ON p.variant_sku = b.product_sku
+        ORDER BY b.product_sku`,
+    );
+    const rows = result.rows as { bonded_units: number; unit_cost_gbp: number }[];
+    res.json({
+      rows: result.rows,
+      skus: rows.length,
+      bonded_units: rows.reduce((sum, row) => sum + row.bonded_units, 0),
+      net_cost_gbp: Math.round(rows.reduce((sum, row) => sum + row.bonded_units * row.unit_cost_gbp, 0) * 100) / 100,
+    });
+  } catch (err) {
+    console.error('Bonded stock list failed:', err instanceof Error ? err.message : err);
+    res.status(500).json({ error: 'Could not load the bonded stock list' });
+  }
+});
+
+/**
+ * POST /api/reports/bonded-stock: { rows: [{ sku, units }] } sets how many units of each SKU are bonded.
+ * units 0 takes the SKU off the list. Other SKUs are left alone.
+ */
+router.post('/bonded-stock', authMiddleware, requirePermission('manage_financials'), async (req: AuthRequest, res: Response) => {
+  try {
+    await ensureBondedStock();
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!rows.length || rows.length > 2000) return res.status(400).json({ error: 'Send between 1 and 2000 rows of { sku, units }' });
+    let saved = 0;
+    let removed = 0;
+    // Only SKUs on the two starting orders can have bonded stock, and no more than the order held.
+    const allowed = await bondableUnits();
+    for (const row of rows) {
+      const sku = String(row?.sku ?? '').trim();
+      const units = Math.trunc(Number(row?.units));
+      if (!sku || sku.length > 120 || !Number.isFinite(units) || units < 0) return res.status(400).json({ error: `Bad row for "${sku}"` });
+      const rule = allowed.get(sku.toUpperCase());
+      if (units > 0 && !rule) return res.status(400).json({ error: `${sku} is not on the starting orders, so it cannot be bonded` });
+      if (units > 0 && rule && units > rule.max) return res.status(400).json({ error: `${sku} can have at most ${rule.max} bonded units (what the starting orders held)` });
+      if (units === 0) {
+        const gone = await query(`DELETE FROM bonded_stock WHERE product_sku = $1`, [sku]);
+        removed += gone.rowCount ?? 0;
+      } else {
+        await query(
+          `INSERT INTO bonded_stock (product_sku, units, source, updated_by) VALUES ($1, $2, 'Edited on the desk', $3)
+           ON CONFLICT (product_sku) DO UPDATE SET units = EXCLUDED.units, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+          [sku, units, req.user?.email ?? null],
+        );
+        saved += 1;
+      }
+    }
+    res.json({ saved, removed });
+  } catch (err) {
+    console.error('Bonded stock save failed:', err instanceof Error ? err.message : err);
+    res.status(500).json({ error: 'Could not save the bonded stock list' });
   }
 });
 
