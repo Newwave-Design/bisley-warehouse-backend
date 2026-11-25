@@ -94,6 +94,12 @@ test('a link to a SKU with nothing on the shelf gives nothing, and the line can 
   assert.deepEqual(plan, [arrival('a', 'ROSFF', 1)])
 })
 
+test('two links to the same part: the one listed first (the newest) wins, the other falls back to normal matching', () => {
+  const lines = [line('a', 'QQ1', 2, 100), line('b', 'QQ2', 2, 200)]
+  const plan = planCustomArrivals(lines, stock(['SPARE', 2]), [{ itemId: 'b', sku: 'SPARE' }, { itemId: 'a', sku: 'SPARE' }])
+  assert.deepEqual(plan, [arrival('b', 'SPARE', 2, true)])
+})
+
 test('a link to a line that is no longer open is ignored', () => {
   assert.deepEqual(planCustomArrivals([], stock(['ROSFF', 1]), [{ itemId: 'gone', sku: 'ROSFF' }]), [])
 })

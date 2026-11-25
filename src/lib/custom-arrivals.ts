@@ -77,7 +77,8 @@ async function run(db: Db): Promise<MatchResult> {
     });
   }
 
-  const pinnedRows = await db.query(`SELECT pick_list_item_id AS "itemId", sku FROM custom_line_arrivals WHERE manual AND consumed_at IS NULL`);
+  // Newest confirmed link first: setting a part aside for another order takes it from an older link when there is not enough for both
+  const pinnedRows = await db.query(`SELECT pick_list_item_id AS "itemId", sku FROM custom_line_arrivals WHERE manual AND consumed_at IS NULL ORDER BY matched_at DESC, pick_list_item_id`);
   const stock = await freeStockNear(db, lines.map((l) => l.code), pinnedRows.rows.map((r: { sku: string }) => r.sku));
   const plan = planCustomArrivals(lines, stock, pinnedRows.rows);
 
@@ -137,7 +138,7 @@ export async function linkCustomArrival(itemId: string, sku: string, existing?: 
     if (!(free.find((f) => f.sku === target)?.free ?? 0)) return { ok: false, status: 409, error: `None of ${target} is free on the shelf` };
     await db.query(
       `INSERT INTO custom_line_arrivals (pick_list_item_id, sku, qty, manual) VALUES ($1, $2, 1, true)
-       ON CONFLICT (pick_list_item_id) DO UPDATE SET sku = EXCLUDED.sku, manual = true, updated_at = NOW()
+       ON CONFLICT (pick_list_item_id) DO UPDATE SET sku = EXCLUDED.sku, manual = true, matched_at = NOW(), updated_at = NOW()
        WHERE custom_line_arrivals.consumed_at IS NULL`,
       [itemId, target],
     );
@@ -164,6 +165,55 @@ export async function unlinkCustomArrival(itemId: string, existing?: Db): Promis
   const db: Db = existing ?? getPool();
   await db.query(`DELETE FROM custom_line_arrivals WHERE pick_list_item_id = $1 AND consumed_at IS NULL`, [itemId]);
   if (!existing) await matchCustomArrivals();
+}
+
+export interface CustomLineState {
+  id: string;
+  order: string;
+  customer: string | null;
+  title: string;
+  code: string;
+  needed: number;
+  arrived: number;
+  arrived_sku: string | null;
+  manual: boolean;
+  state: 'ARRIVED' | 'PARTIAL' | 'WAITING';
+  suggestions: PartSuggestion[];
+}
+
+/** Open custom lines with a part code, whether the part has arrived, and suggested shelf SKUs for any still short. */
+export async function customLinesWithState(db: Db): Promise<CustomLineState[]> {
+  const result = await db.query(
+    `SELECT pli.id, pli.item_title, pli.quantity_required, pli.quantity_picked,
+            pl.pick_list_number, pl.customer_name,
+            COALESCE(a.qty, 0)::int AS arrived, a.sku AS arrived_sku, COALESCE(a.manual, false) AS manual
+       FROM pick_list_items pli
+       JOIN pick_lists pl ON pl.id = pli.pick_list_id
+       LEFT JOIN custom_line_arrivals a ON a.pick_list_item_id = pli.id AND a.consumed_at IS NULL
+      WHERE pli.is_custom = true AND NOT COALESCE(pli.is_archived, false) AND NOT COALESCE(pli.is_sandbox, false)
+        AND NOT pl.is_sandbox AND NOT COALESCE(pl.is_archived, false)
+        AND pl.status NOT IN ('DISPATCHED', 'CANCELLED')
+        AND pli.quantity_picked < pli.quantity_required
+      ORDER BY pl.created_at ASC, pli.line_number ASC`,
+  );
+  const lines: CustomLineState[] = [];
+  for (const r of result.rows) {
+    const title = String(r.item_title || '').trim();
+    const code = codeForLine(title);
+    if (!code) continue;
+    const needed = (Number(r.quantity_required) || 0) - (Number(r.quantity_picked) || 0);
+    const arrived = Number(r.arrived) || 0;
+    lines.push({
+      id: r.id, order: r.pick_list_number, customer: r.customer_name, title, code, needed, arrived,
+      arrived_sku: r.arrived_sku ?? null, manual: Boolean(r.manual),
+      state: arrived >= needed ? 'ARRIVED' : arrived > 0 ? 'PARTIAL' : 'WAITING',
+      suggestions: [],
+    });
+  }
+  const short = lines.filter((l) => l.state !== 'ARRIVED');
+  const suggestions = await suggestionsFor(db, short);
+  for (const l of short) l.suggestions = suggestions.get(l.id) ?? [];
+  return lines;
 }
 
 /** Run a match without ever failing the caller (a check-in or a timer). */

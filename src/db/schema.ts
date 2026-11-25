@@ -486,6 +486,22 @@ CREATE TABLE IF NOT EXISTS custom_line_arrivals (
 );
 ALTER TABLE custom_line_arrivals ADD COLUMN IF NOT EXISTS manual BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_custom_line_arrivals_sku ON custom_line_arrivals(sku);
+-- Desk stock reconciliation: stock put under a different SKU, one row per move so it can be explained and undone.
+CREATE TABLE IF NOT EXISTS stock_reconciliations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  from_sku VARCHAR(50) NOT NULL,
+  to_sku VARCHAR(50) NOT NULL,
+  location_id UUID NOT NULL REFERENCES warehouse_locations(id),
+  quantity INT NOT NULL CHECK (quantity > 0),
+  reason TEXT,
+  performed_by UUID,
+  performed_by_email VARCHAR(255),
+  created_at TIMESTAMP DEFAULT NOW(),
+  reverses_id UUID,
+  undone_at TIMESTAMP,
+  undone_by VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_stock_reconciliations_created ON stock_reconciliations(created_at DESC);
 
 -- ================================================================================
 -- PICK SCANS (Individual scan history — supports partial-quantity picking,

@@ -14,7 +14,8 @@ try {
   await c.query('BEGIN');
   const schema = fs.readFileSync('src/db/schema.ts', 'utf8');
   const ddl = schema.match(/CREATE TABLE IF NOT EXISTS custom_line_arrivals[\s\S]*?idx_custom_line_arrivals_sku[^;]*;/)![0];
-  await c.query(ddl);
+  await c.query(`SET LOCAL lock_timeout = '3s'`);
+  if (!(await one(`select to_regclass('custom_line_arrivals') as t`)).t) await c.query(ddl);
 
   const loc = (await one(`select id from warehouse_locations where location_code='HOLDING'`)).id;
   const user = (await one(`select id from warehouse_users limit 1`)).id;

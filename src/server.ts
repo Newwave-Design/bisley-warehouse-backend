@@ -38,6 +38,7 @@ import reportsRoutes, { generateAndStoreWeeklyReport } from './api/routes/report
 import mobileRoutes from './api/routes/mobile.js';
 import mobileSyncRoutes from './api/routes/mobile-sync.js';
 import customArrivalsRoutes from './api/routes/custom-arrivals.js';
+import reconcileRoutes from './api/routes/reconcile.js';
 import { matchCustomArrivalsQuietly } from './lib/custom-arrivals.js';
 import mobileAppRoutes from './api/routes/mobile-app.js';
 import webhooksRoutes from './api/routes/webhooks.js';
@@ -140,6 +141,7 @@ app.use('/api/reports', reportsRoutes);
 app.use('/api/mobile', mobileRoutes);
 app.use('/api/mobile-sync', mobileSyncRoutes);
 app.use('/api/custom-arrivals', customArrivalsRoutes);
+app.use('/api/reconcile', reconcileRoutes);
 app.use('/api/mobile-app', mobileAppRoutes);
 app.use('/api/reorder-rules', reorderRulesRoutes);
 app.use('/api/pending-reorders', pendingReordersRouter);

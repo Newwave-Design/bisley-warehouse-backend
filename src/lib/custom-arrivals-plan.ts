@@ -79,7 +79,7 @@ export function planCustomArrivals(lines: CustomLine[], stock: FreeStock[], pinn
   const live = lines.filter((l) => l.code && l.needed > 0);
   const byId = new Map(live.map((l) => [l.itemId, l]));
 
-  // a person's link is honoured first, for as many units as are there
+  // a person's link is honoured first, for as many units as are there; earlier entries in `pinned` win, so pass the newest first
   for (const link of pinned) {
     const line = byId.get(link.itemId);
     if (!line || done.has(line.itemId)) continue;
