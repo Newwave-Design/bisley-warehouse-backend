@@ -480,8 +480,11 @@ CREATE TABLE IF NOT EXISTS custom_line_arrivals (
   qty INT NOT NULL CHECK (qty > 0),
   matched_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
-  consumed_at TIMESTAMP
+  consumed_at TIMESTAMP,
+  -- true when a person linked this part on the desk (a near-miss SKU); the match keeps it
+  manual BOOLEAN NOT NULL DEFAULT false
 );
+ALTER TABLE custom_line_arrivals ADD COLUMN IF NOT EXISTS manual BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_custom_line_arrivals_sku ON custom_line_arrivals(sku);
 
 -- ================================================================================
