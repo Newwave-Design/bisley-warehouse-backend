@@ -38,7 +38,7 @@ type Consignment = {
   driverNotes: string;
   bookingIds: string[];
   pieces: SgkPiece[];
-  items: { code: string; desc: string; qty: number; weightKg: string }[];
+  items: { code: string; desc: string; qty: number; weightKg: string; thumbnail?: string | null }[];
   queuedAt: string | null;
   sentAt: string | null;
   collectionDate: string | null;
@@ -116,8 +116,18 @@ async function loadConsignments(filter: { view?: string; pickListIds?: string[] 
       titles.set(`${line.pick_list_id}:${line.product_sku}`, line.item_title);
     }
   }
+  // A picture of each product, as the pick lists show.
+  const pictures = new Map<string, string>();
+  const codes = [...new Set(list.flatMap((group) => group.pieces.map((piece) => String(piece.itemSku || piece.sku || '').trim().toUpperCase()).filter(Boolean)))];
+  if (codes.length) {
+    const found = await query(
+      `SELECT upper(variant_sku) AS sku, variant_thumbnail FROM wms_products WHERE upper(variant_sku) = ANY($1::text[]) AND COALESCE(variant_thumbnail, '') <> ''`,
+      [codes],
+    ).catch(() => ({ rows: [] as { sku: string; variant_thumbnail: string }[] }));
+    for (const row of found.rows as { sku: string; variant_thumbnail: string }[]) pictures.set(row.sku, row.variant_thumbnail);
+  }
   for (const group of list) {
-    group.items = sgkItems(group.pieces).map((item) => ({ ...item, desc: titles.get(`${group.pickListId}:${item.code}`) || item.desc }));
+    group.items = sgkItems(group.pieces).map((item) => ({ ...item, desc: titles.get(`${group.pickListId}:${item.code}`) || item.desc, thumbnail: pictures.get(item.code.toUpperCase()) || null }));
     group.pieces = sgkPiecesWithTitles(group.pieces, titles, group.pickListId);
   }
   return list;
