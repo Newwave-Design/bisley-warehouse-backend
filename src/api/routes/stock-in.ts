@@ -635,52 +635,96 @@ router.post('/reconcile/:id/resolve', authMiddleware, async (req: AuthRequest, r
     const by = req.user?.email ?? null;
     const userId = toUuidOrNull(req.user?.id);
     const sku = String(req.body?.sku ?? '').trim();
-    const row = (await query(`SELECT * FROM stock_in_reconcile WHERE id = $1 AND status = 'OPEN'`, [req.params.id])).rows[0];
-    if (!row) return res.status(404).json({ error: 'Nothing to reconcile for that line' });
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad line id' });
+    const peek = (await query(`SELECT * FROM stock_in_reconcile WHERE id = $1 AND status = 'OPEN'`, [id])).rows[0];
+    if (!peek) return res.status(409).json({ error: 'That line was already reconciled. Refresh to see the latest.' });
 
+    // Everything that can fail is looked up before the transaction, so the transaction only holds writes.
     let finalSku: string | null = null;
+    let loc = '';
+    let colour = '';
     if (sku) {
-      const saved = await assignBarcode(String(row.code), sku, by);
+      const saved = await assignBarcode(String(peek.code), sku, by);
       if (!saved) return res.status(404).json({ error: `Product not found: ${sku}` });
       finalSku = saved.medusa_sku || saved.sku;
-      const loc = await getHoldingLocation();
-      const colour = await resolveColourCode(finalSku, '');
-      const add = async () => {
-        await query(
-          `INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, 'Bisley', NOW(), NOW())
-           ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
-           DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()`,
-          [loc, finalSku, colour, row.quantity],
-        );
-      };
-      if (row.kind === 'UNMATCHED') {
-        await add();
-        await query(
-          `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, colour_code, quantity, notes, performed_by, checkin_session_id)
-           VALUES ('RECEIVE', $1, $2, $3, $4, 'Reconciled stock-in', $5, $6)`,
-          [loc, finalSku, colour, row.quantity, userId, row.session_id],
-        );
-      } else if (row.sku && row.sku.toUpperCase() !== finalSku!.toUpperCase()) {
-        await query(
-          `UPDATE warehouse_inventory SET quantity = GREATEST(0, quantity - $2), updated_at = NOW() WHERE product_sku = $1 AND location_id = $3`,
-          [row.sku, row.quantity, loc],
-        );
-        await add();
-      }
-    } else if (row.kind === 'NOT_IN_CATALOGUE') {
-      finalSku = row.sku;
+      loc = await getHoldingLocation();
+      colour = await resolveColourCode(finalSku, '');
+    } else if (peek.kind === 'NOT_IN_CATALOGUE') {
+      finalSku = peek.sku;
     }
-    await query(
-      `UPDATE stock_in_reconcile SET status = 'DONE', resolved_sku = $2, resolved_by = $3, resolved_at = NOW() WHERE id = $1`,
-      [row.id, finalSku, by],
-    );
+
+    // One transaction, and the line is locked: a second click, or a second desk, cannot add the stock twice,
+    // and a failure part way leaves the stock and the line exactly as they were.
+    const client = await getPool().connect();
+    let row: any;
+    try {
+      await client.query('BEGIN');
+      row = (await client.query(`SELECT * FROM stock_in_reconcile WHERE id = $1 AND status = 'OPEN' FOR UPDATE`, [id])).rows[0];
+      if (!row) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'That line was already reconciled. Refresh to see the latest.' });
+      }
+      if (sku) {
+        const add = async () => {
+          await client.query(
+            `INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, 'Bisley', NOW(), NOW())
+             ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
+             DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()`,
+            [loc, finalSku, colour, row.quantity],
+          );
+        };
+        if (row.kind === 'UNMATCHED') {
+          await add();
+          await client.query(
+            `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, colour_code, quantity, notes, performed_by, checkin_session_id)
+             VALUES ('RECEIVE', $1, $2, $3, $4, 'Reconciled stock-in', $5, $6)`,
+            [loc, finalSku, colour, row.quantity, userId, row.session_id],
+          );
+        } else if (row.sku && row.sku.toUpperCase() !== finalSku!.toUpperCase()) {
+          await client.query(
+            `UPDATE warehouse_inventory SET quantity = GREATEST(0, quantity - $2), updated_at = NOW() WHERE product_sku = $1 AND location_id = $3`,
+            [row.sku, row.quantity, loc],
+          );
+          await add();
+        }
+      }
+      await client.query(
+        `UPDATE stock_in_reconcile SET status = 'DONE', resolved_sku = $2, resolved_by = $3, resolved_at = NOW() WHERE id = $1`,
+        [row.id, finalSku, by],
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+
     res.json({ success: true, sku: finalSku });
+
+    // The stock now exists, so it reaches the shop and any order waiting for it, as a normal stock-in does. Never fails the request.
+    if (sku && finalSku) void stockArrived([finalSku, ...(row.kind === 'NOT_IN_CATALOGUE' && row.sku ? [row.sku] : [])]);
   } catch (err) {
     logger.error(`Reconcile failed: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
-    res.status(500).json({ error: 'Failed to reconcile that line' });
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to reconcile that line. Nothing was changed, so it is safe to try again.' });
   }
 });
+
+/** Stock was added outside a confirm (the desk reconciled a scan): send it to the shop and the orders waiting for it. */
+async function stockArrived(skus: string[]): Promise<void> {
+  try {
+    const unique = [...new Set(skus.filter(Boolean))];
+    await assignStockedToOlderOrders(unique);
+    await unblockBackorderedPickLists(unique);
+    const errors = await pushAvailableStock(unique);
+    if (errors.length) logger.error(`[stock-in] Medusa sync after reconcile failed: ${errors.join('; ')}`);
+    scheduleAllocationRun(`stock-in reconciled (${unique.join(', ')})`);
+  } catch (err) {
+    logger.warn(`[stock-in] Follow-up after reconcile failed: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
+  }
+}
 
 /** POST /api/stock-in/sessions/:id/confirm — Commit stock to warehouse_inventory + sync to Medusa */
 router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, res: Response) => {
