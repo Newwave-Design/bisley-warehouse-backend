@@ -21,6 +21,12 @@ import { apcAlreadyCancelled, apcAvailabilityItems, apcConsignmentSize, apcDutyI
 import { createRoyalMailParcel, deleteRoyalMailOrders, fetchRoyalMailLabelPdf, quoteRoyalMailParcels, readRoyalMailTracking, RoyalMailError, royalMailConfigured, type RoyalMailParcelFormat } from '../../lib/royal-mail.js';
 import { isPaid } from '../../lib/payment-status.js';
 import { isWorkingDay, isWorkingIsoDay } from '../../lib/working-days.js';
+import { sgkOrderNo } from '../../lib/sgk.js';
+import { sgkLabelsForBooking } from './sgk.js';
+
+function randomBatch(): string {
+  return Math.random().toString(16).slice(2, 10).padEnd(8, '0');
+}
 
 async function dropReplacements(pickListId: string | undefined, waybill: string, orderNumber = '') {
   if (!pickListId || (!waybill && !orderNumber)) return;
@@ -150,7 +156,7 @@ function text(value: unknown, fallback = ''): string {
   return String(value);
 }
 
-async function deliveredCourier(pickListId: string): Promise<'APC' | 'DX'> {
+async function deliveredCourier(pickListId: string): Promise<'APC' | 'DX' | 'SGK'> {
   const booked = await query(
     `SELECT courier FROM collection_bookings
       WHERE pick_list_id = $1 AND status <> 'cancelled'
@@ -160,7 +166,7 @@ async function deliveredCourier(pickListId: string): Promise<'APC' | 'DX'> {
     [pickListId]
   );
   const fromBooking = text(booked.rows[0]?.courier).toUpperCase();
-  if (fromBooking === 'DX' || fromBooking === 'APC') return fromBooking;
+  if (fromBooking === 'DX' || fromBooking === 'APC' || fromBooking === 'SGK') return fromBooking;
   const list = await query(
     `SELECT shipping_method_name, selected_courier_code FROM pick_lists WHERE id = $1`,
     [pickListId]
@@ -248,7 +254,7 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
   const agreedDate = returning ? agreedCollectionDate(req.body?.collectionDate) : '';
   const pickListId = text(req.body?.pickListId).trim();
   const askedCourier = text(req.body?.courier).trim().toUpperCase();
-  let courier: 'APC' | 'DX' | 'RM' = askedCourier === 'DX' ? 'DX' : askedCourier === 'RM' ? 'RM' : 'APC';
+  let courier: 'APC' | 'DX' | 'RM' | 'SGK' = askedCourier === 'DX' ? 'DX' : askedCourier === 'RM' ? 'RM' : askedCourier === 'SGK' ? 'SGK' : 'APC';
   if (returning && /^[0-9a-f-]{36}$/i.test(pickListId)) courier = await deliveredCourier(pickListId);
   if (process.env.WAREHOUSE_ENV === 'staging' && courier !== 'DX') {
     return res.status(409).json({ error: 'Staging can book DX on the UAT service only.' });
@@ -256,6 +262,7 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
   if (returning && !agreedDate) {
     return res.status(400).json({ error: 'Enter the collection date agreed with the customer. It has to be a collection day: a weekday that is not a bank holiday and has not passed.' });
   }
+  if (courier === 'SGK') return res.status(400).json({ error: 'SGK has no quote. Queue the order for SGK collection.' });
   if (courier === 'RM') {
     if (returning) return res.status(400).json({ error: 'A return is collected by the courier that delivered it.' });
     if (!royalMailConfigured()) return res.status(500).json({ error: 'Royal Mail is not connected. Add the Click & Drop API key.' });
@@ -774,10 +781,13 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   const agreedDate = returning ? agreedCollectionDate(req.body?.collectionDate) : '';
   const pickListId = text(req.body?.pickListId).trim();
   const askedCourier = text(req.body?.courier).trim().toUpperCase();
-  let courier: 'APC' | 'DX' | 'RM' = askedCourier === 'DX' ? 'DX' : askedCourier === 'RM' ? 'RM' : 'APC';
+  let courier: 'APC' | 'DX' | 'RM' | 'SGK' = askedCourier === 'DX' ? 'DX' : askedCourier === 'RM' ? 'RM' : askedCourier === 'SGK' ? 'SGK' : 'APC';
   if (returning && /^[0-9a-f-]{36}$/i.test(pickListId)) courier = await deliveredCourier(pickListId);
   if (process.env.WAREHOUSE_ENV === 'staging' && courier !== 'DX') {
     return res.status(409).json({ error: 'Staging can book DX on the UAT service only.' });
+  }
+  if (courier === 'SGK' && returning) {
+    return res.status(409).json({ error: 'A return on an SGK delivery is arranged with SGK. Email operations@sgkdistribution.co.uk.' });
   }
   if (returning && outcome && outcome !== 'refund' && outcome !== 'replace' && outcome !== 'collect') {
     return res.status(400).json({ error: 'Choose whether this return is a refund, a replacement, or a collection only.' });
@@ -803,18 +813,20 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   if (courier === 'RM' && !royalMailConfigured()) return res.status(500).json({ error: 'Royal Mail is not connected. Add the Click & Drop API key.' });
 
   if (!/^[0-9a-f-]{36}$/i.test(pickListId)) return res.status(400).json({ error: 'Choose an order to book' });
-  const serviceCode = text(req.body?.serviceCode).trim();
-  const serviceName = text(req.body?.serviceName).trim().slice(0, 120);
+  const serviceCode = courier === 'SGK' ? 'SGK' : text(req.body?.serviceCode).trim();
+  const serviceName = courier === 'SGK' ? 'SGK home delivery' : text(req.body?.serviceName).trim().slice(0, 120);
   if (!serviceCode) return res.status(400).json({ error: 'Choose a service' });
 
   const pieces = asList<any>(req.body?.pieces).slice(0, 20).map((piece) => ({
     sku: text(piece?.sku).trim(),
+    itemSku: text(piece?.itemSku).trim().slice(0, 120),
     title: text(piece?.title).trim().slice(0, 160),
     weightKg: text(piece?.weightKg).trim(),
     lengthCm: text(piece?.lengthCm).trim(),
     widthCm: text(piece?.widthCm).trim(),
     heightCm: text(piece?.heightCm).trim(),
-  })).filter((piece) => piece.weightKg && piece.lengthCm && piece.widthCm && piece.heightCm);
+    // SGK is sent a list of items, not box sizes, so a box without a size still goes.
+  })).filter((piece) => courier === 'SGK' ? (piece.itemSku || piece.title) : (piece.weightKg && piece.lengthCm && piece.widthCm && piece.heightCm));
   if (!pieces.length) return res.status(400).json({ error: 'Add at least one box' });
 
   // One booking per order at a time, so a double click cannot buy two collections.
@@ -897,7 +909,23 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
     let savedPieces: { reference: string; trackingNumber: string; title: string; weightKg: string; lengthCm: string; widthCm: string; heightCm: string }[] = [];
     let apcConsignments: { waybill: string; orderNumber: string; pieces: typeof savedPieces }[] = [];
 
-    if (courier === 'RM') {
+    if (courier === 'SGK') {
+      // Nothing is sent to SGK from here. The order joins the SGK queue and goes out on the next export.
+      waybill = sgkOrderNo(text(list.pick_list_number));
+      if (!waybill) return res.status(400).json({ error: 'This order has no number SGK can use' });
+      orderNumber = randomBatch();
+      collectionDate = text(req.body?.collectionDate).trim().slice(0, 40) || null;
+      savedPieces = pieces.map((piece) => ({
+        reference: (piece.itemSku || piece.sku || piece.title || 'Box').slice(0, 30),
+        sku: piece.itemSku || piece.sku,
+        trackingNumber: '',
+        title: piece.title,
+        weightKg: piece.weightKg,
+        lengthCm: piece.lengthCm,
+        widthCm: piece.widthCm,
+        heightCm: piece.heightCm,
+      } as any));
+    } else if (courier === 'RM') {
       if (returning) return res.status(400).json({ error: 'A return is collected by the courier that delivered it.' });
       const [mailCode, mailFormat] = serviceCode.split('|');
       const packageFormat = (text(req.body?.packageFormat).trim() || mailFormat) as RoyalMailParcelFormat;
@@ -1179,11 +1207,11 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         const inserted = await client.query(
           `INSERT INTO collection_bookings
              (pick_list_id, sku, courier, service_code, service_name, waybill, apc_order_number,
-              collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date, direction, outcome)
-           VALUES ($1, $2, $12, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, 'booked', $11, $13, $14)
+              collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date, direction, outcome, driver_notes)
+           VALUES ($1, $2, $12, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, 'booked', $11, $13, $14, $15)
            RETURNING id, pick_list_id, sku, courier, service_code, service_name, waybill,
-                     collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date, direction, outcome`,
-          [pickListId, row.sku, bookedService, bookedName || null, row.waybill, row.orderNumber || null, collectionPostcode, deliveryPostcode, summary, JSON.stringify(row.pieces), collectionDate, courier, returning ? 'return' : 'outbound', returning ? outcome : null]
+                     collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date, direction, outcome, driver_notes, sent_at`,
+          [pickListId, row.sku, bookedService, bookedName || null, row.waybill, row.orderNumber || null, collectionPostcode, deliveryPostcode, summary, JSON.stringify(row.pieces), collectionDate, courier, returning ? 'return' : 'outbound', returning ? outcome : null, courier === 'SGK' ? (text(req.body?.driverNotes).trim().slice(0, 500) || null) : null]
         );
         saved.push(inserted.rows[0]);
       }
@@ -1231,18 +1259,19 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
         });
       }
     }
-    if (!returning) {
+    // SGK collects later: the order ships, and stock leaves, when the queue is marked sent.
+    if (!returning && courier !== 'SGK') {
       await shipBookedPickList(pickListId, bookedBy).catch((error) => {
         console.warn('Marking the booked order shipped failed', error instanceof Error ? error.message : 'failed');
       });
     }
     const lead = saved.find((row) => row?.id);
-    if (lead?.id) {
+    if (lead?.id && courier !== 'SGK') {
       warmLabel(lead.id, 'ZPL');
       warmLabel(lead.id, 'PDF');
     }
     res.status(201).json({ booked: true, waybill, bookings: saved, replacement });
-    if (!returning) {
+    if (!returning && courier !== 'SGK') {
       const bookedFor = pickListId;
       const bookedUser = text(req.user?.id);
       void fulfillPickListInMedusa(bookedFor).catch((error) => {
@@ -1291,7 +1320,7 @@ router.get('/bookings', authMiddleware, async (_req: AuthRequest, res: Response)
     const result = await query(
       `SELECT id, pick_list_id, sku, courier, service_code, service_name, waybill,
               collection_postcode, delivery_postcode, delivery_summary, pieces, status, collection_date,
-              direction, outcome, created_at
+              direction, outcome, created_at, sent_at, driver_notes
        FROM collection_bookings
        WHERE status <> 'cancelled'
          AND COALESCE(direction, 'outbound') ${text(_req.query.direction).trim().toLowerCase() === 'return' ? '=' : '<>'} 'return'
@@ -1336,7 +1365,8 @@ async function labelsForPrint(bookingId: string, format: 'ZPL' | 'PDF'): Promise
     if (labels?.length) return labels;
   }
   const labels = await loadBookingLabels(bookingId, format);
-  if (labels.length) labelReady.set(key, labels);
+  // SGK labels carry the driver notes, which can change, so they are built each time.
+  if (labels.length && !labels[0].trackingNumber.includes('OV-')) labelReady.set(key, labels);
   return labels;
 }
 
@@ -1349,6 +1379,11 @@ async function loadBookingLabels(id: string, format: 'ZPL' | 'PDF'): Promise<Pri
   const booking = found.rows[0] as { pick_list_id?: string; waybill?: string; apc_order_number?: string; pieces?: { trackingNumber?: string }[]; courier?: string; status?: string; direction?: string; collection_date?: string; created_at?: string } | undefined;
   if (!booking || booking.status === 'cancelled') {
     throw Object.assign(new Error('Unknown booking'), { status: 404 });
+  }
+  if (booking.courier === 'SGK') {
+    // SGK's own paperwork is the exported list. These are our carton labels: order number, customer, address, 1/N.
+    if (format !== 'ZPL') throw Object.assign(new Error('SGK carton labels print on the label printer.'), { status: 409 });
+    return sgkLabelsForBooking(id);
   }
   const waybill = text(booking.waybill).trim();
   if (booking.courier === 'RM') {
@@ -1502,6 +1537,16 @@ router.post('/bookings/:id/cancel', authMiddleware, async (req: AuthRequest, res
           console.warn('Moving the cancelled collection back to picked failed', error instanceof Error ? error.message : 'failed');
         });
       }
+      return res.json({ cancelled: true });
+    }
+    if (booking.courier === 'SGK') {
+      const sent = await query(`SELECT 1 FROM collection_bookings WHERE pick_list_id = $1 AND apc_order_number = $2 AND sent_at IS NOT NULL LIMIT 1`, [booking.pick_list_id, text(booking.apc_order_number)]);
+      if (sent.rows.length) return res.status(409).json({ error: 'SGK has already collected this order. Contact SGK to arrange a return.' });
+      await query(
+        `UPDATE collection_bookings SET status = 'cancelled', updated_at = NOW()
+          WHERE pick_list_id = $1 AND apc_order_number = $2 AND status <> 'cancelled'`,
+        [booking.pick_list_id, text(booking.apc_order_number)]
+      );
       return res.json({ cancelled: true });
     }
     if (booking.courier === 'DX') {

@@ -78,7 +78,7 @@ export async function takeStockForBookedCollection(pickListId: string, preferred
     `SELECT pl.id, pl.medusa_order_id, pl.is_sandbox, pl.is_return, pl.payment_status, pl.purchase_order_number,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT cb.sku), NULL) AS skus
      FROM pick_lists pl
-     JOIN collection_bookings cb ON cb.pick_list_id = pl.id AND cb.status <> 'cancelled' AND COALESCE(cb.direction, 'outbound') <> 'return'
+     JOIN collection_bookings cb ON cb.pick_list_id = pl.id AND cb.status <> 'cancelled' AND COALESCE(cb.direction, 'outbound') <> 'return' AND (cb.courier <> 'SGK' OR cb.sent_at IS NOT NULL)
      WHERE pl.id = $1 AND NOT pl.is_archived
      GROUP BY pl.id`,
     [pickListId],
@@ -186,7 +186,7 @@ export async function takeStockForOpenCollections(): Promise<void> {
   const found = await query(
     `SELECT DISTINCT pl.id
      FROM pick_lists pl
-     JOIN collection_bookings cb ON cb.pick_list_id = pl.id AND cb.status <> 'cancelled' AND COALESCE(cb.direction, 'outbound') <> 'return'
+     JOIN collection_bookings cb ON cb.pick_list_id = pl.id AND cb.status <> 'cancelled' AND COALESCE(cb.direction, 'outbound') <> 'return' AND (cb.courier <> 'SGK' OR cb.sent_at IS NOT NULL)
      WHERE NOT pl.is_archived AND NOT pl.is_sandbox`,
   );
   for (const row of found.rows) {

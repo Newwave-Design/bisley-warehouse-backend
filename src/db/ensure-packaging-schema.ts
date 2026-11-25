@@ -229,6 +229,9 @@ export async function ensurePackagingSchema() {
     `ALTER TABLE collection_bookings ADD COLUMN IF NOT EXISTS collection_date VARCHAR(40)`,
     `ALTER TABLE collection_bookings ADD COLUMN IF NOT EXISTS direction VARCHAR(20) NOT NULL DEFAULT 'outbound'`,
     `ALTER TABLE collection_bookings ADD COLUMN IF NOT EXISTS outcome VARCHAR(20)`,
+    // SGK has no booking API: a queued consignment is exported to SGK, then marked sent when they collect it.
+    `ALTER TABLE collection_bookings ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ`,
+    `ALTER TABLE collection_bookings ADD COLUMN IF NOT EXISTS driver_notes TEXT`,
     `DROP INDEX IF EXISTS idx_collection_bookings_line`,
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_bookings_line
       ON collection_bookings (pick_list_id, sku, direction)

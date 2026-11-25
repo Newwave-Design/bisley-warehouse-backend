@@ -259,10 +259,10 @@ export async function fulfillPickListInMedusa(pickListId: string, options?: { sh
   const pl = await query(
     `SELECT pl.id, pl.medusa_order_id, pl.medusa_fulfillment_id, pl.tracking_number, pl.tracking_url,
             pl.carrier, pl.is_sandbox, pl.status, pl.is_return, pl.shop_shipped_at,
-            b.courier AS booking_courier, b.waybill, b.delivery_postcode
+            b.courier AS booking_courier, b.waybill, b.delivery_postcode, b.sent_at AS booking_sent_at
        FROM pick_lists pl
        LEFT JOIN LATERAL (
-         SELECT courier, waybill, delivery_postcode
+         SELECT courier, waybill, delivery_postcode, sent_at
            FROM collection_bookings
           WHERE pick_list_id = pl.id
             AND status <> 'cancelled'
@@ -282,6 +282,8 @@ export async function fulfillPickListInMedusa(pickListId: string, options?: { sh
 
   const hasLink = String(pickList.tracking_number || '').trim() !== '' && String(pickList.tracking_url || '').trim() !== '';
   const courier = String(pickList.booking_courier || pickList.carrier || '').trim().toUpperCase();
+  // SGK has no tracking feed: the shop order waits until the SGK queue is marked sent.
+  if (courier === 'SGK' && !pickList.booking_sent_at) return { ok: true, skipped: true };
   const waitsForCarrier = (courier === 'APC' || courier === 'DX') && !pickList.shop_shipped_at;
   let ship = hasLink || options?.ship !== false;
   if (waitsForCarrier) {

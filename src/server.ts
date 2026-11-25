@@ -63,6 +63,7 @@ import moveSessionRoutes from './api/routes/move-sessions.js';
 import barcodeTestRoutes from './api/routes/barcode-test.js';
 import apcPreviewRoutes from './api/routes/apc-preview.js';
 import royalMailRoutes from './api/routes/royal-mail.js';
+import sgkRoutes from './api/routes/sgk.js';
 import shippingOptionsRoutes from './routes/shipping-options.js';
 import { createNotificationOnce } from './lib/notifications.js';
 import { reconcileOrders, syncOpenOrders } from './api/routes/webhooks.js';
@@ -162,6 +163,7 @@ app.use('/api/returns', returnsRoutes);
 app.use('/api/barcode-test', barcodeTestRoutes);
 app.use('/api/apc', apcPreviewRoutes);
 app.use('/api/royal-mail', royalMailRoutes);
+app.use('/api/sgk', sgkRoutes);
 app.use('/api', shippingOptionsRoutes);
 
 // 404 handler
