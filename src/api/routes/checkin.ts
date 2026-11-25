@@ -42,18 +42,30 @@ async function enrichCheckinItems(items: any[]) {
     if (p.variant_sku) bySku.set(p.variant_sku, p)
     if (p.nw_code) byNw.set(p.nw_code, p)
   }
+  // A SKU that is not in the catalogue can still be known: Bisley's barcode list, or a SKU typed on the scanner.
+  // Those carry their own description, so they are not "unmatched".
+  const mapped = await query(
+    `SELECT DISTINCT ON (upper(product_sku)) upper(product_sku) AS key, product_name, colour_code, colour_name
+       FROM barcode_mappings
+      WHERE is_active = true AND upper(product_sku) = ANY($1::text[])
+      ORDER BY upper(product_sku), (product_name IS NULL), updated_at DESC`,
+    [keys.map((k) => String(k).toUpperCase())],
+  )
+  const byMapped = new Map<string, any>(mapped.rows.map((r: any) => [r.key, r]))
   return items.map((i) => {
     const p = bySku.get(i.medusa_sku) || bySku.get(i.nw_code) || byNw.get(i.nw_code)
+    const m = p ? null : byMapped.get(String(i.medusa_sku || '').toUpperCase()) || byMapped.get(String(i.nw_code || '').toUpperCase())
     const sku = i.medusa_sku || p?.variant_sku || i.nw_code || ''
-    const code = (p?.colour_code || extractColourCode(sku) || '').toLowerCase()
-    const colourName = COLOUR_NAMES[code] || p?.colour_name || i.colour || ''
+    const mappedColour = m?.colour_code && m.colour_code !== '000' ? m.colour_code : ''
+    const code = (p?.colour_code || extractColourCode(sku) || mappedColour || '').toLowerCase()
+    const colourName = COLOUR_NAMES[code] || p?.colour_name || m?.colour_name || i.colour || ''
     return {
       ...i,
       sku,
       colour_code: code || null,
       colour_name: colourName,
-      description: p?.product_title || i.nw_code || sku,
-      unmatched: !p,
+      description: p?.product_title || m?.product_name || i.nw_code || sku,
+      unmatched: !p && !m,
     }
   })
 }
