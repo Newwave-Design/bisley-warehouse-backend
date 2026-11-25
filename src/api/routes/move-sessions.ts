@@ -17,6 +17,7 @@
 import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { failedScansFor } from '../../lib/failed-scans.js';
+import { idempotent } from '../../lib/idempotency.js';
 import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
 import { lookupProduct, getStock, toUuidOrNull } from './mobile.js';
 import { moveStockBetweenBays } from '../../lib/stock-move.js';
@@ -95,7 +96,7 @@ router.get('/sessions/:id', authMiddleware, async (req: AuthRequest, res: Respon
   }
 });
 
-router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/scan', authMiddleware, idempotent(), async (req: AuthRequest, res: Response) => {
   try {
     const { session_id, scan_input } = req.body;
     const quantity = Math.max(1, parseInt(req.body.quantity) || 1);

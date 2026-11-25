@@ -33,6 +33,7 @@ import { singleTrayFromFivePack } from '../../lib/insert-trays.js';
 import { assignBarcode } from '../../lib/assign-barcode.js';
 import { ensureScanInputColumn } from '../../lib/scan-columns.js';
 import { ensureReconcileTable } from '../../lib/reconcile.js';
+import { idempotent } from '../../lib/idempotency.js';
 import { resolveScan } from '../../lib/resolve-scan.js';
 import { applyLineEditToScans } from '../../lib/stock-in-edit.js';
 
@@ -282,7 +283,7 @@ router.post('/sessions/:id/reopen', authMiddleware, async (req: AuthRequest, res
 });
 
 /** POST /api/stock-in/scan — Lookup barcode/NW code + scan item (cumulative per SKU+colour) */
-router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => {
+router.post('/scan', authMiddleware, idempotent(), async (req: AuthRequest, res: Response) => {
   try {
     const { session_id, scan_input, colour, quantity = 1, quantity_is_units = false } = req.body;
 
