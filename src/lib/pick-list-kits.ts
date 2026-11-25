@@ -1,22 +1,21 @@
 import { query } from '../db/index.js';
 import { COLOUR_NAMES, componentDisplaySku, extractColourCode } from './colour-names.js';
+import { packBase, packSkuFor, singleBase, singleSkuForBase } from './tray-pack.js';
 
-const PACK_OF_FIVE = /^(.+)P5-000$/i;
-const SINGLE_TRAY = /^(.+)P1-000$/i;
 
 /** A 5-pack and its single are one pool. A pack line can be made from five singles, and a single from an opened pack. */
 export function sellableTrayCount(sku: string, onHand: Map<string, number>): number | null {
   const code = sku.trim();
-  const pack = PACK_OF_FIVE.exec(code);
+  const pack = packBase(code);
   if (pack) {
-    const singles = onHand.get(`${pack[1]}P1-000`) ?? 0;
-    const packs = onHand.get(`${pack[1]}P5-000`) ?? 0;
+    const singles = onHand.get(singleSkuForBase(pack)) ?? 0;
+    const packs = onHand.get(code) ?? 0;
     return packs + Math.floor(Math.max(0, singles) / 5);
   }
-  const single = SINGLE_TRAY.exec(code);
+  const single = singleBase(code);
   if (single) {
-    const singles = onHand.get(`${single[1]}P1-000`) ?? 0;
-    const packs = onHand.get(`${single[1]}P5-000`) ?? 0;
+    const singles = onHand.get(code) ?? 0;
+    const packs = onHand.get(packSkuFor(single)) ?? 0;
     return Math.max(0, singles) + Math.max(0, packs) * 5;
   }
   return null;
@@ -24,10 +23,10 @@ export function sellableTrayCount(sku: string, onHand: Map<string, number>): num
 
 export function trayMateSku(sku: string): string | null {
   const code = sku.trim();
-  const pack = PACK_OF_FIVE.exec(code);
-  if (pack) return `${pack[1]}P1-000`;
-  const single = SINGLE_TRAY.exec(code);
-  if (single) return `${single[1]}P5-000`;
+  const pack = packBase(code);
+  if (pack) return singleSkuForBase(pack);
+  const single = singleBase(code);
+  if (single) return packSkuFor(single);
   return null;
 }
 

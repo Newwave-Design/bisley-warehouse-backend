@@ -23,3 +23,9 @@ test('five loose singles make one pack', () => {
 test('other products are left to their own count', () => {
   assert.equal(sellableTrayCount('H123NL-bx6', new Map([['H123NL-bx6', 3]])), null)
 })
+
+test('PIT522 pack is PIT522P5-000 and counts as five singles', () => {
+  const onHand = new Map([['PIT522P1-000', 0], ['PIT522P5-000', 2]])
+  assert.equal(sellableTrayCount('PIT522P1-000', onHand), 10)
+  assert.equal(sellableTrayCount('PIT522P5-000', onHand), 2)
+})

@@ -11,6 +11,7 @@
 import type { PoolClient } from 'pg';
 import { kitParts, trayPackParts } from './stock-holds.js';
 import { TRAYS_PER_PACK, packsToOpen, singlesUsedToShipPacks } from './tray-stock.js';
+import { packSkuFor, singleBase } from './tray-pack.js';
 
 interface KitComponent { sku: string; required_quantity?: number }
 
@@ -157,8 +158,8 @@ export async function applyDispatchStock(
               AND kit_components::text LIKE $1`,
           [`%${sku}%`],
         )).rows;
-        const single = /^(.+)P1-000$/i.exec(sku);
-        if (single) holders.push({ variant_sku: `${single[1]}P5-000`, kit_components: [{ sku, required_quantity: 5 }] });
+        const single = singleBase(sku);
+        if (single) holders.push({ variant_sku: packSkuFor(single), kit_components: [{ sku, required_quantity: 5 }] });
         const packs = holders.flatMap((holder) => {
           const part = kitParts(holder.variant_sku, holder.kit_components).find((item) => item.sku === sku);
           return part ? [{ packSku: holder.variant_sku as string, size: part.per }] : [];

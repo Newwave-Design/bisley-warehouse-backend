@@ -11,6 +11,7 @@ import { getPool, query } from '../db/index.js';
 import { computeBoxHolds } from './box-holds.js';
 import { ensureForcedColumns } from './forced-columns.js';
 import { canonicalSku } from './colour-names.js';
+import { packBase, packSkuFor, singleBase, singleSkuForBase } from './tray-pack.js';
 
 export interface HoldPart { sku: string; per: number }
 
@@ -57,9 +58,9 @@ function demandFor(line: HoldDemand, sku: string, per: number): number {
 
 /** 227P5-000 is five 227P1-000. Customers order either the single or the pack. */
 export function trayPackParts(sku: string): HoldPart[] {
-  const match = /^(.+)P5-000$/i.exec(sku);
-  if (!match) return [];
-  return [{ sku: `${match[1]}P1-000`, per: 5 }];
+  const base = packBase(sku);
+  if (!base) return [];
+  return [{ sku: singleSkuForBase(base), per: 5 }];
 }
 
 /**
@@ -226,8 +227,8 @@ async function computeHolds(): Promise<void> {
   for (const sku of [...skus]) {
     const plinth = /^MDHP-(.+)$/i.exec(sku);
     if (plinth) skus.add(`PLINTH-${plinth[1]}`);
-    const single = /^(.+)P1-000$/i.exec(sku);
-    if (single) skus.add(`${single[1]}P5-000`);
+    const single = singleBase(sku);
+    if (single) skus.add(packSkuFor(single));
     for (const part of trayPackParts(sku)) skus.add(part.sku);
   }
   const onHand = new Map<string, number>();

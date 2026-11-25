@@ -31,6 +31,8 @@ import { assignStockedToOlderOrders } from '../../lib/assign-arrived-stock.js';
 import { getLogger } from '../../lib/logger.js';
 import { singleTrayFromFivePack } from '../../lib/insert-trays.js';
 import { assignBarcode } from '../../lib/assign-barcode.js';
+import { ensureScanInputColumn } from '../../lib/scan-columns.js';
+import { ensureReconcileTable } from '../../lib/reconcile.js';
 import { resolveScan } from '../../lib/resolve-scan.js';
 import { applyLineEditToScans } from '../../lib/stock-in-edit.js';
 
@@ -369,9 +371,10 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
       logger.info(`[stock-in] Scanned ${units}x ${nw_code} (${colour_used}) into session ${writeSessionId}`);
     }
 
+    await ensureScanInputColumn();
     const scanLog = await query(
-      `INSERT INTO checkin_scans (session_id, item_id, quantity) VALUES ($1, $2, $3) RETURNING id, item_id, quantity, scanned_at`,
-      [writeSessionId, item.id, units]
+      `INSERT INTO checkin_scans (session_id, item_id, quantity, scanned_input) VALUES ($1, $2, $3, $4) RETURNING id, item_id, quantity, scanned_at, scanned_input`,
+      [writeSessionId, item.id, units, q.slice(0, 255)]
     );
 
     res.json({
@@ -398,9 +401,10 @@ router.post('/scan', authMiddleware, async (req: AuthRequest, res: Response) => 
            VALUES ($1, $2, NULL, NULL, $3, NOW(), NOW()) RETURNING *`,
           [sessionId, code, qty],
         );
+        await ensureScanInputColumn();
         const scanLog = await query(
-          `INSERT INTO checkin_scans (session_id, item_id, quantity) VALUES ($1, $2, $3) RETURNING id, item_id, quantity, scanned_at`,
-          [sessionId, item.rows[0].id, qty],
+          `INSERT INTO checkin_scans (session_id, item_id, quantity, scanned_input) VALUES ($1, $2, $3, $4) RETURNING id, item_id, quantity, scanned_at, scanned_input`,
+          [sessionId, item.rows[0].id, qty, code.slice(0, 255)],
         );
         return res.json({
           success: true,
@@ -606,6 +610,78 @@ router.post('/sessions/:id/items/:itemId/restore', authMiddleware, async (req: A
   }
 });
 
+/** GET /api/stock-in/reconcile — lines waiting for the desk */
+router.get('/reconcile', authMiddleware, async (_req: AuthRequest, res: Response) => {
+  try {
+    await ensureReconcileTable();
+    const r = await query(
+      `SELECT id, kind, code, sku, quantity, session_id, created_at FROM stock_in_reconcile WHERE status = 'OPEN' ORDER BY created_at DESC LIMIT 500`,
+    );
+    res.json({ items: r.rows });
+  } catch (err) {
+    logger.error(`Reconcile list failed: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
+    res.status(500).json({ error: 'Failed to load items to reconcile' });
+  }
+});
+
+/**
+ * POST /api/stock-in/reconcile/:id/resolve { sku? }
+ * UNMATCHED: the code is saved as a barcode for `sku` and the quantity is stocked; without `sku` the line is dismissed and nothing is stocked.
+ * NOT_IN_CATALOGUE: marked checked, or `sku` moves the stock and the barcode to a catalogue product.
+ */
+router.post('/reconcile/:id/resolve', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    await ensureReconcileTable();
+    const by = req.user?.email ?? null;
+    const userId = toUuidOrNull(req.user?.id);
+    const sku = String(req.body?.sku ?? '').trim();
+    const row = (await query(`SELECT * FROM stock_in_reconcile WHERE id = $1 AND status = 'OPEN'`, [req.params.id])).rows[0];
+    if (!row) return res.status(404).json({ error: 'Nothing to reconcile for that line' });
+
+    let finalSku: string | null = null;
+    if (sku) {
+      const saved = await assignBarcode(String(row.code), sku, by);
+      if (!saved) return res.status(404).json({ error: `Product not found: ${sku}` });
+      finalSku = saved.medusa_sku || saved.sku;
+      const loc = await getHoldingLocation();
+      const colour = await resolveColourCode(finalSku, '');
+      const add = async () => {
+        await query(
+          `INSERT INTO warehouse_inventory (location_id, product_sku, colour_code, quantity, liability_status, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, 'Bisley', NOW(), NOW())
+           ON CONFLICT (location_id, product_sku, COALESCE(colour_code, ''))
+           DO UPDATE SET quantity = warehouse_inventory.quantity + $4, updated_at = NOW()`,
+          [loc, finalSku, colour, row.quantity],
+        );
+      };
+      if (row.kind === 'UNMATCHED') {
+        await add();
+        await query(
+          `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, colour_code, quantity, notes, performed_by, checkin_session_id)
+           VALUES ('RECEIVE', $1, $2, $3, $4, 'Reconciled stock-in', $5, $6)`,
+          [loc, finalSku, colour, row.quantity, userId, row.session_id],
+        );
+      } else if (row.sku && row.sku.toUpperCase() !== finalSku!.toUpperCase()) {
+        await query(
+          `UPDATE warehouse_inventory SET quantity = GREATEST(0, quantity - $2), updated_at = NOW() WHERE product_sku = $1 AND location_id = $3`,
+          [row.sku, row.quantity, loc],
+        );
+        await add();
+      }
+    } else if (row.kind === 'NOT_IN_CATALOGUE') {
+      finalSku = row.sku;
+    }
+    await query(
+      `UPDATE stock_in_reconcile SET status = 'DONE', resolved_sku = $2, resolved_by = $3, resolved_at = NOW() WHERE id = $1`,
+      [row.id, finalSku, by],
+    );
+    res.json({ success: true, sku: finalSku });
+  } catch (err) {
+    logger.error(`Reconcile failed: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
+    res.status(500).json({ error: 'Failed to reconcile that line' });
+  }
+});
+
 /** POST /api/stock-in/sessions/:id/confirm — Commit stock to warehouse_inventory + sync to Medusa */
 router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
@@ -657,9 +733,22 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
     const syncedSkus = new Set<string>();
 
     // Resolve colour codes up front so the transaction only holds writes
+    await ensureReconcileTable();
     const prepared: { sku: string; colourCode: string; qty: number }[] = [];
+    const parked: { kind: 'UNMATCHED' | 'NOT_IN_CATALOGUE'; code: string; sku: string; qty: number }[] = [];
     for (const item of items.rows) {
       const sku = item.medusa_sku || item.nw_code;
+      const known = await query(`SELECT 1 FROM wms_products WHERE upper(variant_sku) = upper($1) LIMIT 1`, [sku]);
+      if (!item.medusa_sku && !known.rows[0]) {
+        // Not a barcode, not a product. Nothing is stocked under a made-up SKU: the desk picks the product first.
+        const raw = await query(
+          `SELECT scanned_input FROM checkin_scans WHERE item_id = $1 AND scanned_input IS NOT NULL ORDER BY scanned_at DESC LIMIT 1`,
+          [item.id],
+        ).catch(() => ({ rows: [] as any[] }));
+        parked.push({ kind: 'UNMATCHED', code: raw.rows[0]?.scanned_input || item.nw_code, sku: item.nw_code, qty: item.quantity_scanned });
+        continue;
+      }
+      if (!known.rows[0]) parked.push({ kind: 'NOT_IN_CATALOGUE', code: item.nw_code, sku, qty: item.quantity_scanned });
       prepared.push({ sku, colourCode: await resolveColourCode(sku, item.colour), qty: item.quantity_scanned });
     }
 
@@ -692,6 +781,12 @@ router.post('/sessions/:id/confirm', authMiddleware, async (req: AuthRequest, re
         stocked++;
       }
 
+      for (const p of parked) {
+        await client.query(
+          `INSERT INTO stock_in_reconcile (kind, code, sku, quantity, session_id) VALUES ($1, $2, $3, $4, $5)`,
+          [p.kind, p.code, p.sku, p.qty, sessionId],
+        );
+      }
       await client.query(
         `UPDATE checkin_sessions SET status = 'COMPLETE', completed_at = NOW(), updated_at = NOW() WHERE id = $1`,
         [sessionId]
