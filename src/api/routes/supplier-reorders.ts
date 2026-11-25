@@ -97,7 +97,7 @@ export function customPartCode(title: string): string | null {
   return pool[0].code;
 }
 
-function isChargeTitle(title: string): boolean {
+export function isChargeTitle(title: string): boolean {
   return /\b(delivery fee|shipping fee|postage|carriage)\b/i.test(title);
 }
 

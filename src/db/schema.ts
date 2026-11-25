@@ -46,6 +46,14 @@ CREATE TABLE IF NOT EXISTS barcode_mappings (
 ALTER TABLE barcode_mappings ADD COLUMN IF NOT EXISTS thumbnail_url VARCHAR(500);
 -- Who assigned a barcode by hand from the handheld (null for codes that came from the Medusa sync)
 ALTER TABLE barcode_mappings ADD COLUMN IF NOT EXISTS assigned_by VARCHAR;
+-- Where a mapping came from: null = Medusa sync / handheld, 'bisley_export' = Bisley's full barcode list
+-- (large; kept out of the handheld download), 'manual_sku' = SKU typed on the scanner for an unrecognised code.
+ALTER TABLE barcode_mappings ADD COLUMN IF NOT EXISTS source VARCHAR(30);
+-- A mapping usable straight away that the desk still has to check against the catalogue
+ALTER TABLE barcode_mappings ADD COLUMN IF NOT EXISTS needs_review BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE barcode_mappings ADD COLUMN IF NOT EXISTS reviewed_by VARCHAR;
+ALTER TABLE barcode_mappings ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP;
+CREATE INDEX IF NOT EXISTS idx_barcode_needs_review ON barcode_mappings(needs_review) WHERE needs_review = true;
 
 -- ================================================================================
 -- WMS PRODUCTS (Local Medusa cache — synced via POST /api/products/sync)
