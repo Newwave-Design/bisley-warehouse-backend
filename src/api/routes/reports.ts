@@ -564,7 +564,8 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
         console.warn('[reports/sales] conversion query failed:', err instanceof Error ? err.message : err);
         return { rows: [{ sample_customers: '0', converted: '0' }] };
       }),
-      // On-hand units × net cost (wms_products.unit_cost_gbp), not the shop price.
+      // Bonded stock only: on-hand units tagged Bisley (still Bisley's, held here) × net cost (wms_products.unit_cost_gbp),
+      // not the shop price. Stock tagged Ovara is Ovara's own and is left out.
       // Kits have no bin of their own, so this is physical stock only.
       // Some bays are labelled with the Medusa SKU while the cost sits on the supplier code;
       // sku_mappings bridges those.
@@ -576,7 +577,7 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
          FROM (
            SELECT product_sku, SUM(quantity)::numeric AS qty
            FROM warehouse_inventory
-           WHERE quantity > 0
+           WHERE quantity > 0 AND COALESCE(liability_status, 'Bisley') = 'Bisley'
            GROUP BY product_sku
          ) s
          LEFT JOIN (
@@ -671,6 +672,7 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
         rate: sampleCustomers ? Math.round((converted / sampleCustomers) * 1000) / 10 : 0,
       },
       inventory_value: {
+        basis: 'bonded',
         net_cost_gbp: round2(Number(stockValue?.net_cost_gbp) || 0),
         units: Number(stockValue?.units) || 0,
         uncosted_units: Number(stockValue?.uncosted_units) || 0,
