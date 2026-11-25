@@ -26,6 +26,7 @@ import { deliveryNoteForSession, openDeliveryNote } from '../../lib/delivery-not
 import { pushAvailableStock } from '../../lib/medusa-inventory.js';
 import { assignStockedToOlderOrders } from '../../lib/assign-arrived-stock.js';
 import { resolveScan } from '../../lib/resolve-scan.js';
+import { matchCustomArrivalsQuietly } from '../../lib/custom-arrivals.js';
 
 async function enrichCheckinItems(items: any[]) {
   const keys = [...new Set(items.flatMap((i) => [i.medusa_sku, i.nw_code].filter(Boolean)))]
@@ -568,6 +569,8 @@ router.post('/sessions/:id/complete', authMiddleware, async (req: AuthRequest, r
     const syncErrors = syncedSkus.size ? await pushAvailableStock([...syncedSkus]) : [];
     if (syncErrors.length) console.error(`[checkin] Medusa sync failed: ${syncErrors.join('; ')}`);
     scheduleStockHolds();
+    // After the holds rebuild (which runs 0.5s from now), set aside any arrived custom parts for their orders
+    setTimeout(() => matchCustomArrivalsQuietly('check-in'), 4000);
 
     const summary = await query(
       `SELECT COUNT(*) as items, SUM(quantity_scanned) as units FROM checkin_items WHERE session_id = $1 AND removed_at IS NULL`,

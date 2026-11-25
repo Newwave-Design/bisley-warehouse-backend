@@ -72,6 +72,42 @@ export async function applyDispatchStock(
          VALUES ('DISPATCH', NULL, $1, $2, 'Custom item', $3, $4, $5)`,
         [item.product_sku, -picked, userId, pickList.medusa_order_id, item.id]
       );
+      // A part set aside for this line (custom_line_arrivals) leaves the shelf now it has shipped.
+      // An ADJUST row, not DISPATCH, so Stock Sold still counts the sale once.
+      // Wrapped in a savepoint: a failure here must never stop the order shipping.
+      await client.query('SAVEPOINT custom_arrival');
+      try {
+        const arrival = (await client.query(
+          `SELECT sku, qty FROM custom_line_arrivals WHERE pick_list_item_id = $1 AND consumed_at IS NULL FOR UPDATE`,
+          [item.id],
+        )).rows[0];
+        if (arrival) {
+          let remaining = Math.min(picked, Number(arrival.qty) || 0);
+          const shelves = (await client.query(
+            `SELECT id, location_id, quantity FROM warehouse_inventory
+              WHERE upper(product_sku) = upper($1) AND quantity > 0
+              ORDER BY quantity DESC FOR UPDATE`,
+            [arrival.sku],
+          )).rows;
+          for (const shelf of shelves) {
+            if (remaining <= 0) break;
+            const take = Math.min(remaining, parseInt(shelf.quantity, 10));
+            if (take <= 0) continue;
+            await client.query(`UPDATE warehouse_inventory SET quantity = quantity - $1, updated_at = NOW() WHERE id = $2`, [take, shelf.id]);
+            await client.query(
+              `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, quantity, notes, performed_by, order_id, pick_list_item_id)
+               VALUES ('ADJUST', $1, $2, $3, 'Custom part shipped', $4, $5, $6)`,
+              [shelf.location_id, arrival.sku, -take, userId, pickList.medusa_order_id, item.id],
+            );
+            remaining -= take;
+          }
+          await client.query(`UPDATE custom_line_arrivals SET consumed_at = NOW(), updated_at = NOW() WHERE pick_list_item_id = $1`, [item.id]);
+        }
+        await client.query('RELEASE SAVEPOINT custom_arrival');
+      } catch (err) {
+        await client.query('ROLLBACK TO SAVEPOINT custom_arrival');
+        console.warn('[dispatch-stock] custom part not taken off the shelf:', err instanceof Error ? err.message : err);
+      }
       continue;
     }
 

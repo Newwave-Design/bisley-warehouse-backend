@@ -37,6 +37,8 @@ import generoRoutes from './api/routes/genero.js';
 import reportsRoutes, { generateAndStoreWeeklyReport } from './api/routes/reports.js';
 import mobileRoutes from './api/routes/mobile.js';
 import mobileSyncRoutes from './api/routes/mobile-sync.js';
+import customArrivalsRoutes from './api/routes/custom-arrivals.js';
+import { matchCustomArrivalsQuietly } from './lib/custom-arrivals.js';
 import mobileAppRoutes from './api/routes/mobile-app.js';
 import webhooksRoutes from './api/routes/webhooks.js';
 import reorderRulesRoutes, { pendingRouter as pendingReordersRouter } from './api/routes/reorder-rules.js';
@@ -137,6 +139,7 @@ app.use('/api/genero', generoRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/mobile', mobileRoutes);
 app.use('/api/mobile-sync', mobileSyncRoutes);
+app.use('/api/custom-arrivals', customArrivalsRoutes);
 app.use('/api/mobile-app', mobileAppRoutes);
 app.use('/api/reorder-rules', reorderRulesRoutes);
 app.use('/api/pending-reorders', pendingReordersRouter);
@@ -289,6 +292,13 @@ async function start() {
         } catch (err) { console.warn('[scheduler] Discrepancy check error:', err); }
       }, THIRTY_MIN);
       console.log('✓ Inventory discrepancy check scheduled (every 30 min)');
+    }
+
+    // Safety net for custom parts: a new custom order, a late payment or a stock change is picked up within 15 minutes
+    if (liveJobs) {
+      setInterval(() => matchCustomArrivalsQuietly('timer'), 15 * 60 * 1000);
+      setTimeout(() => matchCustomArrivalsQuietly('start'), 30 * 1000);
+      console.log('✓ Custom part matching scheduled (every 15 min)');
     }
 
     // Daily checks unconditional of Genero config: weekly report + liability review reminder

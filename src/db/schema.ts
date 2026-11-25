@@ -472,6 +472,17 @@ ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS is_custom BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE pick_list_items ADD COLUMN IF NOT EXISTS item_title TEXT;
 CREATE INDEX IF NOT EXISTS idx_pick_list_items_archived ON pick_list_items(is_archived);
+-- Parts that have arrived for a custom line: which line they are set aside for, from the part code in its title.
+-- Separate from order_stock_holds, which is rebuilt from catalogue lines only. consumed_at is set when the order ships.
+CREATE TABLE IF NOT EXISTS custom_line_arrivals (
+  pick_list_item_id UUID PRIMARY KEY REFERENCES pick_list_items(id) ON DELETE CASCADE,
+  sku VARCHAR(50) NOT NULL,
+  qty INT NOT NULL CHECK (qty > 0),
+  matched_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  consumed_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_custom_line_arrivals_sku ON custom_line_arrivals(sku);
 
 -- ================================================================================
 -- PICK SCANS (Individual scan history — supports partial-quantity picking,
