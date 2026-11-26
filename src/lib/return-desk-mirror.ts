@@ -105,7 +105,7 @@ export async function mirrorRequestToDesk(pickListId: string, sku: string, detai
               return_reason = CASE WHEN $5::text IS NOT NULL AND COALESCE(return_reason, 'Customer return') = 'Customer return' THEN $5 ELSE return_reason END,
               notes = CASE
                 WHEN $6::text = '' THEN notes
-                WHEN COALESCE(notes, '') = '' OR notes ~* '^(Asked for on the customer desk|Brought over|undefined:?\s*$)' THEN $6
+                WHEN COALESCE(notes, '') = '' OR notes ~* '^(Asked for on the customer desk|Brought over|undefined)' OR notes ~ '^(CRM-[0-9]+): \1: ' THEN $6
                 WHEN position($6 in notes) > 0 THEN notes
                 ELSE left(notes || E'\\n' || $6, 1500) END,
               updated_at = NOW()
