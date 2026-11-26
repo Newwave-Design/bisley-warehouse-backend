@@ -6,7 +6,8 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { importPackagingSnapshot } from './packaging-import.js';
+import { query } from '../db/index.js';
+import { boxNoteExtra, importPackagingSnapshot, money, parseDims } from './packaging-import.js';
 
 const API = 'https://app.smartsuite.com/api/v1/applications/';
 const DEFAULT_ACCOUNT = 's7kapanm';
@@ -101,4 +102,61 @@ export async function syncPackagingFromSmartSuite(opts: { dryRun?: boolean; fetc
     rmSync(dir, { recursive: true, force: true });
   }
   return last!;
+}
+
+export interface BoxRefreshResult {
+  ok: boolean;
+  dryRun: boolean;
+  error?: string;
+  boxes_in_smartsuite?: number;
+  /** One line per box whose size, price or merge note differs from the WMS. */
+  changes?: { code: string; size?: [string | null, string | null]; cost?: [number | null, number | null]; merge?: [string | null, string | null] }[];
+  /** Boxes SmartSuite has that the WMS has no row for. A full sync adds them. */
+  not_in_wms?: string[];
+}
+
+/**
+ * Brings box size, price, internal size and the merge note from SmartSuite onto boxes the WMS already has.
+ * Leaves stock, BOMs and every other pack alone. Dry run unless dryRun is false.
+ */
+export async function refreshBoxesFromSmartSuite(opts: { dryRun?: boolean; fetchFn?: Fetch } = {}): Promise<BoxRefreshResult> {
+  const dryRun = opts.dryRun !== false;
+  try {
+    const records = await fetchTable(SMARTSUITE_TABLES.Boxes, opts.fetchFn);
+    if (records.length < (MINIMUM_ROWS.Boxes ?? 0)) throw new Error(`SmartSuite Boxes returned ${records.length} rows. Nothing changed.`);
+    const existing = (await query(`SELECT id, code, unit_cost_gbp, internal_length_mm, internal_width_mm, internal_height_mm, extra FROM packaging_items WHERE item_type = 'box'`)).rows;
+    const byCode = new Map(existing.map((row: any) => [String(row.code), row]));
+    const changes: NonNullable<BoxRefreshResult['changes']> = [];
+    const missing: string[] = [];
+    for (const record of records) {
+      const code = String(record.title || '');
+      const row: any = byCode.get(code);
+      if (!row) { if (code) missing.push(code); continue; }
+      const size = typeof record.sa9b7fe02d === 'string' ? record.sa9b7fe02d : null;
+      const cost = money(record.s50a02c27e);
+      const note = boxNoteExtra(record.s0bdd4c923);
+      const dims = parseDims(record.s0e2a6acaa);
+      const before = row.extra || {};
+      const change: NonNullable<BoxRefreshResult['changes']>[number] = { code };
+      if ((before.box_size_formula ?? null) !== size) change.size = [before.box_size_formula ?? null, size];
+      if (cost != null && Number(row.unit_cost_gbp ?? NaN) !== cost) change.cost = [row.unit_cost_gbp == null ? null : Number(row.unit_cost_gbp), cost];
+      if ((before.merge_into ?? null) !== note.merge_into) change.merge = [before.merge_into ?? null, note.merge_into as string | null];
+      const dimsChanged = dims.l != null && (row.internal_length_mm !== dims.l || row.internal_width_mm !== dims.w || row.internal_height_mm !== dims.h);
+      if (!change.size && !change.cost && !change.merge && !dimsChanged && (before.ss_notes ?? '') === note.ss_notes) continue;
+      changes.push(change);
+      if (!dryRun) {
+        await query(
+          `UPDATE packaging_items SET
+             unit_cost_gbp = COALESCE($2, unit_cost_gbp),
+             internal_length_mm = COALESCE($3, internal_length_mm), internal_width_mm = COALESCE($4, internal_width_mm), internal_height_mm = COALESCE($5, internal_height_mm),
+             extra = COALESCE(extra, '{}'::jsonb) || $6::jsonb, updated_at = NOW()
+           WHERE id = $1`,
+          [row.id, cost, dims.l, dims.w, dims.h, JSON.stringify({ box_size_formula: size, ...note })],
+        );
+      }
+    }
+    return { ok: true, dryRun, boxes_in_smartsuite: records.length, changes, not_in_wms: missing };
+  } catch (err: any) {
+    return { ok: false, dryRun, error: String(err?.message || err) };
+  }
 }

@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MINIMUM_ROWS, SMARTSUITE_TABLES, fetchTable, writeSnapshot } from './smartsuite-sync.ts'
-import { bomOptions, isSyncOwned } from './packaging-import.ts'
+import { bomOptions, isSyncOwned, parseMergeNote } from './packaging-import.ts'
 
 process.env.SMARTSUITE_API_KEY = 'test-key'
 
@@ -64,4 +64,12 @@ test('hand-made BOMs are not owned by the sync', () => {
   assert.equal(isSyncOwned('smartsuite'), true)
   assert.equal(isSyncOwned('manual'), false)
   assert.equal(isSyncOwned(null), false)
+})
+
+test('merge notes are read from the SmartSuite box notes', () => {
+  assert.deepEqual(parseMergeNote('Merge into Box-19'), { merge_into: 'BOX-19', run_down: false })
+  assert.deepEqual(parseMergeNote('Merge into Box-19, run down'), { merge_into: 'BOX-19', run_down: true })
+  assert.deepEqual(parseMergeNote('Merge into Box-13, run down'), { merge_into: 'BOX-13', run_down: true })
+  assert.equal(parseMergeNote('Checked with supplier'), null)
+  assert.equal(parseMergeNote(undefined), null)
 })

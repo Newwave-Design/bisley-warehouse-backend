@@ -17,7 +17,7 @@ function num(v: any): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function money(v: any): number | null {
+export function money(v: any): number | null {
   if (v == null || v === '') return null;
   const n = Number(String(v).replace(/[£,]/g, ''));
   return Number.isFinite(n) ? n : null;
@@ -56,7 +56,7 @@ function mapPackagingType(raw: any): { method: string; label: string; exclude: b
   return { method: 'needs_packaging', label: token || 'Unknown', exclude: false, raw: token };
 }
 
-function parseDims(text: string | null | undefined): { l: number | null; w: number | null; h: number | null } {
+export function parseDims(text: string | null | undefined): { l: number | null; w: number | null; h: number | null } {
   if (!text) return { l: null, w: null, h: null };
   const parts = String(text).replace(/,/g, '').match(/(\d+(?:\.\d+)?)/g);
   if (!parts || parts.length < 2) return { l: null, w: null, h: null };
@@ -128,6 +128,23 @@ async function link(from_kind: string, from_key: string, to_kind: string, to_key
   );
 }
 
+/**
+ * SmartSuite box notes such as "Merge into Box-19, run down".
+ * merge_into is the box that takes over (BOX-19). run_down means use up the stock left in this box first and stop buying it.
+ */
+export function parseMergeNote(note: unknown): { merge_into: string; run_down: boolean } | null {
+  const text = typeof note === 'string' ? note : '';
+  const match = text.match(/merge\s+into\s+box[\s-]*(\d+)/i);
+  if (!match) return null;
+  return { merge_into: `BOX-${Number(match[1])}`, run_down: /run\s*down/i.test(text) };
+}
+
+/** What a box row stores about its SmartSuite note. A cleared note clears the merge. */
+export function boxNoteExtra(note: unknown): Record<string, unknown> {
+  const merge = parseMergeNote(note);
+  return { ss_notes: typeof note === 'string' ? note : '', merge_into: merge?.merge_into ?? null, run_down: merge?.run_down ?? false };
+}
+
 /** Cartons to build for a product, preferred first. Box beats sleeve and tray when both exist. */
 export function bomOptions(hasBox: boolean, hasSleeveSet: boolean): { kind: 'box' | 'sleeve_tray'; rank: number; label: string }[] {
   const out: { kind: 'box' | 'sleeve_tray'; rank: number; label: string }[] = [];
@@ -197,6 +214,7 @@ export async function importPackagingSnapshot(opts: { dryRun?: boolean; sourceDi
         box_size_formula: r.sa9b7fe02d,
         packed_max: { l: num(r.sd185e7a13), w: num(r.s9pdssra), h: num(r.sw18wuus) },
         units_month: num(r.s210acc4ea),
+        ...boxNoteExtra(r.s0bdd4c923),
       },
     });
     itemBySs.set(r.id, { id, code: r.title });

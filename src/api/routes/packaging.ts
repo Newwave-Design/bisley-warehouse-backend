@@ -9,7 +9,9 @@ import { query } from '../../db/index.js';
 import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { toUuidOrNull } from './mobile.js';
 import { importPackagingSnapshot } from '../../lib/packaging-import.js';
-import { lastSmartSuiteSync, smartSuiteConfigured, syncPackagingFromSmartSuite } from '../../lib/smartsuite-sync.js';
+import { lastSmartSuiteSync, refreshBoxesFromSmartSuite, smartSuiteConfigured, syncPackagingFromSmartSuite } from '../../lib/smartsuite-sync.js';
+import { loadPackagingPlan } from '../../lib/packaging-plan.js';
+import { loadCoverage } from '../../lib/packaging-coverage.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
 import { loadPackagingReorder } from '../../lib/packaging-reorder.js';
 import { scheduleStockHolds } from '../../lib/stock-holds.js';
@@ -1004,11 +1006,108 @@ router.post('/import-snapshot', requirePermission('manage_settings'), async (req
   }
 });
 
+/** What open orders still need, what is on the shelf and on order, what to buy, and which orders each pack unlocks. */
+router.get('/plan', async (_req: Request, res: Response) => {
+  try {
+    res.json(await loadPackagingPlan());
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to build the packaging plan', details: err.message });
+  }
+});
+
+/** Which products each pack covers, and which packs each product uses. First choice and alternatives. */
+router.get('/coverage', async (_req: Request, res: Response) => {
+  try {
+    res.json(await loadCoverage());
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to build packaging coverage', details: err.message });
+  }
+});
+
+/** Open on-order lines, one per pack code with the earliest due date. */
+router.get('/on-order', async (_req: Request, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT o.id, i.code, i.name, o.qty, to_char(o.due_on, 'YYYY-MM-DD') AS due_on, o.reference, o.status, o.note, o.placed_at
+         FROM packaging_on_order o JOIN packaging_items i ON i.id = o.packaging_item_id
+        WHERE o.status = 'open'
+        ORDER BY o.due_on NULLS LAST, i.code`,
+    );
+    res.json({ lines: result.rows });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to list packaging on order', details: err.message });
+  }
+});
+
+/** Record a purchase: { reference?, due_on?, lines: [{ code, qty }] }. Nothing is sent to the supplier. */
+router.post('/on-order', requirePermission('manage_settings'), async (req: Request, res: Response) => {
+  try {
+    const lines: { code: string; qty: number }[] = (Array.isArray(req.body?.lines) ? req.body.lines : [])
+      .map((line: any) => ({ code: String(line?.code || '').trim(), qty: Math.floor(Number(line?.qty) || 0) }))
+      .filter((line: { code: string; qty: number }) => line.code && line.qty > 0);
+    if (!lines.length) return res.status(400).json({ error: 'lines needs at least one { code, qty }' });
+    const dueOn = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body?.due_on || '')) ? String(req.body.due_on) : null;
+    const reference = String(req.body?.reference || '').trim().slice(0, 100) || null;
+    const items = await query(`SELECT id, code FROM packaging_items WHERE code = ANY($1::text[]) AND is_active`, [lines.map((line) => line.code)]);
+    const idByCode = new Map(items.rows.map((row: any) => [String(row.code), String(row.id)]));
+    const unknown = lines.filter((line) => !idByCode.has(line.code)).map((line) => line.code);
+    if (unknown.length) return res.status(400).json({ error: `Unknown packaging code: ${unknown.join(', ')}` });
+    const created: any[] = [];
+    for (const line of lines) {
+      const row = await query(
+        `INSERT INTO packaging_on_order (id, packaging_item_id, qty, due_on, reference) VALUES ($1,$2,$3,$4,$5) RETURNING id, qty, due_on, reference, status`,
+        [uuid(), idByCode.get(line.code), line.qty, dueOn, reference],
+      );
+      created.push({ code: line.code, ...row.rows[0] });
+    }
+    res.status(201).json({ created });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to record the order', details: err.message });
+  }
+});
+
+/** { action: 'receive' } books the quantity in and closes the line. { action: 'cancel' } closes it. { qty?, due_on? } edits it. */
+router.patch('/on-order/:id', requirePermission('manage_settings'), async (req: Request, res: Response) => {
+  try {
+    const found = await query(`SELECT * FROM packaging_on_order WHERE id = $1`, [req.params.id]);
+    const line = found.rows[0];
+    if (!line) return res.status(404).json({ error: 'Not found' });
+    if (line.status !== 'open') return res.status(409).json({ error: `Already ${line.status}` });
+    const action = String(req.body?.action || '');
+    if (action === 'receive') {
+      const userId = toUuidOrNull((req as any).user?.id);
+      await query(
+        `INSERT INTO packaging_stock_movements (id, packaging_item_id, movement_type, qty, supplier_order_ref, reason, created_by)
+         VALUES ($1,$2,'receipt',$3,$4,'Booked in from packaging on order',$5)`,
+        [uuid(), line.packaging_item_id, line.qty, line.reference, userId],
+      );
+      await query(`UPDATE packaging_items SET stock_on_hand = stock_on_hand + $2, updated_at = NOW() WHERE id = $1`, [line.packaging_item_id, line.qty]);
+      await query(`UPDATE packaging_on_order SET status = 'received', closed_at = NOW() WHERE id = $1`, [line.id]);
+      scheduleStockHolds();
+      return res.json({ status: 'received' });
+    }
+    if (action === 'cancel') {
+      await query(`UPDATE packaging_on_order SET status = 'cancelled', closed_at = NOW() WHERE id = $1`, [line.id]);
+      return res.json({ status: 'cancelled' });
+    }
+    const qty = req.body?.qty == null ? line.qty : Math.floor(Number(req.body.qty));
+    const dueOn = req.body?.due_on === undefined ? line.due_on : (/^\d{4}-\d{2}-\d{2}$/.test(String(req.body.due_on)) ? req.body.due_on : null);
+    if (!(qty > 0)) return res.status(400).json({ error: 'qty must be above 0' });
+    await query(`UPDATE packaging_on_order SET qty = $2, due_on = $3 WHERE id = $1`, [line.id, qty, dueOn]);
+    res.json({ status: 'open', qty, due_on: dueOn });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update the order line', details: err.message });
+  }
+});
+
 /** Pull SmartSuite now. Dry run unless dryRun=false. GET shows the last run, including the timed ones. */
 router.post('/sync-smartsuite', requirePermission('manage_settings'), async (req: Request, res: Response) => {
   if (!smartSuiteConfigured()) return res.status(400).json({ error: 'SMARTSUITE_API_KEY is not set on this server' });
   const dryRun = String(req.query.dryRun ?? req.body?.dryRun ?? 'true') !== 'false';
-  const result = await syncPackagingFromSmartSuite({ dryRun });
+  // scope=boxes brings only box sizes, prices and merge notes. It does not touch stock or BOMs.
+  const result = String(req.query.scope ?? req.body?.scope ?? '') === 'boxes'
+    ? await refreshBoxesFromSmartSuite({ dryRun })
+    : await syncPackagingFromSmartSuite({ dryRun });
   res.status(result.ok ? 200 : 502).json(result);
 });
 

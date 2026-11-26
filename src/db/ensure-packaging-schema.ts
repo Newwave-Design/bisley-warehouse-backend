@@ -150,6 +150,20 @@ export async function ensurePackagingSchema() {
       created_at TIMESTAMP DEFAULT NOW()
     )`,
     `CREATE INDEX IF NOT EXISTS idx_pkg_moves_item ON packaging_stock_movements(packaging_item_id, created_at DESC)`,
+
+    // Packaging placed with the supplier and not yet booked in. The Packaging plan nets it off what is still to order.
+    `CREATE TABLE IF NOT EXISTS packaging_on_order (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      packaging_item_id UUID NOT NULL REFERENCES packaging_items(id),
+      qty INTEGER NOT NULL CHECK (qty > 0),
+      due_on DATE,
+      reference VARCHAR(100),
+      status VARCHAR(12) NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'received', 'cancelled')),
+      note TEXT,
+      placed_at TIMESTAMP DEFAULT NOW(),
+      closed_at TIMESTAMP
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_pkg_on_order_open ON packaging_on_order(packaging_item_id) WHERE status = 'open'`,
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_pkg_moves_shipment
       ON packaging_stock_movements (pick_list_id, packaging_item_id)
       WHERE movement_type = 'pack_usage' AND extra->>'source' = 'shipment'`,
