@@ -20,6 +20,8 @@ import { COLOUR_NAMES, extractColourCode } from '../../lib/colour-names.js';
 import { getCachedUpsRates, upsReferenceDestinationConfigured, type UpsRateQuote } from '../../lib/ups.js';
 import { decideShippingForPackedItem, parseAitWeightTiers, parseDhlTiers, type AitAssignment, type AitWeightTier, type DhlAssignment, type DhlTier } from '../../lib/shipping-decision.js';
 
+import { pooledTrayQty, trayMate } from '../../lib/tray-pool.js';
+
 const router = express.Router();
 
 
@@ -44,7 +46,16 @@ async function warehouseStockBySku(): Promise<Map<string, number>> {
   const result = await query(
     `SELECT product_sku, COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory GROUP BY product_sku`
   );
-  return new Map(result.rows.map((r: any) => [r.product_sku, r.qty ?? 0]));
+  const own = new Map<string, number>(result.rows.map((r: any) => [r.product_sku, r.qty ?? 0]));
+  // Insert-tray singles and 5-packs are one pool: each shows what can be sold as that form.
+  const stock = new Map(own);
+  for (const [sku, qty] of own) {
+    const mate = trayMate(sku);
+    if (!mate) continue;
+    stock.set(sku, pooledTrayQty(sku, qty, own.get(mate) ?? 0));
+    if (!stock.has(mate)) stock.set(mate, pooledTrayQty(mate, 0, qty));
+  }
+  return stock;
 }
 
 // Rewrite the catalogue cache column from warehouse_inventory. Catalogue sync must not

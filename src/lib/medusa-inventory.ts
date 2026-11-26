@@ -30,6 +30,25 @@ export async function getMedusaToken(): Promise<string> {
   return MEDUSA_API_KEY;
 }
 
+import { pooledTrayQty, trayMate } from './tray-pool.js';
+
+/** Warehouse totals for a SKU. An insert tray also counts its other form (single <-> 5-pack) as one pool. */
+export async function warehouseTotals(sku: string): Promise<{ available: number; onhand: number; n: number }> {
+  const mate = trayMate(sku);
+  const r = await query(
+    `SELECT product_sku, COALESCE(SUM(quantity_available), 0)::int AS available, COALESCE(SUM(quantity), 0)::int AS onhand, COUNT(*)::int AS n
+     FROM warehouse_inventory WHERE product_sku = ANY($1::text[]) GROUP BY product_sku`,
+    [mate ? [sku, mate] : [sku]],
+  );
+  const own = r.rows.find((x: any) => x.product_sku === sku);
+  const other = r.rows.find((x: any) => x.product_sku === mate);
+  return {
+    available: pooledTrayQty(sku, Number(own?.available ?? 0), Number(other?.available ?? 0)),
+    onhand: pooledTrayQty(sku, Number(own?.onhand ?? 0), Number(other?.onhand ?? 0)),
+    n: Number(own?.n ?? 0) + Number(other?.n ?? 0),
+  };
+}
+
 /**
  * Make Medusa sell exactly the warehouse's free stock (stock not reserved to any existing order).
  * wmsQty is the warehouse FREE quantity. Medusa subtracts its own reservations from the stocked quantity, so the stocked
@@ -58,10 +77,10 @@ export async function syncSkuToMedusa(
     if (!level) return { ok: false, error: `No location level for SKU ${sku}` };
 
     // Stocked quantity = what can be sold + Medusa's own reservations, so stocked minus reserved is what can be sold.
-    const onhandRow = await query(`SELECT COALESCE(SUM(quantity), 0)::int AS onhand, COUNT(*)::int AS n FROM warehouse_inventory WHERE product_sku = $1`, [sku]);
+    const totals = await warehouseTotals(sku);
     const target = shopStockTarget({
       free: wmsQty,
-      onhand: Number(onhandRow.rows[0]?.n) > 0 ? Number(onhandRow.rows[0]?.onhand) : null,
+      onhand: totals.n > 0 ? totals.onhand : null,
       medusaReserved: Number(level.reserved_quantity) || 0,
     });
 
@@ -97,12 +116,11 @@ export async function pushAvailableStock(skus: string[]): Promise<string[]> {
   const errors: string[] = [];
   const floored: string[] = [];
   const missing: string[] = [];
-  for (const sku of [...new Set(skus.map((value) => String(value || '').trim()).filter(Boolean))]) {
-    const total = await query(
-      `SELECT COALESCE(SUM(quantity_available), 0)::int AS available FROM warehouse_inventory WHERE product_sku = $1`,
-      [sku],
-    );
-    const available = Number(total.rows[0]?.available);
+  const wanted = skus.map((value) => String(value || '').trim()).filter(Boolean);
+  // A tray single and its 5-pack share one pool, so a change to one changes what the other can sell.
+  for (const sku of [...wanted]) { const mate = trayMate(sku); if (mate) wanted.push(mate); }
+  for (const sku of [...new Set(wanted)]) {
+    const available = (await warehouseTotals(sku)).available;
     if (!Number.isInteger(available)) {
       errors.push(`${sku}: warehouse free stock was not a whole number, so Medusa was left unchanged`);
       continue;
@@ -160,6 +178,15 @@ export async function reconcileAvailableStock(): Promise<{ checked: number; upda
   const rows = await query(
     `SELECT product_sku AS sku, COALESCE(SUM(quantity_available), 0)::int AS available, COALESCE(SUM(quantity), 0)::int AS onhand FROM warehouse_inventory GROUP BY product_sku`,
   );
+  // Insert-tray singles and 5-packs are one pool, so each is checked against what it can sell as that form.
+  const ownRows = new Map<string, { available: number; onhand: number }>(rows.rows.map((r: any) => [r.sku, { available: Number(r.available), onhand: Number(r.onhand) }]));
+  for (const row of rows.rows) {
+    const mate = trayMate(row.sku);
+    if (!mate) continue;
+    const other = ownRows.get(mate);
+    row.available = pooledTrayQty(row.sku, Number(ownRows.get(row.sku)?.available ?? 0), other?.available ?? 0);
+    row.onhand = pooledTrayQty(row.sku, Number(ownRows.get(row.sku)?.onhand ?? 0), other?.onhand ?? 0);
+  }
   let levels: Map<string, { stocked: number; reserved: number }>;
   try {
     levels = await medusaLevelsAtOvara();
