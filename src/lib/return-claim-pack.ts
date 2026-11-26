@@ -12,13 +12,30 @@ function safe(text: string) {
   return String(text || 'item').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 40);
 }
 
-export type ClaimPack = { file: string; zip: Buffer; photos: number; skipped: number; kind: 'bisley' | 'carrier'; target: string };
+export type ClaimPack = {
+  file: string;
+  zip: Buffer;
+  photos: number;
+  skipped: number;
+  kind: 'bisley' | 'carrier';
+  target: string;
+  /** The claim written out, as in claim.txt, for an email. */
+  text: string;
+  /** The photos in the order they matter (courier delivery photo first), for an email. */
+  photoFiles: { name: string; contentType: string; data: Buffer }[];
+  rma: string;
+  order: string;
+  customer: string;
+  consignment: string;
+  deskCaseId: string | null;
+};
 
 export async function buildClaimPack(claimId: string): Promise<ClaimPack | null> {
   const claim = await query(
     `SELECT c.id, c.kind, c.note, ra.id AS return_id, ra.rma_number, ra.customer_name, ra.customer_email, ra.return_reason, ra.tracking_number,
             ra.courier_problem, ra.decision, ra.notes, ra.pick_list_id, ra.created_at, pl.pick_list_number, pl.medusa_order_id,
-            ra.delivered_at, ra.delivered_signed_by, ra.delivery_gps, pl.tracking_number AS out_tracking, pl.carrier AS out_carrier
+            ra.delivered_at, ra.delivered_signed_by, ra.delivery_gps, pl.tracking_number AS out_tracking, pl.carrier AS out_carrier,
+            ra.desk_case_id, ra.fault, ra.fault_note
        FROM return_claims c
        JOIN return_authorizations ra ON ra.id = c.return_authorization_id
        LEFT JOIN pick_lists pl ON pl.id = ra.pick_list_id
@@ -31,6 +48,7 @@ export async function buildClaimPack(claimId: string): Promise<ClaimPack | null>
   const items = (await query(`SELECT id, product_sku, quantity_requested, quantity_received, item_condition, decision, item_notes FROM return_items WHERE return_authorization_id = $1 ORDER BY created_at, id`, [row.return_id])).rows;
 
   const files: ZipEntry[] = [];
+  const photoFiles: ClaimPack['photoFiles'] = [];
   let used = 0;
   let skipped = 0;
   const lines: string[] = [];
@@ -40,6 +58,7 @@ export async function buildClaimPack(claimId: string): Promise<ClaimPack | null>
     const ext = EXT[type] || 'jpg';
     const file = `photos/${String(files.length + 1).padStart(2, '0')}-${safe(name)}.${ext}`;
     files.push({ name: file, data });
+    photoFiles.push({ name: file.replace(/^photos\//, ''), contentType: type, data });
     lines.push(`  ${file}  ${label}`);
   };
 
@@ -75,6 +94,7 @@ export async function buildClaimPack(claimId: string): Promise<ClaimPack | null>
     `Tracking: ${row.tracking_number || row.out_tracking || ''}${row.out_carrier ? ` (${row.out_carrier})` : ''}`,
     row.delivered_at ? `Delivered: ${new Date(row.delivered_at).toISOString().replace('T', ' ').slice(0, 16)} UTC${row.delivered_signed_by ? `, signed ${row.delivered_signed_by}` : ''}${row.delivery_gps ? `, GPS ${row.delivery_gps}` : ''}` : '',
     `Return opened: ${row.created_at ? new Date(row.created_at).toISOString().slice(0, 10) : ''}`,
+    row.fault ? `Fault: ${row.fault}${row.fault_note ? ` (${row.fault_note})` : ''}` : '',
     row.note ? `Claim note: ${row.note}` : '',
     '',
     'Items:',
@@ -94,6 +114,13 @@ export async function buildClaimPack(claimId: string): Promise<ClaimPack | null>
     photos: files.length,
     skipped,
     kind,
-    target: kind === 'carrier' ? 'DX UAT or the carrier named on the order' : 'Bisley',
+    target: kind === 'carrier' ? (row.out_carrier ? String(row.out_carrier) : 'the carrier named on the order') : 'Bisley',
+    text,
+    photoFiles,
+    rma: String(row.rma_number || ''),
+    order: String(row.pick_list_number || ''),
+    customer: String(row.customer_name || ''),
+    consignment: String(row.out_tracking || row.tracking_number || ''),
+    deskCaseId: row.desk_case_id ? String(row.desk_case_id) : null,
   };
 }

@@ -34,6 +34,10 @@ test('a Bisley claim needs a photo of the damage, or a reason', () => {
   assert.equal(canRaiseClaim({ kind: 'bisley', fault: 'packing', photoKinds: [], override: 'Inspected in the warehouse, paint bubbling' }).ok, true);
 });
 
+test('the courier delivery photo counts as the box photo for a carrier claim', () => {
+  assert.equal(canRaiseClaim({ kind: 'carrier', fault: 'courier', photoKinds: ['item', 'delivery'] }).ok, true);
+});
+
 test('the courier delivery photo is not a photo of the damage', () => {
   assert.equal(canRaiseClaim({ kind: 'bisley', fault: 'manufacturing', photoKinds: ['delivery', 'signature'] }).ok, false);
 });

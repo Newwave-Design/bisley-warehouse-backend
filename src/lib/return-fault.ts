@@ -61,8 +61,9 @@ export function canRaiseClaim(check: ClaimCheck): { ok: true } | { ok: false; re
   }
   const overridden = String(check.override || '').trim().length >= 10;
   const kinds = check.photoKinds.map((kind) => String(kind || 'item'));
-  if (check.kind === 'carrier' && !kinds.some((kind) => kind === 'box' || kind === 'label') && !overridden) {
-    return { ok: false, reason: 'A carrier will ask for a photo of the outer box or label. Add one, or give a reason to claim without it.' };
+  // The courier's own delivery photo shows the box at the door, so it counts as the box photo.
+  if (check.kind === 'carrier' && !kinds.some((kind) => kind === 'box' || kind === 'label' || kind === 'delivery') && !overridden) {
+    return { ok: false, reason: 'A carrier will ask for a photo of the outer box or label. Add one, fetch the courier delivery photo, or give a reason to claim without it.' };
   }
   // The courier's delivery photo and signature are not a photo of the damage.
   if (!kinds.some((kind) => kind !== 'delivery' && kind !== 'signature') && !overridden) {

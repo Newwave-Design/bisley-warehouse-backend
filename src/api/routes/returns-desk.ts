@@ -19,6 +19,7 @@ import { stockArrived } from './stock-in.js';
 import { returnProgress, RETURN_STEPS, type ReturnCollection } from '../../lib/return-progress.js';
 import { returnKind } from '../../lib/return-kind.js';
 import { pullDeliveryProof } from '../../lib/delivery-proof.js';
+import { claimContacts, DeskLinkError, sendClaim } from '../../lib/desk-link.js';
 import { canRaiseClaim, evidenceChecklist, isClaimKind, isClaimStatus, isFault, isPhotoKind, suggestFault, FAULTS, PHOTO_KINDS, CLAIM_STATUSES } from '../../lib/return-fault.js';
 
 const router = express.Router();
@@ -70,7 +71,7 @@ router.get('/', async (req: AuthRequest, res: Response) => {
                 FROM return_desk_photos p WHERE p.return_authorization_id = ra.id
             ), '[]') AS photos,
             COALESCE((
-              SELECT json_agg(json_build_object('id', c.id, 'kind', c.kind, 'status', COALESCE(c.status, 'open'), 'note', c.note, 'override_note', c.override_note, 'created_by', c.created_by, 'created_at', c.created_at, 'report_name', c.report_name) ORDER BY c.created_at)
+              SELECT json_agg(json_build_object('id', c.id, 'kind', c.kind, 'status', COALESCE(c.status, 'open'), 'note', c.note, 'override_note', c.override_note, 'created_by', c.created_by, 'created_at', c.created_at, 'report_name', c.report_name, 'sent_to', c.sent_to, 'sent_at', c.sent_at) ORDER BY c.created_at)
                 FROM return_claims c WHERE c.return_authorization_id = ra.id
             ), '[]') AS claims
      FROM return_authorizations ra
@@ -553,6 +554,41 @@ router.post('/:id/claims', async (req: AuthRequest, res: Response) => {
     [ra.id, kind, note, req.user?.email || null, override || null]
   );
   res.status(201).json({ claim: saved.rows[0] });
+});
+
+/** Who a claim can be emailed to: the contacts saved on the customer desk, with Sue at Bisley marked. */
+router.get('/claim-contacts', async (_req: AuthRequest, res: Response) => {
+  try {
+    res.json(await claimContacts());
+  } catch (error) {
+    const status = error instanceof DeskLinkError ? error.status : 502;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'The customer desk did not answer' });
+  }
+});
+
+/** Email a claim from the orders mailbox, with its photos (courier delivery photo first), and mark it sent. */
+router.post('/claims/:id/send', async (req: AuthRequest, res: Response) => {
+  if (!(await admin(req))) return res.status(403).json({ error: 'An admin sends a claim' });
+  const to = String(req.body?.to || '').trim();
+  if (!to) return res.status(400).json({ error: 'Choose who the claim goes to' });
+  const found = await query(`SELECT id, status FROM return_claims WHERE id = $1`, [req.params.id]);
+  if (!found.rows[0]) return res.status(404).json({ error: 'Claim not found' });
+  try {
+    const sent = await sendClaim(req.params.id, to, String(req.body?.message || '').slice(0, 4000));
+    const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+    await query(
+      `UPDATE return_claims
+          SET status = CASE WHEN COALESCE(status, 'open') = 'open' THEN 'sent' ELSE status END,
+              sent_to = $2, sent_at = NOW(), updated_at = NOW(),
+              note = left(COALESCE(note || E'\\n', '') || $3, 2000)
+        WHERE id = $1`,
+      [req.params.id, sent.to.join(', '), `Emailed to ${sent.to.join(', ')} on ${stamp} UTC by ${req.user?.email || 'the warehouse'} with ${sent.photos} photo${sent.photos === 1 ? '' : 's'}.`]
+    );
+    res.json(sent);
+  } catch (error) {
+    const status = error instanceof DeskLinkError ? error.status : 502;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'The claim was not sent' });
+  }
 });
 
 /** Move a claim on: sent, accepted, rejected, paid or withdrawn. */

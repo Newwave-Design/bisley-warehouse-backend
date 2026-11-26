@@ -1712,6 +1712,9 @@ ALTER TABLE return_claims ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL D
 ALTER TABLE return_claims ADD COLUMN IF NOT EXISTS created_by VARCHAR(255);
 ALTER TABLE return_claims ADD COLUMN IF NOT EXISTS override_note TEXT;
 ALTER TABLE return_claims ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+-- Where and when a claim was emailed from the orders mailbox
+ALTER TABLE return_claims ADD COLUMN IF NOT EXISTS sent_to VARCHAR(400);
+ALTER TABLE return_claims ADD COLUMN IF NOT EXISTS sent_at TIMESTAMP;
 
 -- A week (Friday to Thursday) becomes fixed once locked: its statement lines are copied here and never change
 CREATE TABLE IF NOT EXISTS settlement_weeks (
