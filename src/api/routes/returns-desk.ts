@@ -16,6 +16,7 @@ import { buildClaimPack } from '../../lib/return-claim-pack.js';
 import { splitKitForReturn } from '../../lib/return-kits.js';
 import { stockArrived } from './stock-in.js';
 import { returnProgress, RETURN_STEPS, type ReturnCollection } from '../../lib/return-progress.js';
+import { returnKind } from '../../lib/return-kind.js';
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -79,10 +80,45 @@ router.get('/', async (req: AuthRequest, res: Response) => {
     : { rows: [] as (ReturnCollection & { pick_list_id: string })[] };
   const byPick = new Map<string, ReturnCollection>();
   for (const row of bookings.rows as (ReturnCollection & { pick_list_id: string })[]) byPick.set(row.pick_list_id, row);
+  // What was asked for on the order: the order number, each requested line with its title and who raised it,
+  // and the photos attached to those requests (they live apart from the photos taken at inspection).
+  const orders = pickIds.length
+    ? await query(
+        `SELECT pl.id, pl.pick_list_number, pl.status AS order_status,
+                COALESCE((
+                  SELECT json_agg(json_build_object('sku', r.sku, 'title', pli.item_title, 'qty', pli.quantity_required, 'outcome', r.outcome,
+                                                    'status', r.status, 'created_by', r.created_by, 'created_at', r.created_at) ORDER BY r.created_at, r.sku)
+                    FROM return_requests r
+                    LEFT JOIN LATERAL (
+                      SELECT item_title, quantity_required FROM pick_list_items
+                       WHERE pick_list_id = r.pick_list_id AND product_sku = r.sku AND NOT COALESCE(is_archived, false)
+                       ORDER BY line_number LIMIT 1
+                    ) pli ON true
+                   WHERE r.pick_list_id = pl.id AND r.status <> 'cancelled'
+                ), '[]'::json) AS request_lines,
+                COALESCE((
+                  SELECT json_agg(json_build_object('id', i.id, 'sku', r.sku, 'created_by', i.created_by, 'created_at', i.created_at) ORDER BY i.created_at)
+                    FROM return_request_images i JOIN return_requests r ON r.id = i.return_request_id
+                   WHERE r.pick_list_id = pl.id AND r.status <> 'cancelled'
+                ), '[]'::json) AS request_photos
+           FROM pick_lists pl WHERE pl.id = ANY($1::uuid[])`,
+        [pickIds]
+      )
+    : { rows: [] as Record<string, unknown>[] };
+  const byOrder = new Map<string, Record<string, unknown>>(orders.rows.map((row: Record<string, unknown>) => [String(row.id), row]));
   const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' }).format(new Date());
   const returns = rows.rows.map((row: { pick_list_id?: string }) => {
     const collection = row.pick_list_id ? byPick.get(row.pick_list_id) || null : null;
-    return { ...row, collection, progress: returnProgress(row as { desk_status?: string; how_back?: string; outcome?: string }, collection, today) };
+    const order = row.pick_list_id ? byOrder.get(row.pick_list_id) : undefined;
+    return {
+      ...row,
+      collection,
+      order_number: order?.pick_list_number || null,
+      request_lines: order?.request_lines || [],
+      request_photos: order?.request_photos || [],
+      kind: returnKind(row as Parameters<typeof returnKind>[0]),
+      progress: returnProgress(row as { desk_status?: string; how_back?: string; outcome?: string }, collection, today),
+    };
   });
   res.json({ returns, reasons: RETURN_REASONS, steps: RETURN_STEPS });
 });
@@ -150,6 +186,16 @@ router.post('/:id/items/:itemId/photos', express.raw({ type: ['image/jpeg', 'ima
     [req.params.id, req.params.itemId, type, bytes, req.user?.email || null]
   );
   res.status(201).json({ id: saved.rows[0].id });
+});
+
+/** A photo attached to a return request (customer or desk photo), served here so the Returns screen needs no other route. */
+router.get('/request-photos/:photoId', async (req: AuthRequest, res: Response) => {
+  const found = await query(`SELECT content_type, image FROM return_request_images WHERE id = $1`, [req.params.photoId]);
+  const row = found.rows[0];
+  if (!row) return res.status(404).json({ error: 'Photo not found' });
+  res.setHeader('Content-Type', row.content_type);
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+  res.end(row.image);
 });
 
 router.get('/photos/:photoId', async (req: AuthRequest, res: Response) => {
