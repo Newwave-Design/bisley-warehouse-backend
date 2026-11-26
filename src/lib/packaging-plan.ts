@@ -17,6 +17,9 @@ export type PackKind = 'box' | 'tray' | 'sleeve';
 
 export interface PlanNeed { code: string; name: string; kind: PackKind; qty: number }
 
+/** A sleeve and its matching tray. Together they are one box, so they are bought and counted as one set. */
+export interface PlanPair { sleeve: { code: string; name: string }; tray: { code: string; name: string }; qty: number }
+
 export interface PlanOrderIn {
   id: string;
   number: string;
@@ -26,6 +29,8 @@ export interface PlanOrderIn {
   /** Every line still to pick has its product assigned. */
   inStock: boolean;
   needs: PlanNeed[];
+  /** Sleeve and tray pairs on this order. These are not repeated in `needs`. */
+  pairs?: PlanPair[];
   /** SKUs on this order with no packaging defined at all. */
   undefinedSkus: string[];
 }
@@ -57,10 +62,15 @@ export interface PlanOrderRef {
   via?: string;
 }
 
+export interface SetPart { code: string; on_hand: number; on_order: number; to_order: number }
+
 export interface PlanRow {
   code: string;
   name: string;
-  kind: PackKind;
+  /** 'set' is a sleeve and its tray counted as one box. */
+  kind: PackKind | 'set';
+  /** For a set: the sleeve and the tray that make it. Their to_order can differ when one of them is already on the shelf. */
+  parts?: { sleeve: SetPart; tray: SetPart };
   on_hand: number;
   on_order: number;
   on_order_due: string | null;
@@ -150,6 +160,7 @@ export function buildPackagingPlan(input: {
     else if (!orderDue.has(row.code)) orderDue.set(row.code, row.dueOn);
   }
   const onHandStart = new Map(hand);
+  const orderQtyStart = new Map(orderQty);
   const orders = [...input.orders].sort((a, b) => a.orderedAt - b.orderedAt || a.number.localeCompare(b.number, undefined, { numeric: true }));
 
   const rows = new Map<string, PlanRow>();
@@ -163,7 +174,7 @@ export function buildPackagingPlan(input: {
         name: known?.name || fallback.name || code,
         kind: known?.kind || fallback.kind,
         on_hand: onHandStart.get(code) ?? 0,
-        on_order: orderQty.get(code) || 0,
+        on_order: orderQtyStart.get(code) || 0,
         on_order_due: orderDue.get(code) ?? null,
         need_total: 0,
         need_by: input.horizons.map((h) => ({ label: h.label, date: h.date, need: 0, short: 0 })),
@@ -186,9 +197,77 @@ export function buildPackagingPlan(input: {
     return row;
   };
 
+  const setRowFor = (pair: PlanPair): PlanRow => {
+    const code = `${pair.sleeve.code} + ${pair.tray.code}`;
+    let row = rows.get(code);
+    if (!row) {
+      const sleeve = stockBy.get(pair.sleeve.code), tray = stockBy.get(pair.tray.code);
+      const part = (p: { code: string }): SetPart => ({ code: p.code, on_hand: onHandStart.get(p.code) ?? 0, on_order: orderQtyStart.get(p.code) || 0, to_order: 0 });
+      const cost = sleeve?.unitCost != null && tray?.unitCost != null ? sleeve.unitCost + tray.unitCost : null;
+      const dues = [orderDue.get(pair.sleeve.code), orderDue.get(pair.tray.code)].filter(Boolean) as string[];
+      row = {
+        code,
+        name: `${pair.sleeve.name || pair.sleeve.code} + ${pair.tray.name || pair.tray.code}`,
+        kind: 'set',
+        parts: { sleeve: part(pair.sleeve), tray: part(pair.tray) },
+        on_hand: Math.min(onHandStart.get(pair.sleeve.code) ?? 0, onHandStart.get(pair.tray.code) ?? 0),
+        on_order: Math.min(orderQtyStart.get(pair.sleeve.code) || 0, orderQtyStart.get(pair.tray.code) || 0),
+        on_order_due: dues.sort().pop() ?? null,
+        need_total: 0,
+        need_by: input.horizons.map((h) => ({ label: h.label, date: h.date, need: 0, short: 0 })),
+        to_order: 0,
+        blocked_orders: [],
+        unlocked_by_buying: [],
+        only_blocker: [],
+        flag: null,
+        late_on_order: false,
+        size: null,
+        size_updated: null,
+        unit_cost: cost,
+        line_cost: null,
+        merge_into: null,
+        run_down: false,
+        merged_from: [],
+      };
+      rows.set(code, row);
+    }
+    return row;
+  };
+
   const ordersOut: PlanOrderOut[] = [];
   for (const order of orders) {
     const missing: PlanOrderOut['missing'] = [];
+
+    /** A sleeve and tray are one box. A unit uses the sleeve and tray on the shelf, then what is on order. Anything still missing is bought as a set. */
+    const servePair = (pair: PlanPair) => {
+      const row = setRowFor(pair);
+      row.need_total += pair.qty;
+      for (const slot of row.need_by) if (order.due && order.due <= slot.date) slot.need += pair.qty;
+      let fromShelf = 0, fromOrder = 0, buying = 0;
+      for (let unit = 0; unit < pair.qty; unit += 1) {
+        const takeShelf = (code: string) => { if ((hand.get(code) ?? 0) > 0) { hand.set(code, (hand.get(code) ?? 0) - 1); return true; } return false; };
+        const takeOrder = (code: string) => { if ((orderQty.get(code) || 0) > 0) { orderQty.set(code, (orderQty.get(code) || 0) - 1); return true; } return false; };
+        const sleeveShelf = takeShelf(pair.sleeve.code), trayShelf = takeShelf(pair.tray.code);
+        if (sleeveShelf && trayShelf) { fromShelf += 1; continue; }
+        const sleeveOk = sleeveShelf || takeOrder(pair.sleeve.code);
+        const trayOk = trayShelf || takeOrder(pair.tray.code);
+        if (sleeveOk && trayOk) { fromOrder += 1; continue; }
+        buying += 1;
+        if (!sleeveOk) row.parts!.sleeve.to_order += 1;
+        if (!trayOk) row.parts!.tray.to_order += 1;
+      }
+      const short = fromOrder + buying;
+      if (short <= 0) return;
+      row.blocked_orders.push({ number: order.number, due: order.due, qty: short, covered: buying > 0 ? 'to_order' : 'on_order' });
+      if (fromOrder > 0 && row.on_order_due && order.due && row.on_order_due > order.due) row.late_on_order = true;
+      if (buying > 0) {
+        row.to_order += buying;
+        row.unlocked_by_buying.push(order.number);
+        missing.push({ code: row.code, name: row.name, qty: buying, status: 'to_order' });
+      } else {
+        missing.push({ code: row.code, name: row.name, qty: short, status: 'on_order' });
+      }
+    };
 
     /** Serves `qty` of a pack for this order. A merged pack uses its own stock first and passes the rest to its target. */
     const serve = (need: PlanNeed, qty: number, via?: string) => {
@@ -228,6 +307,7 @@ export function buildPackagingPlan(input: {
     };
 
     for (const need of order.needs) serve(need, need.qty);
+    for (const pair of order.pairs || []) servePair(pair);
     if (missing.length) {
       ordersOut.push({
         number: order.number,
@@ -248,8 +328,9 @@ export function buildPackagingPlan(input: {
 
   const christmas = input.horizons[0]?.date;
   for (const row of rows.values()) {
-    const onHandNow = onHandStart.get(row.code) ?? 0;
-    const supply = onHandNow + row.on_order;
+    const supply = row.parts
+      ? Math.min((row.parts.sleeve.on_hand + row.parts.sleeve.on_order), (row.parts.tray.on_hand + row.parts.tray.on_order))
+      : (onHandStart.get(row.code) ?? 0) + row.on_order;
     for (const slot of row.need_by) slot.short = Math.max(0, slot.need - supply);
     if (row.to_order > 0) {
       const earliest = row.blocked_orders.filter((ref) => ref.covered === 'to_order' && ref.due).map((ref) => ref.due as string).sort()[0];
@@ -312,6 +393,31 @@ function lacksPackaging(line: HoldupOrder['lines'][number], hasParts: boolean): 
   if (!pack) return true;
   if ((pack.items || []).length) return false;
   return !SOLVED_METHODS.has(String(pack.method || ''));
+}
+
+/**
+ * Splits out the lines that use a sleeve and a tray together. Each is one box, so it becomes a pair and its
+ * sleeve and tray rows are taken off the line so they are not counted twice. Other lines are returned as they were.
+ */
+export function pairSleeveTray(lines: HoldupOrder['lines']): { pairs: PlanPair[]; lines: HoldupOrder['lines'] } {
+  const pairs: PlanPair[] = [];
+  const rest = lines.map((line) => {
+    const rows = line.packaging?.items || [];
+    const sleeve = rows.find((row) => String(row.item_type || '').toLowerCase() === 'sleeve' && row.code);
+    const tray = rows.find((row) => String(row.item_type || '').toLowerCase() === 'tray' && row.code);
+    if (!sleeve || !tray || !line.packaging) return line;
+    const qty = Math.max(0, line.required - line.picked) > 0 ? (Number(sleeve.qty) || Math.max(0, line.required - line.picked)) : 0;
+    if (qty > 0) pairs.push({ sleeve: { code: String(sleeve.code), name: String(sleeve.name || sleeve.code) }, tray: { code: String(tray.code), name: String(tray.name || tray.code) }, qty });
+    return { ...line, packaging: { ...line.packaging, items: rows.filter((row) => !['sleeve', 'tray'].includes(String(row.item_type || '').toLowerCase())) } };
+  });
+  // Several lines can use the same pair on one order.
+  const merged = new Map<string, PlanPair>();
+  for (const pair of pairs) {
+    const key = `${pair.sleeve.code}|${pair.tray.code}`;
+    const have = merged.get(key);
+    if (have) have.qty += pair.qty; else merged.set(key, { ...pair });
+  }
+  return { pairs: [...merged.values()], lines: rest };
 }
 
 /** Outer size from SmartSuite when there is one (560L 540W 790H), else the internal size as L x W x H. */
@@ -378,6 +484,8 @@ export async function loadPackagingPlan(): Promise<PackagingPlan> {
     });
     const order = { id: list.id, status: list.status } as HoldupOrder;
     order.lines = lines.map((entry) => entry.line);
+    const split = pairSleeveTray(order.lines);
+    const needsOrder = { ...order, lines: split.lines } as HoldupOrder;
     const remaining = (line: HoldupOrder['lines'][number]) => Math.max(0, line.required - line.picked);
     return {
       id: list.id,
@@ -385,7 +493,8 @@ export async function loadPackagingPlan(): Promise<PackagingPlan> {
       orderedAt: new Date(list.created_at).getTime(),
       due: dues[list.id]?.latest || dues[list.id]?.earliest || null,
       inStock: order.lines.every((line) => line.assigned == null || remaining(line) === 0 || line.assigned >= remaining(line)),
-      needs: packNeeds(order),
+      needs: packNeeds(needsOrder),
+      pairs: split.pairs,
       undefinedSkus: [...new Set(lines.filter((entry) => remaining(entry.line) > 0 && lacksPackaging(entry.line, entry.hasParts)).map((entry) => entry.line.sku))],
     };
   });

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildPackagingPlan, defaultHorizons, sizeText, type PlanOrderIn } from './packaging-plan.ts'
+import { buildPackagingPlan, defaultHorizons, pairSleeveTray, sizeText, type PlanOrderIn } from './packaging-plan.ts'
 
 const horizons = defaultHorizons('2026-11-26')
 const stock = [
@@ -127,4 +127,65 @@ test('size text prefers the outer size and falls back to the internal size', () 
   assert.equal(sizeText({ box_size_formula: '560L 540W 790H, 1,100L&W' }), '560L 540W 790H')
   assert.equal(sizeText({ internal_length_mm: 420, internal_width_mm: 300, internal_height_mm: 335 }), '420 x 300 x 335 internal')
   assert.equal(sizeText({}), null)
+})
+
+const setStock = [
+  { code: 'SLV-12', name: 'SLV-12', kind: 'sleeve' as const, onHand: 1 },
+  { code: 'SLV-15', name: 'SLV-15', kind: 'sleeve' as const, onHand: 2 },
+  { code: 'TRA-6', name: 'TRA-6', kind: 'tray' as const, onHand: 1 },
+]
+const pair = (sleeve: string, tray: string, qty: number) => ({ sleeve: { code: sleeve, name: sleeve }, tray: { code: tray, name: tray }, qty })
+
+test('a sleeve and its tray are one set row, not two', () => {
+  const plan = buildPackagingPlan({ orders: [order(1, 1, '2026-12-01', [], { pairs: [pair('SLV-12', 'TRA-6', 3)] })], stock: setStock, onOrder: [], horizons })
+  assert.deepEqual(plan.rows.map((r) => r.code), ['SLV-12 + TRA-6'])
+  const row = plan.rows[0]
+  assert.equal(row.kind, 'set')
+  assert.equal(row.to_order, 2)
+  assert.equal(row.parts!.sleeve.to_order, 2)
+  assert.equal(row.parts!.tray.to_order, 2)
+})
+
+test('a set short of only its tray buys a tray, not a sleeve', () => {
+  const plan = buildPackagingPlan({
+    orders: [order(1, 1, '2026-12-01', [], { pairs: [pair('SLV-15', 'TRA-6', 2)] })],
+    stock: setStock, onOrder: [], horizons,
+  })
+  const row = plan.rows[0]
+  assert.equal(row.to_order, 1)
+  assert.equal(row.parts!.sleeve.to_order, 0)
+  assert.equal(row.parts!.tray.to_order, 1)
+})
+
+test('two sleeves sharing a tray take it oldest order first', () => {
+  const plan = buildPackagingPlan({
+    orders: [order(1, 1, '2026-12-01', [], { pairs: [pair('SLV-12', 'TRA-6', 1)] }), order(2, 2, '2026-12-02', [], { pairs: [pair('SLV-15', 'TRA-6', 1)] })],
+    stock: setStock, onOrder: [], horizons,
+  })
+  assert.equal(plan.rows.find((r) => r.code === 'SLV-12 + TRA-6')?.blocked_orders.length ?? 0, 0)
+  assert.deepEqual(plan.rows.find((r) => r.code === 'SLV-15 + TRA-6')!.unlocked_by_buying, ['#2'])
+  assert.deepEqual(plan.orders[0].missing.map((m) => m.code), ['SLV-15 + TRA-6'])
+})
+
+test('a set covered by what is on order is not bought again', () => {
+  const plan = buildPackagingPlan({
+    orders: [order(1, 1, '2026-12-01', [], { pairs: [pair('SLV-15', 'TRA-6', 2)] })],
+    stock: setStock, onOrder: [{ code: 'TRA-6', qty: 1, dueOn: '2026-12-10' }], horizons,
+  })
+  const row = plan.rows[0]
+  assert.equal(row.to_order, 0)
+  assert.equal(row.blocked_orders[0].covered, 'on_order')
+  assert.equal(row.late_on_order, true)
+})
+
+test('pairSleeveTray takes sleeve and tray off the line and merges repeats', () => {
+  const line = (sku: string, qty: number, items: { code: string; item_type: string; qty: number }[]) => ({ itemId: sku, sku, title: sku, required: qty, picked: 0, assigned: qty, packaging: { method: 'sleeve_tray', items } })
+  const { pairs, lines } = pairSleeveTray([
+    line('YETB1019-4S-aa31', 1, [{ code: 'VBD-1970', item_type: 'edge_guard', qty: 1 }, { code: 'SLV-12', item_type: 'sleeve', qty: 1 }, { code: 'TRA-6', item_type: 'tray', qty: 1 }]),
+    line('YECB1019-4S-bz2', 2, [{ code: 'SLV-12', item_type: 'sleeve', qty: 2 }, { code: 'TRA-6', item_type: 'tray', qty: 2 }]),
+    line('H123NL-bx6', 1, [{ code: 'BOX-3', item_type: 'box', qty: 1 }]),
+  ])
+  assert.deepEqual(pairs.map((p) => `${p.sleeve.code}+${p.tray.code}x${p.qty}`), ['SLV-12+TRA-6x3'])
+  assert.deepEqual(lines[0].packaging!.items!.map((i) => i.code), ['VBD-1970'])
+  assert.deepEqual(lines[2].packaging!.items!.map((i) => i.code), ['BOX-3'])
 })
