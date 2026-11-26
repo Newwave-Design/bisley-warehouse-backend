@@ -15,6 +15,7 @@ import { canScanIntoStock, codeMatchesItem, decisionChangesStock, decisionStockE
 import { buildClaimPack } from '../../lib/return-claim-pack.js';
 import { splitKitForReturn } from '../../lib/return-kits.js';
 import { stockArrived } from './stock-in.js';
+import { returnProgress, RETURN_STEPS, type ReturnCollection } from '../../lib/return-progress.js';
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -65,7 +66,25 @@ router.get('/', async (req: AuthRequest, res: Response) => {
      ORDER BY ra.created_at DESC
      LIMIT 200`
   );
-  res.json({ returns: rows.rows, reasons: RETURN_REASONS });
+  // The courier collection booked for each return, so the screen can say where it has got to.
+  const pickIds = [...new Set(rows.rows.map((row: { pick_list_id?: string }) => row.pick_list_id).filter(Boolean))];
+  const bookings = pickIds.length
+    ? await query(
+        `SELECT DISTINCT ON (pick_list_id) pick_list_id, courier, waybill, collection_date, service_name
+           FROM collection_bookings
+          WHERE pick_list_id = ANY($1::uuid[]) AND status <> 'cancelled' AND direction = 'return'
+          ORDER BY pick_list_id, created_at DESC`,
+        [pickIds]
+      )
+    : { rows: [] as (ReturnCollection & { pick_list_id: string })[] };
+  const byPick = new Map<string, ReturnCollection>();
+  for (const row of bookings.rows as (ReturnCollection & { pick_list_id: string })[]) byPick.set(row.pick_list_id, row);
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' }).format(new Date());
+  const returns = rows.rows.map((row: { pick_list_id?: string }) => {
+    const collection = row.pick_list_id ? byPick.get(row.pick_list_id) || null : null;
+    return { ...row, collection, progress: returnProgress(row as { desk_status?: string; how_back?: string; outcome?: string }, collection, today) };
+  });
+  res.json({ returns, reasons: RETURN_REASONS, steps: RETURN_STEPS });
 });
 
 router.post('/', async (req: AuthRequest, res: Response) => {

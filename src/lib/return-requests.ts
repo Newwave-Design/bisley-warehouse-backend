@@ -4,7 +4,7 @@
 import { query } from '../db/index.js';
 import { outcomeChange } from './return-booking-rules.js';
 import { openReturnReplacement, releaseReturnReplacement } from './return-replacement.js';
-import { mirrorRequestToDesk, unmirrorRequest } from './return-desk-mirror.js';
+import { mirrorRequestToDesk, unmirrorRequest, type ReturnDetail } from './return-desk-mirror.js';
 
 const RETURNABLE = ['DISPATCHED', 'PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED'];
 
@@ -71,7 +71,7 @@ async function skusOnList(pickListId: string): Promise<string[]> {
 }
 
 /** Mark the whole order, or the given items, as waiting for a return collection. A replacement is created for Plan picks and is not put on a pick list. */
-export async function requestReturns(pickListId: string, skus: string[] | null, actor: string, outcome: string) {
+export async function requestReturns(pickListId: string, skus: string[] | null, actor: string, outcome: string, detail?: ReturnDetail) {
   const choice = outcome === 'replace' ? 'replace' : outcome === 'refund' ? 'refund' : outcome === 'collect' ? 'collect' : '';
   if (!choice) throw new ReturnRequestError('Choose whether this return is a refund, a replacement, or a collection only.');
   const found = await query(`SELECT id, status FROM pick_lists WHERE id = $1`, [pickListId]);
@@ -125,7 +125,7 @@ export async function requestReturns(pickListId: string, skus: string[] | null, 
       [pickListId, sku, actor.slice(0, 255), choice]
     );
     // Show it on the Returns screen as well. A failure here must not stop the request.
-    await mirrorRequestToDesk(pickListId, sku).catch((error) => console.error('Return not copied to the Returns screen:', error instanceof Error ? error.message : error));
+    await mirrorRequestToDesk(pickListId, sku, detail).catch((error) => console.error('Return not copied to the Returns screen:', error instanceof Error ? error.message : error));
     if (change.createOrder) await openReturnReplacement(pickListId, sku);
     if (change.releaseOrder) await releaseReturnReplacement(pickListId, sku);
   }

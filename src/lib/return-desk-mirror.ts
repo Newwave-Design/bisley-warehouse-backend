@@ -35,27 +35,82 @@ export async function withRmaNumber<T>(run: (rma: string) => Promise<T>): Promis
   }
 }
 
+/** What the customer desk knows about a return: why, what was said, which enquiry, and who asked and approved. */
+export interface ReturnDetail {
+  reason?: string;
+  note?: string;
+  ref?: string;
+  requestedBy?: string;
+  approvedBy?: string;
+}
+
+const DESK_REASON_LABEL: Record<string, string> = {
+  damaged: 'Damaged',
+  faulty: 'Faulty',
+  wrong_item: 'Wrong item',
+  missing_part: 'Missing part',
+  change_of_mind: 'Change of mind',
+  lost: 'Courier problem',
+  late: 'Courier problem',
+};
+
+export function deskReasonLabel(reason?: string | null): string | null {
+  return DESK_REASON_LABEL[String(reason || '').trim().toLowerCase()] || null;
+}
+
+/** One line for the Notes field: the enquiry, what it says, and who asked and approved. */
+export function deskNote(detail?: ReturnDetail | null): string {
+  if (!detail) return '';
+  const said = [detail.ref, detail.note].map((part) => String(part || '').trim()).filter(Boolean).join(': ');
+  const who = [detail.requestedBy ? `asked by ${detail.requestedBy}` : '', detail.approvedBy ? `approved by ${detail.approvedBy}` : ''].filter(Boolean).join(', ');
+  return [said, who ? `[${who}]` : ''].filter(Boolean).join(' ').slice(0, 1000);
+}
+
+const PLACEHOLDER_NOTE = /^(Asked for on the customer desk|Brought over)/i;
+
 /** Put one requested SKU on the Returns screen. Returns false when there is nothing to do (no shop order, or already closed). */
-export async function mirrorRequestToDesk(pickListId: string, sku: string): Promise<boolean> {
+export async function mirrorRequestToDesk(pickListId: string, sku: string, detail?: ReturnDetail | null): Promise<boolean> {
   if (!pickListId || !sku) return false;
   const order = await query(`SELECT id, medusa_order_id, customer_name, customer_email FROM pick_lists WHERE id = $1`, [pickListId]);
   const pick = order.rows[0];
   if (!pick || !pick.medusa_order_id) return false;
   const key = mirrorKey(pickListId);
+  const outcomeRow = await query(`SELECT outcome FROM return_requests WHERE pick_list_id = $1 AND sku = $2 AND status <> 'cancelled' ORDER BY created_at DESC LIMIT 1`, [pickListId, sku]);
+  const outcome = outcomeRow.rows[0]?.outcome || null;
+  const reasonLabel = deskReasonLabel(detail?.reason);
+  const note = deskNote(detail);
   let found = await query(`SELECT id, desk_status FROM return_authorizations WHERE legacy_key = $1`, [key]);
   if (!found.rows[0]) {
     const created = await withRmaNumber((rma) => query(
       `INSERT INTO return_authorizations
          (rma_number, medusa_order_id, status, redeem_to_warehouse, return_reason, customer_name, customer_email,
-          notes, desk_status, how_back, hold_refund, pick_list_id, sold_stock_hold, legacy_key)
-       VALUES ($1,$2,'AUTHORIZED', false, 'Customer return', $3,$4,$5,'due_back','post', true,$6, true,$7)
+          notes, desk_status, how_back, hold_refund, pick_list_id, sold_stock_hold, legacy_key, outcome, desk_ref, desk_requested_by)
+       VALUES ($1,$2,'AUTHORIZED', false, $3, $4,$5,$6,'due_back','post', true,$7, true,$8,$9,$10,$11)
        ON CONFLICT (legacy_key) DO NOTHING
        RETURNING id, desk_status`,
-      [rma, pick.medusa_order_id, pick.customer_name, pick.customer_email, 'Asked for on the customer desk or the order', pickListId, key]
+      [rma, pick.medusa_order_id, reasonLabel || 'Customer return', pick.customer_name, pick.customer_email, note || 'Asked for on the customer desk or the order', pickListId, key, outcome, detail?.ref || null, detail?.requestedBy || null]
     ));
     found = created.rows[0] ? created : await query(`SELECT id, desk_status FROM return_authorizations WHERE legacy_key = $1`, [key]);
   }
   const ra = found.rows[0];
+  // A later request, or a request that was brought over earlier, fills in what the desk knows. A return that has arrived is left alone.
+  if (ra && ra.desk_status === 'due_back') {
+    await query(
+      `UPDATE return_authorizations
+          SET outcome = COALESCE($2, outcome),
+              desk_ref = COALESCE($3, desk_ref),
+              desk_requested_by = COALESCE($4, desk_requested_by),
+              return_reason = CASE WHEN $5::text IS NOT NULL AND COALESCE(return_reason, 'Customer return') = 'Customer return' THEN $5 ELSE return_reason END,
+              notes = CASE
+                WHEN $6::text = '' THEN notes
+                WHEN COALESCE(notes, '') = '' OR notes ~* '^(Asked for on the customer desk|Brought over)' THEN $6
+                WHEN position($6 in notes) > 0 THEN notes
+                ELSE left(notes || E'\\n' || $6, 1500) END,
+              updated_at = NOW()
+        WHERE id = $1`,
+      [ra.id, outcome, detail?.ref || null, detail?.requestedBy || null, reasonLabel, note]
+    );
+  }
   // A return that was already dealt with stays as it is. A new request after that is a new job, not a change to it.
   if (!ra || ra.desk_status === 'closed') return false;
   const line = await query(

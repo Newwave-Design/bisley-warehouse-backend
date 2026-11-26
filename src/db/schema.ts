@@ -400,6 +400,9 @@ ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS refund_shipping BOOLE
 ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS report_sent BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS sold_stock_hold BOOLEAN NOT NULL DEFAULT true;
 ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS legacy_key VARCHAR(160);
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS outcome VARCHAR(20);
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS desk_ref VARCHAR(60);
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS desk_requested_by VARCHAR(160);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_return_authorizations_legacy_key ON return_authorizations (legacy_key);
 ALTER TABLE return_items ADD COLUMN IF NOT EXISTS item_scanned BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE return_items ADD COLUMN IF NOT EXISTS bay_scanned VARCHAR(40);

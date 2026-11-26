@@ -1209,7 +1209,13 @@ router.get('/return-requests', authMiddleware, async (req: Request, res: Respons
 router.post('/:pickListId/return-requests', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const body = Array.isArray(req.body?.skus) ? req.body.skus.map((sku: unknown) => String(sku)) : null;
-    const requests = await requestReturns(req.params.pickListId, body, String(req.headers['x-actor'] || '').trim().slice(0, 120) || req.user?.email || '', String(req.body?.outcome || ''));
+    const requests = await requestReturns(req.params.pickListId, body, String(req.headers['x-actor'] || '').trim().slice(0, 120) || req.user?.email || '', String(req.body?.outcome || ''), {
+      reason: String(req.body?.reason || '').trim().slice(0, 40) || undefined,
+      note: String(req.body?.note || '').trim().slice(0, 800) || undefined,
+      ref: String(req.body?.ref || '').trim().slice(0, 60) || undefined,
+      requestedBy: String(req.body?.requested_by || '').trim().slice(0, 120) || undefined,
+      approvedBy: String(req.headers['x-actor'] || '').trim().slice(0, 120) || undefined,
+    });
     return res.status(201).json({ requests });
   } catch (error) {
     if (error instanceof ReturnRequestError) return res.status(error.status).json({ error: error.message });
