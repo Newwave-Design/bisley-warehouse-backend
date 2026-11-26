@@ -45,6 +45,8 @@ import mobileAppRoutes from './api/routes/mobile-app.js';
 import webhooksRoutes from './api/routes/webhooks.js';
 import reorderRulesRoutes, { pendingRouter as pendingReordersRouter } from './api/routes/reorder-rules.js';
 import supplierReordersRoutes from './api/routes/supplier-reorders.js';
+import purchaseOrdersRoutes from './api/routes/purchase-orders.js';
+import { ensurePurchaseOrders } from './db/ensure-purchase-orders.js';
 import reordersV2Routes from './api/routes/reorders-v2.js';
 import stockSoldRoutes from './api/routes/stock-sold.js';
 import stockSoldV2Routes from './api/routes/stock-sold-v2.js';
@@ -148,6 +150,7 @@ app.use('/api/mobile-app', mobileAppRoutes);
 app.use('/api/reorder-rules', reorderRulesRoutes);
 app.use('/api/pending-reorders', pendingReordersRouter);
 app.use('/api/supplier-reorders', supplierReordersRoutes);
+app.use('/api/purchase-orders', purchaseOrdersRoutes);
 app.use('/api/reorders-v2', reordersV2Routes);
 app.use('/api/stock-sold', stockSoldRoutes);
 app.use('/api/stock-sold-v2', stockSoldV2Routes);
@@ -237,6 +240,12 @@ async function start() {
       await ensurePickListEvents();
     } catch (eventError) {
       console.warn('⚠️  Pick list events bootstrap warning:', (eventError as Error).message);
+    }
+
+    try {
+      await ensurePurchaseOrders();
+    } catch (poError) {
+      console.warn('⚠️  Purchase orders bootstrap warning:', (poError as Error).message);
     }
 
     try {

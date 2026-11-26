@@ -23,6 +23,7 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'manage_error_log', label: 'Error Log', description: 'Bulk-resolve error log entries.' },
   { key: 'manage_operations', label: 'Delete Records', description: 'Delete pick lists and check-in sessions.' },
   { key: 'manage_crm', label: 'CRM & Queries', description: 'Manage customer queries, communications history, and complaint actions.' },
+  { key: 'approve_purchase_orders', label: 'Approve Purchase Orders', description: 'Approve purchase orders before they go to the supplier, or send them back. Anyone can create one.' },
   { key: 'manage_users', label: 'Users & Permissions', description: 'Invite/manage users, groups, and permissions.' },
 ];
 
