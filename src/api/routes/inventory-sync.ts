@@ -8,6 +8,8 @@ import express, { Request, Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 
+import { medusaKeyHeader } from '../../lib/shop-stock.js';
+
 const router = express.Router();
 
 const MEDUSA_URL = process.env.MEDUSA_API_BASE_URL || 'https://bisley-shop.medusajs.app';
@@ -19,7 +21,7 @@ const LOCATION_ID = process.env.MEDUSA_LOCATION_ID || 'sloc_01KY7PZB8JRYF31JPJ6E
 function getMedusaHeaders(): Record<string, string> {
   if (!MEDUSA_API_KEY) throw new Error('MEDUSA_SECRET_API_KEY env var is not set');
   return {
-    'Authorization': `Bearer ${MEDUSA_API_KEY}`,
+    'Authorization': medusaKeyHeader(MEDUSA_API_KEY),
     'Content-Type': 'application/json',
   };
 }

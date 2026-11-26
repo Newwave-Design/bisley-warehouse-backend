@@ -292,7 +292,7 @@ async function start() {
           const result = await runDiscrepancyCheck();
           console.log(`[scheduler] Discrepancy check: ${result.checked} SKUs, ${result.mismatches} mismatches (${result.newlyLogged} newly logged, ${result.autoResolved} auto-resolved)`);
           const synced = await reconcileAvailableStock();
-          console.log(`[scheduler] Free-stock sync: ${synced.checked} SKUs, ${synced.updated} updated, ${synced.floored} negative counts stored as 0, ${synced.missing} with no Medusa item`);
+          console.log(`[scheduler] Free-stock sync: ${synced.checked} SKUs, ${synced.updated} updated, ${synced.floored} negative counts stored as 0, ${synced.missing} with no Medusa item, ${synced.failed} failed`);
           if (result.newlyLogged > 0) {
             await createNotificationOnce('INVENTORY_DISCREPANCY',
               `${result.newlyLogged} new inventory discrepanc${result.newlyLogged === 1 ? 'y' : 'ies'} found`,
