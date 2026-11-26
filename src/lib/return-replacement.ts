@@ -6,6 +6,58 @@
 import { query } from '../db/index.js';
 import { rootMedusaOrderId } from './order-values.js';
 import { scheduleStockHolds } from './stock-holds.js';
+import { assignStockedToOlderOrders } from './assign-arrived-stock.js';
+import { pushAvailableStock } from './medusa-inventory.js';
+import { adjustReserved } from './reserved-stock.js';
+
+/**
+ * A replacement is owed to a customer, so its stock is given to it at once (as the oldest order it belongs to) and the shop
+ * stops selling that unit straight away. It has no shop order of its own, so Medusa holds no reservation for it: without this the
+ * shop could sell the unit until the next scheduled run. Best effort, in the background; a failure here never stops the replacement.
+ */
+function holdStockForReplacements(skus: string[]): void {
+  const list = [...new Set(skus.map((sku) => sku.trim()).filter(Boolean))];
+  if (!list.length) return;
+  void (async () => {
+    await assignStockedToOlderOrders(list);
+    await pushAvailableStock(list);
+  })().catch((error) => console.warn('Replacement stock was not held at once:', error instanceof Error ? error.message : error));
+}
+
+/**
+ * Reserved stock can never be more than the units open orders still need. When a replacement is dropped, the unit it
+ * was holding is given back: whatever is reserved above what open orders need (kit parts included) is released.
+ * Unpaid lines count as need, so this only ever releases, never takes a unit from a real order.
+ */
+export async function trimReservedToDemand(skus: string[]): Promise<number> {
+  let released = 0;
+  for (const sku of [...new Set(skus.map((value) => value.trim()).filter(Boolean))]) {
+    const need = await query(
+      `SELECT (
+          COALESCE((SELECT SUM(pli.quantity_required) FROM pick_list_items pli JOIN pick_lists pl ON pl.id = pli.pick_list_id
+                     WHERE pli.product_sku = $1 AND NOT COALESCE(pli.is_archived, false) AND NOT COALESCE(pli.is_sandbox, false)
+                       AND NOT pl.is_archived AND NOT pl.is_sandbox AND pl.status NOT IN ('DISPATCHED', 'CANCELLED')), 0)
+          +
+          COALESCE((SELECT SUM(pli.quantity_required * COALESCE((comp->>'required_quantity')::numeric, 1))
+                      FROM pick_list_items pli
+                      JOIN pick_lists pl ON pl.id = pli.pick_list_id
+                      JOIN wms_products wp ON wp.variant_sku = pli.product_sku AND COALESCE(wp.is_kit, false)
+                      CROSS JOIN LATERAL jsonb_array_elements(wp.kit_components) comp
+                     WHERE comp->>'sku' = $1 AND comp->>'sku' <> pli.product_sku
+                       AND NOT COALESCE(pli.is_archived, false) AND NOT COALESCE(pli.is_sandbox, false)
+                       AND NOT pl.is_archived AND NOT pl.is_sandbox AND pl.status NOT IN ('DISPATCHED', 'CANCELLED')), 0)
+        )::int AS need,
+        COALESCE((SELECT SUM(quantity_reserved) FROM warehouse_inventory WHERE product_sku = $1), 0)::int AS reserved`,
+      [sku]
+    );
+    const extra = Number(need.rows[0].reserved) - Number(need.rows[0].need);
+    if (extra > 0) {
+      await adjustReserved({ query }, sku, -extra);
+      released += extra;
+    }
+  }
+  return released;
+}
 
 export interface OpenedReplacement {
   id: string;
@@ -161,6 +213,7 @@ export async function openReturnReplacement(sourcePickListId: string, sku: strin
   );
 
   scheduleStockHolds();
+  holdStockForReplacements(await unpickedSkus(productSku));
   return { id: pickListId!, pick_list_number: pickListNumber! };
 }
 
@@ -218,4 +271,7 @@ export async function releaseReturnReplacement(sourcePickListId: string, sku: st
     }
   }
   scheduleStockHolds();
+  // The units a dropped replacement was holding go back to the shop.
+  await trimReservedToDemand(skus).catch((error) => console.warn('Reserved stock was not released:', error instanceof Error ? error.message : error));
+  holdStockForReplacements(skus);
 }

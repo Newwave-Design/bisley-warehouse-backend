@@ -108,7 +108,7 @@ const OPEN_LINES = `
    WHERE NOT pl.is_sandbox AND NOT COALESCE(pli.is_sandbox, false)
      AND NOT pli.is_archived AND NOT pl.is_archived
      AND pl.status NOT IN ('DISPATCHED', 'CANCELLED')
-     AND (pl.payment_status IN ('captured', 'partially_refunded') OR COALESCE(pl.purchase_order_number, '') <> '')
+     AND (pl.payment_status IN ('captured', 'partially_refunded') OR COALESCE(pl.purchase_order_number, '') <> '' OR COALESCE(pl.is_return, false))
      AND pli.quantity_required > 0
      AND NOT pli.is_custom
      AND pli.product_sku NOT ILIKE '%SAMPLE%'`
