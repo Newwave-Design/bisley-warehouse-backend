@@ -18,10 +18,18 @@ export function shippingTypeForLines(lines: { sku?: string; title?: string; item
   return [...new Set(lines.map((line) => shippingOption(line.sku || '')).filter(Boolean))].join(' · ');
 }
 
+/**
+ * Essentials products are stored with a slash before the shelf count (YECB0819/4S) but sold with a hyphen
+ * (YECB0819-4S-bn6). This returns the slash form so a sold SKU can match its product code.
+ */
+export function slashShelfCount(sku: string): string {
+  return sku.toUpperCase().replace(/-(\dS)(?=-|$)/, '/$1');
+}
+
 export function shippingOption(sku: string, productCode = ''): string | null {
   const upper = sku.toUpperCase();
   if (isMultiDesk(upper) || isMultiDesk(productCode)) return 'DX';
-  const normalised = upper.replace(/-(\dS)(?=-|$)/, '/$1');
+  const normalised = slashShelfCount(upper);
   if (SHIPPING_OPTION[normalised]) return SHIPPING_OPTION[normalised];
   if (productCode && SHIPPING_OPTION[productCode]) return SHIPPING_OPTION[productCode];
   const code = Object.keys(SHIPPING_OPTION).sort((a, b) => b.length - a.length)
@@ -180,7 +188,8 @@ export async function attachPackaging<T extends { sku: string; quantity_required
   const matchCode = (sku: string) => {
     const upper = sku.toUpperCase();
     if (specByCode.has(upper) || bomBySku.has(upper)) return upper;
-    return codes.find(code => upper.startsWith(`${code}-`)) || '';
+    const slashed = slashShelfCount(upper);
+    return codes.find(code => upper.startsWith(`${code}-`) || slashed.startsWith(`${code}-`)) || '';
   };
 
   return groups.map(items => {
@@ -191,7 +200,8 @@ export async function attachPackaging<T extends { sku: string; quantity_required
     const code = bom ? '' : matchCode(item.sku);
     const productBom = code ? bomByProduct.get(code) : undefined;
     const chosen = bom || productBom;
-    const productCode = codes.find(entry => exact === entry || exact.startsWith(`${entry}-`)) || '';
+    const slashedExact = slashShelfCount(exact);
+    const productCode = codes.find(entry => exact === entry || exact.startsWith(`${entry}-`) || slashedExact === entry || slashedExact.startsWith(`${entry}-`)) || '';
     const spec = productCode ? specByCode.get(productCode) : specByCode.get(exact);
     const method = chosen?.method || spec?.method || '';
     const option = shippingOption(item.sku, productCode || exact);
