@@ -150,6 +150,36 @@ export async function unmirrorRequest(pickListId: string, sku: string): Promise<
   }
 }
 
+/**
+ * A damage complaint on the customer desk puts a case on the Returns screen's Damage view before any return or refund exists,
+ * so the damage is on record, with its photos, while the desk works out what to do. One case per desk enquiry, keyed on the enquiry id,
+ * so sending it twice only returns the case that is already there. It starts at To decide.
+ */
+export async function createDamageComplaint(pickListId: string, complaint: { caseId: string; reason?: string; note?: string; ref?: string; requestedBy?: string }): Promise<{ rma: string; created: boolean } | null> {
+  const caseId = String(complaint.caseId || '').trim().slice(0, 60);
+  if (!pickListId || !caseId) return null;
+  const order = await query(`SELECT id, medusa_order_id, customer_name, customer_email FROM pick_lists WHERE id = $1`, [pickListId]);
+  const pick = order.rows[0];
+  if (!pick || !pick.medusa_order_id) return null;
+  const key = `desk-case:${caseId}`;
+  const existing = await query(`SELECT rma_number FROM return_authorizations WHERE legacy_key = $1`, [key]);
+  if (existing.rows[0]) return { rma: existing.rows[0].rma_number, created: false };
+  const label = deskReasonLabel(complaint.reason) || 'Damaged';
+  const note = deskNote({ ref: complaint.ref, note: complaint.note, requestedBy: complaint.requestedBy }) || 'Damage reported on the customer desk';
+  const created = await withRmaNumber((rma) => query(
+    `INSERT INTO return_authorizations
+       (rma_number, medusa_order_id, status, redeem_to_warehouse, return_reason, customer_name, customer_email,
+        notes, desk_status, how_back, hold_refund, pick_list_id, sold_stock_hold, legacy_key, desk_ref, desk_requested_by)
+     VALUES ($1,$2,'AUTHORIZED', false, $3,$4,$5,$6,'to_decide','kept', false,$7, false,$8,$9,$10)
+     ON CONFLICT (legacy_key) DO NOTHING
+     RETURNING rma_number`,
+    [rma, pick.medusa_order_id, label, pick.customer_name, pick.customer_email, note, pickListId, key, complaint.ref || null, complaint.requestedBy || null]
+  ));
+  if (created.rows[0]) return { rma: created.rows[0].rma_number, created: true };
+  const again = await query(`SELECT rma_number FROM return_authorizations WHERE legacy_key = $1`, [key]);
+  return again.rows[0] ? { rma: again.rows[0].rma_number, created: false } : null;
+}
+
 const DAMAGE_REASONS: Record<string, string> = {
   damaged: 'Damaged',
   faulty: 'Faulty',

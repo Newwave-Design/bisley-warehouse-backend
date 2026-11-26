@@ -33,6 +33,7 @@ import { expandKitPicksByList } from '../../lib/pick-list-kits.js';
 import { confirmPartFulfilment, inspectPartFulfilment, PartFulfilError } from '../../lib/part-fulfilment.js';
 import { openPartsSend, PartsSendError } from '../../lib/parts-send.js';
 import { stockReservations, takeReservedItem } from '../../lib/stock-reservations.js';
+import { createDamageComplaint } from '../../lib/return-desk-mirror.js';
 import { addDeskPhoto, addReturnRequestImage, cancelReturnRequests, deleteReturnRequestImage, listReturnRequests, requestReturns, returnRequestImage, ReturnRequestError } from '../../lib/return-requests.js';
 import { isWorkingIsoDay } from '../../lib/working-days.js';
 import { loadHoldups } from '../../lib/order-holdup.js';
@@ -1273,6 +1274,24 @@ router.post(
     }
   },
 );
+
+/** POST /api/pick-lists/:pickListId/damage-cases — put a damage complaint from the customer desk on the Returns screen's Damage view. */
+router.post('/:pickListId/damage-cases', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const made = await createDamageComplaint(req.params.pickListId, {
+      caseId: String(req.body?.case_id || ''),
+      reason: String(req.body?.reason || '').trim().slice(0, 40) || undefined,
+      note: String(req.body?.note || '').trim().slice(0, 800) || undefined,
+      ref: String(req.body?.ref || '').trim().slice(0, 60) || undefined,
+      requestedBy: String(req.body?.requested_by || '').trim().slice(0, 120) || undefined,
+    });
+    if (!made) return res.status(404).json({ error: 'Order not found, or case_id missing.' });
+    return res.status(made.created ? 201 : 200).json(made);
+  } catch (error) {
+    console.error('Creating a damage case failed', error instanceof Error ? error.message : error);
+    return res.status(500).json({ error: 'Could not add that damage case.' });
+  }
+});
 
 /** POST /api/pick-lists/:pickListId/return-photos — a photo from the customer desk for this order's return or damage case. Header X-Photo-Key is the desk's picture id. */
 router.post(
