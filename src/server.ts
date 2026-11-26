@@ -72,6 +72,7 @@ import { createNotificationOnce } from './lib/notifications.js';
 import { reconcileOrders, syncOpenOrders } from './api/routes/webhooks.js';
 import { refreshUnpaidPickLists } from './lib/payment-status.js';
 import { scheduleAllocationRun } from './lib/allocation.js';
+import { smartSuiteConfigured, syncPackagingFromSmartSuite } from './lib/smartsuite-sync.js';
 import { reconcileAvailableStock } from './lib/medusa-inventory.js';
 import { runDiscrepancyCheck } from './lib/discrepancy-check.js';
 import { query as dbQueryUtil } from './db/index.js';
@@ -312,6 +313,18 @@ async function start() {
         } catch (err) { console.warn('[scheduler] Discrepancy check error:', err); }
       }, THIRTY_MIN);
       console.log('✓ Inventory discrepancy check scheduled (every 30 min)');
+    }
+
+    // Packaging catalogue from SmartSuite every 3 hours, only when SMARTSUITE_API_KEY is set. Hand-edited BOMs are left alone.
+    if (liveJobs && smartSuiteConfigured()) {
+      const THREE_HOURS = 3 * 60 * 60 * 1000;
+      const runSmartSuiteSync = async () => {
+        const result = await syncPackagingFromSmartSuite({ dryRun: false });
+        if (result.ok) console.log(`[scheduler] SmartSuite packaging sync: ${JSON.stringify(result.imported)}`);
+        else console.warn(`[scheduler] SmartSuite packaging sync failed: ${result.error}`);
+      };
+      setInterval(() => { void runSmartSuiteSync(); }, THREE_HOURS);
+      console.log('✓ SmartSuite packaging sync scheduled (every 3h)');
     }
 
     // Safety net for custom parts: a new custom order, a late payment or a stock change is picked up within 15 minutes

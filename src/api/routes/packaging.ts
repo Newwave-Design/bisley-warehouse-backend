@@ -9,6 +9,7 @@ import { query } from '../../db/index.js';
 import { authMiddleware, requirePermission } from '../../middleware/auth.js';
 import { toUuidOrNull } from './mobile.js';
 import { importPackagingSnapshot } from '../../lib/packaging-import.js';
+import { lastSmartSuiteSync, smartSuiteConfigured, syncPackagingFromSmartSuite } from '../../lib/smartsuite-sync.js';
 import { getDeliveryDues } from '../../lib/delivery-due.js';
 import { loadPackagingReorder } from '../../lib/packaging-reorder.js';
 import { scheduleStockHolds } from '../../lib/stock-holds.js';
@@ -1001,6 +1002,18 @@ router.post('/import-snapshot', requirePermission('manage_settings'), async (req
   } catch (err: any) {
     res.status(500).json({ error: 'Import failed', details: err.message });
   }
+});
+
+/** Pull SmartSuite now. Dry run unless dryRun=false. GET shows the last run, including the timed ones. */
+router.post('/sync-smartsuite', requirePermission('manage_settings'), async (req: Request, res: Response) => {
+  if (!smartSuiteConfigured()) return res.status(400).json({ error: 'SMARTSUITE_API_KEY is not set on this server' });
+  const dryRun = String(req.query.dryRun ?? req.body?.dryRun ?? 'true') !== 'false';
+  const result = await syncPackagingFromSmartSuite({ dryRun });
+  res.status(result.ok ? 200 : 502).json(result);
+});
+
+router.get('/sync-smartsuite', requirePermission('manage_settings'), (_req: Request, res: Response) => {
+  res.json({ configured: smartSuiteConfigured(), last: lastSmartSuiteSync() });
 });
 
 router.post('/seed-shipping-rates', requirePermission('manage_settings'), async (_req: Request, res: Response) => {

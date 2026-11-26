@@ -128,6 +128,20 @@ async function link(from_kind: string, from_key: string, to_kind: string, to_key
   );
 }
 
+/** Cartons to build for a product, preferred first. Box beats sleeve and tray when both exist. */
+export function bomOptions(hasBox: boolean, hasSleeveSet: boolean): { kind: 'box' | 'sleeve_tray'; rank: number; label: string }[] {
+  const out: { kind: 'box' | 'sleeve_tray'; rank: number; label: string }[] = [];
+  if (hasBox) out.push({ kind: 'box', rank: 1, label: 'Preferred' });
+  if (hasSleeveSet) out.push({ kind: 'sleeve_tray', rank: hasBox ? 2 : 1, label: hasBox ? 'Alternative' : 'Preferred' });
+  return out;
+}
+
+/** BOMs the SmartSuite import created. Anything else was made or taken over by hand and is not rewritten. */
+export function isSyncOwned(source: string | null | undefined): boolean {
+  return source === 'smartsuite_snapshot' || source === 'smartsuite';
+}
+
+
 function defaultDir() {
   return process.env.PACKAGING_SNAPSHOT_DIR
     || join(process.cwd(), 'data', 'packaging-snapshot-2026-10-22');
@@ -356,57 +370,66 @@ export async function importPackagingSnapshot(opts: { dryRun?: boolean; sourceDi
     const box = boxSs ? itemBySs.get(boxSs) : null;
     const setRec = sleeveSs ? sets.find((s: any) => s.id === sleeveSs) : null;
 
-    const existingBom = await query(
-      `SELECT id FROM packaging_boms WHERE product_code = $1 AND sku IS NULL AND option_rank = 1`,
-      [r.title]
-    );
-    let bomId = existingBom.rows[0]?.id as string | undefined;
-    if (!bomId && (box || setRec)) {
-      bomId = uuid();
-      await query(
-        `INSERT INTO packaging_boms (id, product_code, method, option_rank, label, source)
-         VALUES ($1,$2,$3,1,'Preferred','smartsuite_snapshot')`,
-        [bomId, r.title, box ? 'box' : 'sleeve_tray']
+    // Box first. A product with both a box and a sleeve set keeps the box as its preferred carton and the sleeve set as the alternative.
+    const options = bomOptions(!!box, !!setRec);
+    for (const option of options) {
+      const found = await query(
+        `SELECT id, source FROM packaging_boms WHERE product_code = $1 AND sku IS NULL AND option_rank = $2 AND is_active`,
+        [r.title, option.rank]
       );
-    }
-    if (bomId && box) {
-      await query(`DELETE FROM packaging_bom_lines WHERE bom_id = $1`, [bomId]);
-      await query(
-        `INSERT INTO packaging_bom_lines (id, bom_id, packaging_item_id, qty, qty_confirmed) VALUES ($1,$2,$3,1,true)`,
-        [uuid(), bomId, box.id]
-      );
-      const boxRec = boxes.find((b: any) => b.id === boxSs);
-      const edgeSs = boxRec?.sms4gavn?.[0];
-      const edge = edgeSs ? itemBySs.get(edgeSs) : null;
-      if (edge) {
-        await query(
-          `INSERT INTO packaging_bom_lines (id, bom_id, packaging_item_id, qty, qty_confirmed, notes)
-           VALUES ($1,$2,$3,1,false,'Qty not in SmartSuite — confirm')`,
-          [uuid(), bomId, edge.id]
-        );
+      let bomId = found.rows[0]?.id as string | undefined;
+      if (bomId && !isSyncOwned(found.rows[0]?.source)) {
+        // Edited by hand in the WMS. The sync leaves it alone.
+        bump('boms', 'skipped');
+        continue;
       }
-      await link('product', r.title, 'item', box.code, 'uses_box');
-    }
-    if (bomId && setRec) {
+      if (!bomId) {
+        bomId = uuid();
+        await query(
+          `INSERT INTO packaging_boms (id, product_code, method, option_rank, label, source)
+           VALUES ($1,$2,$3,$4,$5,'smartsuite_snapshot')`,
+          [bomId, r.title, option.kind, option.rank, option.label]
+        );
+      } else {
+        await query(`UPDATE packaging_boms SET method = $2, label = $3, updated_at = NOW() WHERE id = $1`, [bomId, option.kind, option.label]);
+      }
       await query(`DELETE FROM packaging_bom_lines WHERE bom_id = $1`, [bomId]);
-      const tray = setRec.s239sv1s?.[0] ? itemBySs.get(setRec.s239sv1s[0]) : null;
-      const sleeve = setRec.sdltj60e?.[0] ? itemBySs.get(setRec.sdltj60e[0]) : null;
-      const edge = setRec.s0dm08rw?.[0] ? itemBySs.get(setRec.s0dm08rw[0]) : null;
-      for (const part of [tray, sleeve]) {
-        if (!part) continue;
+      if (option.kind === 'box' && box) {
         await query(
           `INSERT INTO packaging_bom_lines (id, bom_id, packaging_item_id, qty, qty_confirmed) VALUES ($1,$2,$3,1,true)`,
-          [uuid(), bomId, part.id]
+          [uuid(), bomId, box.id]
         );
+        const boxRec = boxes.find((b: any) => b.id === boxSs);
+        const edgeSs = boxRec?.sms4gavn?.[0];
+        const edge = edgeSs ? itemBySs.get(edgeSs) : null;
+        if (edge) {
+          await query(
+            `INSERT INTO packaging_bom_lines (id, bom_id, packaging_item_id, qty, qty_confirmed, notes)
+             VALUES ($1,$2,$3,1,false,'Qty not in SmartSuite — confirm')`,
+            [uuid(), bomId, edge.id]
+          );
+        }
+        await link('product', r.title, 'item', box.code, 'uses_box');
+      } else if (option.kind === 'sleeve_tray' && setRec) {
+        const tray = setRec.s239sv1s?.[0] ? itemBySs.get(setRec.s239sv1s[0]) : null;
+        const sleeve = setRec.sdltj60e?.[0] ? itemBySs.get(setRec.sdltj60e[0]) : null;
+        const edge = setRec.s0dm08rw?.[0] ? itemBySs.get(setRec.s0dm08rw[0]) : null;
+        for (const part of [tray, sleeve]) {
+          if (!part) continue;
+          await query(
+            `INSERT INTO packaging_bom_lines (id, bom_id, packaging_item_id, qty, qty_confirmed) VALUES ($1,$2,$3,1,true)`,
+            [uuid(), bomId, part.id]
+          );
+        }
+        if (edge) {
+          await query(
+            `INSERT INTO packaging_bom_lines (id, bom_id, packaging_item_id, qty, qty_confirmed, notes)
+             VALUES ($1,$2,$3,1,false,'Qty not in SmartSuite — confirm')`,
+            [uuid(), bomId, edge.id]
+          );
+        }
+        await link('product', r.title, 'sleeve_set', setRec.title, 'uses_sleeve_set');
       }
-      if (edge) {
-        await query(
-          `INSERT INTO packaging_bom_lines (id, bom_id, packaging_item_id, qty, qty_confirmed, notes)
-           VALUES ($1,$2,$3,1,false,'Qty not in SmartSuite — confirm')`,
-          [uuid(), bomId, edge.id]
-        );
-      }
-      await link('product', r.title, 'sleeve_set', setRec.title, 'uses_sleeve_set');
     }
     bump('products', 'upserted');
   }
