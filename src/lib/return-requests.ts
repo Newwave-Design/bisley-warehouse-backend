@@ -5,6 +5,7 @@ import { query } from '../db/index.js';
 import { outcomeChange } from './return-booking-rules.js';
 import { openReturnReplacement, releaseReturnReplacement } from './return-replacement.js';
 import { mirrorRequestToDesk, unmirrorRequest, type ReturnDetail } from './return-desk-mirror.js';
+import { isPhotoKind } from './return-fault.js';
 
 const RETURNABLE = ['DISPATCHED', 'PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED'];
 
@@ -232,7 +233,14 @@ export async function addReturnRequestImage(pickListId: string, sku: string, byt
  * A photo from the customer desk goes onto the order's open return or damage case, whichever the order has.
  * It carries the desk's picture id, so sending it twice attaches it once. An order with no return or damage case has nowhere to put it.
  */
-export async function addDeskPhoto(pickListId: string, bytes: Buffer, contentType: string, sourceKey: string, actor: string): Promise<{ attached: boolean; rma: string }> {
+export async function addDeskPhoto(
+  pickListId: string,
+  bytes: Buffer,
+  contentType: string,
+  sourceKey: string,
+  actor: string,
+  extra: { caseId?: string; kind?: string; sku?: string; caption?: string } = {}
+): Promise<{ attached: boolean; rma: string }> {
   const type = contentType.toLowerCase().split(';')[0].trim();
   if (!PHOTO_TYPES.has(type) || !looksLikeImage(bytes, type)) throw new ReturnRequestError('Use a JPEG, PNG, WebP or GIF photo.');
   if (bytes.length > 8 * 1024 * 1024) throw new ReturnRequestError('That photo must be under 8 MB.');
@@ -241,19 +249,19 @@ export async function addDeskPhoto(pickListId: string, bytes: Buffer, contentTyp
   const found = await query(
     `SELECT id, rma_number FROM return_authorizations
       WHERE pick_list_id = $1
-      ORDER BY (COALESCE(desk_status, 'due_back') <> 'closed') DESC, created_at DESC LIMIT 1`,
-    [pickListId]
+      ORDER BY (desk_case_id IS NOT NULL AND desk_case_id = $2) DESC, (COALESCE(desk_status, 'due_back') <> 'closed') DESC, created_at DESC LIMIT 1`,
+    [pickListId, String(extra.caseId || '').trim().slice(0, 60)]
   );
   const ra = found.rows[0];
   if (!ra) throw new ReturnRequestError('This order has no return or damage case to attach a photo to.', 404);
   const count = await query(`SELECT COUNT(*)::int AS n FROM return_desk_photos WHERE return_authorization_id = $1`, [ra.id]);
   if (Number(count.rows[0]?.n) >= 12) throw new ReturnRequestError('This case already has 12 photos.');
   const saved = await query(
-    `INSERT INTO return_desk_photos (return_authorization_id, content_type, image, created_by, source_key)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO return_desk_photos (return_authorization_id, content_type, image, created_by, source_key, photo_kind, sku, caption)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (return_authorization_id, source_key) WHERE source_key IS NOT NULL DO NOTHING
      RETURNING id`,
-    [ra.id, type, bytes, actor.slice(0, 255), key]
+    [ra.id, type, bytes, actor.slice(0, 255), key, isPhotoKind(extra.kind) ? extra.kind : 'item', String(extra.sku || '').trim().slice(0, 120) || null, String(extra.caption || '').trim().slice(0, 200) || null]
   );
   return { attached: !!saved.rows[0], rma: ra.rma_number };
 }

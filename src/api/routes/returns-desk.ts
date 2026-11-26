@@ -17,6 +17,7 @@ import { splitKitForReturn } from '../../lib/return-kits.js';
 import { stockArrived } from './stock-in.js';
 import { returnProgress, RETURN_STEPS, type ReturnCollection } from '../../lib/return-progress.js';
 import { returnKind } from '../../lib/return-kind.js';
+import { canRaiseClaim, evidenceChecklist, isClaimKind, isClaimStatus, isFault, isPhotoKind, suggestFault, FAULTS, PHOTO_KINDS, CLAIM_STATUSES } from '../../lib/return-fault.js';
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -52,14 +53,18 @@ router.get('/', async (req: AuthRequest, res: Response) => {
   const where = tab === 'closed'
     ? `ra.desk_status = 'closed'`
     : tab === 'claims'
-      ? `ra.desk_status = 'claim'`
+      ? `(ra.desk_status = 'claim' OR EXISTS (SELECT 1 FROM return_claims c WHERE c.return_authorization_id = ra.id AND COALESCE(c.status, 'open') NOT IN ('paid', 'rejected', 'withdrawn')))`
       : `COALESCE(ra.desk_status, 'due_back') <> 'closed'`;
   const rows = await query(
     `SELECT ra.*, COALESCE(json_agg(ri.*) FILTER (WHERE ri.id IS NOT NULL), '[]') AS items,
             COALESCE((
-              SELECT json_agg(json_build_object('id', p.id, 'item_id', p.return_item_id) ORDER BY p.created_at)
+              SELECT json_agg(json_build_object('id', p.id, 'item_id', p.return_item_id, 'kind', COALESCE(p.photo_kind, 'item'), 'sku', p.sku, 'caption', p.caption) ORDER BY p.created_at)
                 FROM return_desk_photos p WHERE p.return_authorization_id = ra.id
-            ), '[]') AS photos
+            ), '[]') AS photos,
+            COALESCE((
+              SELECT json_agg(json_build_object('id', c.id, 'kind', c.kind, 'status', COALESCE(c.status, 'open'), 'note', c.note, 'override_note', c.override_note, 'created_by', c.created_by, 'created_at', c.created_at, 'report_name', c.report_name) ORDER BY c.created_at)
+                FROM return_claims c WHERE c.return_authorization_id = ra.id
+            ), '[]') AS claims
      FROM return_authorizations ra
      LEFT JOIN return_items ri ON ri.return_authorization_id = ra.id
      WHERE ${where}
@@ -110,17 +115,22 @@ router.get('/', async (req: AuthRequest, res: Response) => {
   const returns = rows.rows.map((row: { pick_list_id?: string }) => {
     const collection = row.pick_list_id ? byPick.get(row.pick_list_id) || null : null;
     const order = row.pick_list_id ? byOrder.get(row.pick_list_id) : undefined;
+    const full = row as Record<string, any>;
+    const requestPhotos = (order?.request_photos as unknown[]) || [];
+    const photoKinds = [...((full.photos || []) as { kind?: string }[]).map((photo) => photo.kind || 'item'), ...requestPhotos.map(() => 'item')];
     return {
       ...row,
       collection,
       order_number: order?.pick_list_number || null,
       request_lines: order?.request_lines || [],
-      request_photos: order?.request_photos || [],
+      request_photos: requestPhotos,
+      fault_hint: full.fault ? null : suggestFault({ reason: full.return_reason, courier_problem: full.courier_problem, notes: full.notes }),
+      evidence: evidenceChecklist({ photoKinds, reportedAt: full.damage_reported_at, tracking: full.tracking_number || collection?.waybill, fault: full.fault }),
       kind: returnKind(row as Parameters<typeof returnKind>[0]),
       progress: returnProgress(row as { desk_status?: string; how_back?: string; outcome?: string }, collection, today),
     };
   });
-  res.json({ returns, reasons: RETURN_REASONS, steps: RETURN_STEPS });
+  res.json({ returns, reasons: RETURN_REASONS, steps: RETURN_STEPS, faults: FAULTS, photo_kinds: PHOTO_KINDS, claim_statuses: CLAIM_STATUSES });
 });
 
 router.post('/', async (req: AuthRequest, res: Response) => {
@@ -485,6 +495,88 @@ router.post('/:id/refund', async (req: AuthRequest, res: Response) => {
     if (error instanceof RefundError) return res.status(error.status).json({ error: error.message });
     throw error;
   }
+});
+
+/** Staff set who is at fault. Admin only, because it decides who the business claims against. */
+router.post('/:id/fault', async (req: AuthRequest, res: Response) => {
+  if (!admin(req)) return res.status(403).json({ error: 'An admin sets who is at fault' });
+  const fault = String(req.body?.fault || '');
+  if (!isFault(fault)) return res.status(400).json({ error: 'Choose courier, manufacturing, packing, customer or unknown' });
+  const note = String(req.body?.note || '').trim().slice(0, 1000) || null;
+  const done = await query(
+    `UPDATE return_authorizations SET fault = $2, fault_note = $3, fault_by = $4, fault_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING id`,
+    [req.params.id, fault, note, req.user?.email || null]
+  );
+  if (!done.rows[0]) return res.status(404).json({ error: 'Return not found' });
+  res.json({ fault, fault_note: note });
+});
+
+/** Every photo on a case, for the claim rules: Returns screen photos with their kind, and the request photos (photos of the goods). */
+async function casePhotoKinds(returnId: string, pickListId: string | null): Promise<string[]> {
+  const own = await query(`SELECT COALESCE(photo_kind, 'item') AS kind FROM return_desk_photos WHERE return_authorization_id = $1`, [returnId]);
+  const older = pickListId
+    ? await query(`SELECT COUNT(*)::int AS n FROM return_request_images i JOIN return_requests r ON r.id = i.return_request_id WHERE r.pick_list_id = $1 AND r.status <> 'cancelled'`, [pickListId])
+    : { rows: [{ n: 0 }] };
+  return [...own.rows.map((row: { kind: string }) => row.kind), ...Array.from({ length: Number(older.rows[0]?.n) || 0 }, () => 'item')];
+}
+
+/** Raise a claim against the courier or Bisley at any stage. The fault must be set and match, and the usual photo must be there unless a reason is given. */
+router.post('/:id/claims', async (req: AuthRequest, res: Response) => {
+  if (!admin(req)) return res.status(403).json({ error: 'An admin raises a claim' });
+  const kind = String(req.body?.kind || '');
+  const found = await query(`SELECT id, fault, desk_status, pick_list_id FROM return_authorizations WHERE id = $1`, [req.params.id]);
+  const ra = found.rows[0];
+  if (!ra) return res.status(404).json({ error: 'Return not found' });
+  const override = String(req.body?.override || '').trim().slice(0, 1000);
+  const check = canRaiseClaim({ kind, fault: ra.fault, photoKinds: await casePhotoKinds(ra.id, ra.pick_list_id), override, open: ra.desk_status !== 'closed' });
+  if (!check.ok) return res.status(400).json({ error: check.reason });
+  if (!isClaimKind(kind)) return res.status(400).json({ error: 'Choose a carrier claim or a Bisley claim.' });
+  const open = await query(
+    `SELECT id FROM return_claims WHERE return_authorization_id = $1 AND kind = $2 AND COALESCE(status, 'open') NOT IN ('rejected', 'withdrawn')`,
+    [ra.id, kind]
+  );
+  if (open.rows[0]) return res.status(409).json({ error: `A ${kind === 'carrier' ? 'carrier' : 'Bisley'} claim is already on this case.` });
+  const note = String(req.body?.note || '').trim().slice(0, 1000) || null;
+  const saved = await query(
+    `INSERT INTO return_claims (return_authorization_id, kind, note, status, created_by, override_note, updated_at)
+     VALUES ($1, $2, $3, 'open', $4, $5, NOW()) RETURNING *`,
+    [ra.id, kind, note, req.user?.email || null, override || null]
+  );
+  res.status(201).json({ claim: saved.rows[0] });
+});
+
+/** Move a claim on: sent, accepted, rejected, paid or withdrawn. */
+router.post('/claims/:id/status', async (req: AuthRequest, res: Response) => {
+  if (!admin(req)) return res.status(403).json({ error: 'An admin updates a claim' });
+  const status = String(req.body?.status || '');
+  if (!isClaimStatus(status)) return res.status(400).json({ error: 'Choose open, sent, accepted, rejected, paid or withdrawn' });
+  const note = String(req.body?.note || '').trim().slice(0, 500);
+  const done = await query(
+    `UPDATE return_claims SET status = $2, note = CASE WHEN $3 = '' THEN note ELSE left(COALESCE(note || E'\\n', '') || $3, 2000) END, updated_at = NOW() WHERE id = $1 RETURNING id, status`,
+    [req.params.id, status, note]
+  );
+  if (!done.rows[0]) return res.status(404).json({ error: 'Claim not found' });
+  res.json(done.rows[0]);
+});
+
+/** Add a photo to a case at any stage: the damage, the outer box, the label or the inner packing. */
+router.post('/:id/photos', express.raw({ type: ['image/jpeg', 'image/png', 'image/webp', 'image/gif'], limit: '8mb' }), async (req: AuthRequest, res: Response) => {
+  const bytes = req.body as Buffer;
+  const type = String(req.headers['content-type'] || '').toLowerCase().split(';')[0].trim();
+  if (!Buffer.isBuffer(bytes) || !bytes.length) return res.status(400).json({ error: 'Choose a photo to upload.' });
+  if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(type)) return res.status(400).json({ error: 'Use a JPEG, PNG, WebP or GIF photo.' });
+  const kind = String(req.query.kind || 'item');
+  if (!isPhotoKind(kind)) return res.status(400).json({ error: 'Say what the photo shows: item, box, label, inner or other' });
+  const ra = await query(`SELECT id FROM return_authorizations WHERE id = $1`, [req.params.id]);
+  if (!ra.rows[0]) return res.status(404).json({ error: 'Return not found' });
+  const count = await query(`SELECT COUNT(*)::int AS n FROM return_desk_photos WHERE return_authorization_id = $1`, [req.params.id]);
+  if (Number(count.rows[0]?.n) >= 30) return res.status(400).json({ error: 'This case already has 30 photos.' });
+  const saved = await query(
+    `INSERT INTO return_desk_photos (return_authorization_id, content_type, image, created_by, photo_kind, sku, caption)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+    [req.params.id, type, bytes, req.user?.email || null, kind, String(req.query.sku || '').trim().slice(0, 120) || null, String(req.query.caption || '').trim().slice(0, 200) || null]
+  );
+  res.status(201).json({ id: saved.rows[0].id });
 });
 
 router.post('/:id/claim-report', async (req: AuthRequest, res: Response) => {

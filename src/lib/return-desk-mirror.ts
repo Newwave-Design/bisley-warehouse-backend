@@ -169,11 +169,11 @@ export async function createDamageComplaint(pickListId: string, complaint: { cas
   const created = await withRmaNumber((rma) => query(
     `INSERT INTO return_authorizations
        (rma_number, medusa_order_id, status, redeem_to_warehouse, return_reason, customer_name, customer_email,
-        notes, desk_status, how_back, hold_refund, pick_list_id, sold_stock_hold, legacy_key, desk_ref, desk_requested_by)
-     VALUES ($1,$2,'AUTHORIZED', false, $3,$4,$5,$6,'to_decide','kept', false,$7, false,$8,$9,$10)
+        notes, desk_status, how_back, hold_refund, pick_list_id, sold_stock_hold, legacy_key, desk_ref, desk_requested_by, desk_case_id, damage_reported_at)
+     VALUES ($1,$2,'AUTHORIZED', false, $3,$4,$5,$6,'to_decide','kept', false,$7, false,$8,$9,$10,$11, NOW())
      ON CONFLICT (legacy_key) DO NOTHING
      RETURNING rma_number`,
-    [rma, pick.medusa_order_id, label, pick.customer_name, pick.customer_email, note, pickListId, key, complaint.ref || null, complaint.requestedBy || null]
+    [rma, pick.medusa_order_id, label, pick.customer_name, pick.customer_email, note, pickListId, key, complaint.ref || null, complaint.requestedBy || null, caseId]
   ));
   if (created.rows[0]) return { rma: created.rows[0].rma_number, created: true };
   const again = await query(`SELECT rma_number FROM return_authorizations WHERE legacy_key = $1`, [key]);

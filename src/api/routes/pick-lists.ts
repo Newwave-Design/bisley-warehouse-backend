@@ -1275,6 +1275,16 @@ router.post(
   },
 );
 
+/** A header the desk sends URI-encoded (a caption can hold any text). A badly encoded one is used as it came. */
+function headerText(value: unknown): string {
+  const raw = String(value || '');
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
 /** POST /api/pick-lists/:pickListId/damage-cases — put a damage complaint from the customer desk on the Returns screen's Damage view. */
 router.post('/:pickListId/damage-cases', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
@@ -1308,6 +1318,12 @@ router.post(
         String(req.headers['content-type'] || ''),
         String(req.headers['x-photo-key'] || ''),
         String(req.headers['x-actor'] || '').trim() || req.user?.email || '',
+        {
+          caseId: String(req.headers['x-desk-case'] || ''),
+          kind: String(req.headers['x-photo-kind'] || ''),
+          sku: headerText(req.headers['x-photo-sku']),
+          caption: headerText(req.headers['x-photo-caption']),
+        },
       );
       return res.status(done.attached ? 201 : 200).json(done);
     } catch (error) {
