@@ -1,6 +1,7 @@
 import { query } from '../db/index.js';
 import { logWarning } from './logger.js';
 import { medusaKeyHeader, shopStockTarget } from './shop-stock.js';
+import { assignStockedToOlderOrders } from './assign-arrived-stock.js';
 
 /**
  * Shared Medusa inventory update helper.
@@ -153,6 +154,9 @@ async function medusaLevelsAtOvara(): Promise<Map<string, { stocked: number; res
  * A failure to read Medusa, or to write a SKU, is logged where the team can see it, never swallowed.
  */
 export async function reconcileAvailableStock(): Promise<{ checked: number; updated: number; floored: number; missing: number; failed: number }> {
+  // Stock goes to the oldest open order first. Do that before reading what is free, so a unit owed to an older order
+  // (including a made-to-order one waiting for its stock) can never be offered to the shop.
+  await assignStockedToOlderOrders().catch((error) => logWarning('INVENTORY_SYNC', 'Older orders could not be given their stock before the shop sync', { error: error instanceof Error ? error.message : String(error) }));
   const rows = await query(
     `SELECT product_sku AS sku, COALESCE(SUM(quantity_available), 0)::int AS available, COALESCE(SUM(quantity), 0)::int AS onhand FROM warehouse_inventory GROUP BY product_sku`,
   );
