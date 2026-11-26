@@ -17,6 +17,7 @@ import { splitKitForReturn } from '../../lib/return-kits.js';
 import { stockArrived } from './stock-in.js';
 import { returnProgress, RETURN_STEPS, type ReturnCollection } from '../../lib/return-progress.js';
 import { returnKind } from '../../lib/return-kind.js';
+import { pullDeliveryProof } from '../../lib/delivery-proof.js';
 import { canRaiseClaim, evidenceChecklist, isClaimKind, isClaimStatus, isFault, isPhotoKind, suggestFault, FAULTS, PHOTO_KINDS, CLAIM_STATUSES } from '../../lib/return-fault.js';
 
 const router = express.Router();
@@ -89,7 +90,7 @@ router.get('/', async (req: AuthRequest, res: Response) => {
   // and the photos attached to those requests (they live apart from the photos taken at inspection).
   const orders = pickIds.length
     ? await query(
-        `SELECT pl.id, pl.pick_list_number, pl.status AS order_status,
+        `SELECT pl.id, pl.pick_list_number, pl.status AS order_status, pl.tracking_number AS out_tracking, pl.carrier AS out_carrier,
                 COALESCE((
                   SELECT json_agg(json_build_object('sku', r.sku, 'title', pli.item_title, 'qty', pli.quantity_required, 'outcome', r.outcome,
                                                     'status', r.status, 'created_by', r.created_by, 'created_at', r.created_at) ORDER BY r.created_at, r.sku)
@@ -125,7 +126,9 @@ router.get('/', async (req: AuthRequest, res: Response) => {
       request_lines: order?.request_lines || [],
       request_photos: requestPhotos,
       fault_hint: full.fault ? null : suggestFault({ reason: full.return_reason, courier_problem: full.courier_problem, notes: full.notes }),
-      evidence: evidenceChecklist({ photoKinds, reportedAt: full.damage_reported_at, tracking: full.tracking_number || collection?.waybill, fault: full.fault }),
+      out_tracking: order?.out_tracking || null,
+      out_carrier: order?.out_carrier || null,
+      evidence: evidenceChecklist({ photoKinds, reportedAt: full.damage_reported_at, tracking: full.tracking_number || (order?.out_tracking as string | undefined) || collection?.waybill, fault: full.fault }),
       kind: returnKind(row as Parameters<typeof returnKind>[0]),
       progress: returnProgress(row as { desk_status?: string; how_back?: string; outcome?: string }, collection, today),
     };
@@ -557,6 +560,18 @@ router.post('/claims/:id/status', async (req: AuthRequest, res: Response) => {
   );
   if (!done.rows[0]) return res.status(404).json({ error: 'Claim not found' });
   res.json(done.rows[0]);
+});
+
+/** Pull the courier's proof of delivery onto the case: the driver's delivery photo, the signature, who signed, when and where. */
+router.post('/:id/delivery-proof', async (req: AuthRequest, res: Response) => {
+  try {
+    const found = await query(`SELECT 1 FROM return_authorizations WHERE id = $1`, [req.params.id]);
+    if (!found.rows[0]) return res.status(404).json({ error: 'Return not found' });
+    res.json(await pullDeliveryProof(req.params.id, req.user?.email || 'courier'));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'The courier did not answer';
+    res.status(502).json({ error: `Could not read the courier's proof of delivery: ${message}` });
+  }
 });
 
 /** Add a photo to a case at any stage: the damage, the outer box, the label or the inner packing. */

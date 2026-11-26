@@ -7,6 +7,7 @@
  */
 import { query } from '../db/index.js';
 import { splitKitForReturn } from './return-kits.js';
+import { pullDeliveryProofLater } from './delivery-proof.js';
 
 export function mirrorKey(pickListId: string) {
   return `return_requests:${pickListId}`;
@@ -172,10 +173,14 @@ export async function createDamageComplaint(pickListId: string, complaint: { cas
         notes, desk_status, how_back, hold_refund, pick_list_id, sold_stock_hold, legacy_key, desk_ref, desk_requested_by, desk_case_id, damage_reported_at)
      VALUES ($1,$2,'AUTHORIZED', false, $3,$4,$5,$6,'to_decide','kept', false,$7, false,$8,$9,$10,$11, NOW())
      ON CONFLICT (legacy_key) DO NOTHING
-     RETURNING rma_number`,
+     RETURNING id, rma_number`,
     [rma, pick.medusa_order_id, label, pick.customer_name, pick.customer_email, note, pickListId, key, complaint.ref || null, complaint.requestedBy || null, caseId]
   ));
-  if (created.rows[0]) return { rma: created.rows[0].rma_number, created: true };
+  if (created.rows[0]) {
+    // The courier's delivery photo shows the box at the door: fetch it in the background so the case has it from the start.
+    pullDeliveryProofLater(created.rows[0].id);
+    return { rma: created.rows[0].rma_number, created: true };
+  }
   const again = await query(`SELECT rma_number FROM return_authorizations WHERE legacy_key = $1`, [key]);
   return again.rows[0] ? { rma: again.rows[0].rma_number, created: false } : null;
 }

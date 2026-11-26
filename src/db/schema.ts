@@ -1703,6 +1703,10 @@ ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS desk_case_id VARCHAR(
 ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS customer_wants VARCHAR(20);
 ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS damage_reported_at TIMESTAMP;
 CREATE INDEX IF NOT EXISTS idx_return_authorizations_desk_case ON return_authorizations (desk_case_id);
+-- The courier's proof of delivery on the outbound parcel: when, who signed, and the GPS of the drop
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP;
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS delivered_signed_by VARCHAR(120);
+ALTER TABLE return_authorizations ADD COLUMN IF NOT EXISTS delivery_gps VARCHAR(60);
 -- A claim moves on from open (sent, accepted, rejected, paid, withdrawn) and records who raised it and any reason it went without the usual photo
 ALTER TABLE return_claims ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'open';
 ALTER TABLE return_claims ADD COLUMN IF NOT EXISTS created_by VARCHAR(255);

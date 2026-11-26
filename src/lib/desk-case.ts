@@ -111,6 +111,8 @@ export async function deskCaseStatus(caseId: string) {
     photos: photos.rows.length,
     evidence: evidenceChecklist({ photoKinds: kinds, reportedAt: ra.damage_reported_at, tracking: ra.tracking_number, fault: ra.fault }),
     refunded: !!ra.refunded_at,
+    delivered_at: ra.delivered_at || null,
+    delivered_signed_by: ra.delivered_signed_by || null,
     updated_at: ra.updated_at,
   };
 }

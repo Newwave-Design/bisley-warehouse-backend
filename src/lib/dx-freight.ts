@@ -631,6 +631,65 @@ export async function fetchDxTrackingNumbers(consignmentNumber: string, routingS
   return numbers;
 }
 
+/** One delivery event from DX: when, its status code, who signed, and references to the signature image and the driver's photos. */
+export interface DxTrackingEvent {
+  at: string | null;
+  status: string;
+  podName: string | null;
+  podAt: string | null;
+  signatureRef: string | null;
+  photoRefs: string[];
+  gps: { lat: number; lng: number } | null;
+}
+
+function dxEventDate(value: unknown): string | null {
+  const raw = text(value);
+  if (!raw) return null;
+  // DX can answer in WCF form, /Date(1700000000000+0000)/, or as an ISO string.
+  const wcf = raw.match(/\/Date\((-?\d+)/);
+  const date = wcf ? new Date(Number(wcf[1])) : new Date(raw);
+  return Number.isNaN(date.getTime()) || date.getUTCFullYear() < 2000 ? null : date.toISOString();
+}
+
+/** Read DX's events for a consignment, without logging in again for each call. Proof of delivery is on the delivered event. */
+export function dxTrackingEvents(json: any): DxTrackingEvent[] {
+  const list = Array.isArray(json?.TrackingEvents) ? json.TrackingEvents : Array.isArray(json?.GetTrackingResult?.TrackingEvents) ? json.GetTrackingResult.TrackingEvents : [];
+  return list.map((event: any) => {
+    const lat = Number(event?.DeliveryGPSCoOrds?.Latitude ?? event?.DeliveryGPSCoOrds?.Lat);
+    const lng = Number(event?.DeliveryGPSCoOrds?.Longitude ?? event?.DeliveryGPSCoOrds?.Long ?? event?.DeliveryGPSCoOrds?.Lng);
+    return {
+      at: dxEventDate(event?.TrackingEventDateTime),
+      status: text(event?.EventStatusCode),
+      podName: text(event?.PODName) || null,
+      podAt: dxEventDate(event?.PODDateTime),
+      signatureRef: text(event?.PODImageAttachmentRef) || null,
+      photoRefs: (Array.isArray(event?.DeliveryPhotoAttachmentRefs) ? event.DeliveryPhotoAttachmentRefs : []).map((ref: unknown) => text(ref)).filter(Boolean),
+      gps: Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0) ? { lat, lng } : null,
+    };
+  });
+}
+
+export async function fetchDxTracking(consignmentNumber: string): Promise<DxTrackingEvent[]> {
+  const json = await authed('GetTracking', { ConsignmentNumber: consignmentNumber });
+  assertOk(json, 'DX did not return the tracking for this consignment.');
+  return dxTrackingEvents(json);
+}
+
+/** One attachment (signature image or delivery photo). DX sends the file as base64 with its type. */
+export async function fetchDxAttachment(ref: string): Promise<{ contentType: string; bytes: Buffer } | null> {
+  const json = await authed('GetTrackingAttachment', { AttachmentRef: ref });
+  assertOk(json, 'DX did not return that delivery image.');
+  const data = text(json?.Data);
+  if (!data) return null;
+  const bytes = Buffer.from(data, 'base64');
+  const declared = text(json?.Type).toLowerCase();
+  const contentType = declared.includes('/') ? declared
+    : /png/.test(declared) || bytes.subarray(1, 4).toString() === 'PNG' ? 'image/png'
+    : /gif/.test(declared) || bytes.subarray(0, 3).toString() === 'GIF' ? 'image/gif'
+    : 'image/jpeg';
+  return { contentType, bytes };
+}
+
 export async function deleteDxConsignment(consignmentNumber: string, routingStream: string) {
   const json = await authed('DeleteConsignment', {
     ConsignmentNumber: consignmentNumber,

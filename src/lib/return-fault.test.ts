@@ -34,6 +34,10 @@ test('a Bisley claim needs a photo of the damage, or a reason', () => {
   assert.equal(canRaiseClaim({ kind: 'bisley', fault: 'packing', photoKinds: [], override: 'Inspected in the warehouse, paint bubbling' }).ok, true);
 });
 
+test('the courier delivery photo is not a photo of the damage', () => {
+  assert.equal(canRaiseClaim({ kind: 'bisley', fault: 'manufacturing', photoKinds: ['delivery', 'signature'] }).ok, false);
+});
+
 test('a closed case cannot be claimed', () => {
   assert.equal(canRaiseClaim({ kind: 'carrier', fault: 'courier', photoKinds: ['box'], open: false }).ok, false);
 });
@@ -49,5 +53,5 @@ test('the hint reads the box', () => {
 test('the checklist shows what a claim still needs', () => {
   const list = evidenceChecklist({ photoKinds: ['item'], reportedAt: null, tracking: 'C346', fault: 'courier' });
   const done = Object.fromEntries(list.map((row) => [row.key, row.ok]));
-  assert.deepEqual(done, { item: true, box: false, label: false, reported: false, tracking: true, fault: true });
+  assert.deepEqual(done, { item: true, box: false, label: false, delivery: false, reported: false, tracking: true, fault: true });
 });

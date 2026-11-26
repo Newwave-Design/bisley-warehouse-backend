@@ -6,7 +6,8 @@
 export const FAULTS = ['courier', 'manufacturing', 'packing', 'customer', 'unknown'] as const;
 export type Fault = (typeof FAULTS)[number];
 
-export const PHOTO_KINDS = ['item', 'box', 'label', 'inner', 'other'] as const;
+/** delivery and signature come from the courier's proof of delivery; staff upload the others. */
+export const PHOTO_KINDS = ['item', 'box', 'label', 'inner', 'other', 'delivery', 'signature'] as const;
 export type PhotoKind = (typeof PHOTO_KINDS)[number];
 
 export const WANTS = ['refund', 'replace', 'part_refund', 'repair', 'undecided'] as const;
@@ -63,7 +64,8 @@ export function canRaiseClaim(check: ClaimCheck): { ok: true } | { ok: false; re
   if (check.kind === 'carrier' && !kinds.some((kind) => kind === 'box' || kind === 'label') && !overridden) {
     return { ok: false, reason: 'A carrier will ask for a photo of the outer box or label. Add one, or give a reason to claim without it.' };
   }
-  if (!kinds.length && !overridden) {
+  // The courier's delivery photo and signature are not a photo of the damage.
+  if (!kinds.some((kind) => kind !== 'delivery' && kind !== 'signature') && !overridden) {
     return { ok: false, reason: 'Add a photo of the damage, or give a reason to claim without one.' };
   }
   return { ok: true };
@@ -90,6 +92,7 @@ export function evidenceChecklist(input: { photoKinds: (string | null | undefine
     { key: 'item', label: 'Photo of the damage', ok: kinds.some((kind) => kind === 'item' || kind === 'other') },
     { key: 'box', label: 'Photo of the outer box', ok: kinds.includes('box') },
     { key: 'label', label: 'Photo of the shipping label', ok: kinds.includes('label') },
+    { key: 'delivery', label: "Courier's delivery photo", ok: kinds.includes('delivery') },
     { key: 'reported', label: 'Date the customer reported it', ok: !!input.reportedAt },
     { key: 'tracking', label: 'Tracking or waybill number', ok: !!String(input.tracking || '').trim() },
     { key: 'fault', label: 'Fault decided', ok: !!input.fault && input.fault !== 'unknown' },

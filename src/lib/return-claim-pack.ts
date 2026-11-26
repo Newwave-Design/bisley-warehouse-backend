@@ -17,7 +17,8 @@ export type ClaimPack = { file: string; zip: Buffer; photos: number; skipped: nu
 export async function buildClaimPack(claimId: string): Promise<ClaimPack | null> {
   const claim = await query(
     `SELECT c.id, c.kind, c.note, ra.id AS return_id, ra.rma_number, ra.customer_name, ra.customer_email, ra.return_reason, ra.tracking_number,
-            ra.courier_problem, ra.decision, ra.notes, ra.pick_list_id, ra.created_at, pl.pick_list_number, pl.medusa_order_id
+            ra.courier_problem, ra.decision, ra.notes, ra.pick_list_id, ra.created_at, pl.pick_list_number, pl.medusa_order_id,
+            ra.delivered_at, ra.delivered_signed_by, ra.delivery_gps, pl.tracking_number AS out_tracking, pl.carrier AS out_carrier
        FROM return_claims c
        JOIN return_authorizations ra ON ra.id = c.return_authorization_id
        LEFT JOIN pick_lists pl ON pl.id = ra.pick_list_id
@@ -42,8 +43,19 @@ export async function buildClaimPack(claimId: string): Promise<ClaimPack | null>
     lines.push(`  ${file}  ${label}`);
   };
 
-  const desk = await query(`SELECT p.content_type, p.image, p.created_at, ri.product_sku FROM return_desk_photos p LEFT JOIN return_items ri ON ri.id = p.return_item_id WHERE p.return_authorization_id = $1 ORDER BY p.created_at`, [row.return_id]);
-  for (const photo of desk.rows) add(photo.product_sku || 'return', photo.content_type, photo.image, `${photo.product_sku || 'whole return'}, taken on the Returns screen`);
+  // Courier proof of delivery goes first: it shows the box at the door.
+  const desk = await query(
+    `SELECT p.content_type, p.image, p.created_at, p.photo_kind, p.caption, COALESCE(p.sku, ri.product_sku) AS product_sku
+       FROM return_desk_photos p LEFT JOIN return_items ri ON ri.id = p.return_item_id
+      WHERE p.return_authorization_id = $1
+      ORDER BY CASE p.photo_kind WHEN 'delivery' THEN 0 WHEN 'signature' THEN 1 WHEN 'box' THEN 2 WHEN 'label' THEN 3 ELSE 4 END, p.created_at`,
+    [row.return_id]
+  );
+  const KIND_LABEL: Record<string, string> = { delivery: 'courier delivery photo', signature: 'courier signature', box: 'outer box', label: 'shipping label', inner: 'inner packing', item: 'the damage', other: 'other' };
+  for (const photo of desk.rows) {
+    const what = KIND_LABEL[photo.photo_kind] || 'photo';
+    add(`${photo.photo_kind || 'photo'}-${photo.product_sku || 'case'}`, photo.content_type, photo.image, photo.caption || `${what}${photo.product_sku ? `, ${photo.product_sku}` : ''}`);
+  }
   if (row.pick_list_id) {
     const older = await query(
       `SELECT i.content_type, i.image, r.sku FROM return_request_images i JOIN return_requests r ON r.id = i.return_request_id WHERE r.pick_list_id = $1 ORDER BY i.created_at`,
@@ -60,7 +72,8 @@ export async function buildClaimPack(claimId: string): Promise<ClaimPack | null>
     `Customer: ${row.customer_name || ''}${row.customer_email ? ` <${row.customer_email}>` : ''}`,
     `Reason: ${row.return_reason || ''}`,
     `Courier problem: ${row.courier_problem || 'none'}`,
-    `Tracking: ${row.tracking_number || ''}`,
+    `Tracking: ${row.tracking_number || row.out_tracking || ''}${row.out_carrier ? ` (${row.out_carrier})` : ''}`,
+    row.delivered_at ? `Delivered: ${new Date(row.delivered_at).toISOString().replace('T', ' ').slice(0, 16)} UTC${row.delivered_signed_by ? `, signed ${row.delivered_signed_by}` : ''}${row.delivery_gps ? `, GPS ${row.delivery_gps}` : ''}` : '',
     `Return opened: ${row.created_at ? new Date(row.created_at).toISOString().slice(0, 10) : ''}`,
     row.note ? `Claim note: ${row.note}` : '',
     '',
