@@ -11,6 +11,7 @@
 import { query } from '../db/index.js';
 import { getMedusaHeaders } from './medusa-inventory.js';
 import { shopStockTarget } from './shop-stock.js';
+import { pooledTrayQty, trayMate } from './tray-pool.js';
 import { logWarning } from './logger.js';
 
 const MEDUSA_URL = process.env.MEDUSA_API_BASE_URL || 'https://bisley-shop.medusajs.app';
@@ -47,7 +48,22 @@ export interface DiscrepancyResult {
 
 export async function runDiscrepancyCheck(): Promise<DiscrepancyResult> {
   const wmsRows = await query(`SELECT product_sku AS sku, SUM(quantity)::int AS onhand, SUM(quantity_available)::int AS free FROM warehouse_inventory GROUP BY product_sku`);
-  const wmsStock = new Map<string, { onhand: number; free: number }>(wmsRows.rows.map((r: any) => [r.sku, { onhand: r.onhand, free: r.free }]));
+  const ownStock = new Map<string, { onhand: number; free: number }>(wmsRows.rows.map((r: any) => [r.sku, { onhand: r.onhand, free: r.free }]));
+  // Insert-tray singles and 5-packs are one pool, as in the shop sync, so each is checked against what it can sell as that form.
+  const wmsStock = new Map<string, { onhand: number; free: number }>();
+  for (const [sku, own] of ownStock) {
+    const mate = trayMate(sku);
+    const other = mate ? ownStock.get(mate) : undefined;
+    wmsStock.set(sku, mate ? { onhand: pooledTrayQty(sku, own.onhand, other?.onhand ?? 0), free: pooledTrayQty(sku, own.free, other?.free ?? 0) } : own);
+  }
+  // A tray form with no stock of its own still sells from the pool.
+  for (const sku of ownStock.keys()) {
+    const mate = trayMate(sku);
+    if (mate && !wmsStock.has(mate)) {
+      const other = ownStock.get(sku)!;
+      wmsStock.set(mate, { onhand: pooledTrayQty(mate, 0, other.onhand), free: pooledTrayQty(mate, 0, other.free) });
+    }
+  }
   const medusaMap = await fetchMedusaQuantities();
 
   // Existing open discrepancy entries, keyed by sku, so we can compare/auto-resolve
