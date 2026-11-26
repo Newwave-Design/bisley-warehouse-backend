@@ -1,0 +1,128 @@
+/**
+ * A return asked for on the customer desk or on an order goes into the older queue (return_requests).
+ * The Returns screen reads return_authorizations, so each request is also put there: one return per order,
+ * one line per SKU. The key is the same one scripts/bring-over-returns.mjs uses, so nothing is added twice.
+ *
+ * This is a copy for the Returns screen. It must never stop the request itself, so callers catch its errors.
+ */
+import { query } from '../db/index.js';
+import { splitKitForReturn } from './return-kits.js';
+
+export function mirrorKey(pickListId: string) {
+  return `return_requests:${pickListId}`;
+}
+
+/** Today's next return number: one more than the highest plain number used today (never a count, which a deleted row would put back in use). */
+export async function nextRmaNumber() {
+  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const top = await query(
+    `SELECT COALESCE(MAX(SUBSTRING(rma_number FROM '[0-9]+$')::int), 0) AS n FROM return_authorizations WHERE rma_number ~ $1`,
+    [`^RMA-${today}-[0-9]+$`]
+  );
+  return `RMA-${today}-${String(Number(top.rows[0].n) + 1).padStart(4, '0')}`;
+}
+
+/** Run an insert that needs a return number. Two returns made at the same moment can pick the same number: the loser takes the next one. */
+export async function withRmaNumber<T>(run: (rma: string) => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await run(await nextRmaNumber());
+    } catch (error) {
+      const e = error as { code?: string; constraint?: string };
+      if (e?.code === '23505' && String(e.constraint || '').includes('rma_number') && attempt < 5) continue;
+      throw error;
+    }
+  }
+}
+
+/** Put one requested SKU on the Returns screen. Returns false when there is nothing to do (no shop order, or already closed). */
+export async function mirrorRequestToDesk(pickListId: string, sku: string): Promise<boolean> {
+  if (!pickListId || !sku) return false;
+  const order = await query(`SELECT id, medusa_order_id, customer_name, customer_email FROM pick_lists WHERE id = $1`, [pickListId]);
+  const pick = order.rows[0];
+  if (!pick || !pick.medusa_order_id) return false;
+  const key = mirrorKey(pickListId);
+  let found = await query(`SELECT id, desk_status FROM return_authorizations WHERE legacy_key = $1`, [key]);
+  if (!found.rows[0]) {
+    const created = await withRmaNumber((rma) => query(
+      `INSERT INTO return_authorizations
+         (rma_number, medusa_order_id, status, redeem_to_warehouse, return_reason, customer_name, customer_email,
+          notes, desk_status, how_back, hold_refund, pick_list_id, sold_stock_hold, legacy_key)
+       VALUES ($1,$2,'AUTHORIZED', false, 'Customer return', $3,$4,$5,'due_back','post', true,$6, true,$7)
+       ON CONFLICT (legacy_key) DO NOTHING
+       RETURNING id, desk_status`,
+      [rma, pick.medusa_order_id, pick.customer_name, pick.customer_email, 'Asked for on the customer desk or the order', pickListId, key]
+    ));
+    found = created.rows[0] ? created : await query(`SELECT id, desk_status FROM return_authorizations WHERE legacy_key = $1`, [key]);
+  }
+  const ra = found.rows[0];
+  // A return that was already dealt with stays as it is. A new request after that is a new job, not a change to it.
+  if (!ra || ra.desk_status === 'closed') return false;
+  const line = await query(
+    `SELECT COALESCE(quantity_required, 1) AS qty FROM pick_list_items
+      WHERE pick_list_id = $1 AND product_sku = $2 AND NOT COALESCE(is_archived, false)
+      ORDER BY line_number LIMIT 1`,
+    [pickListId, sku]
+  );
+  // A kit comes back as its parts. Parts already on the return are left as they are.
+  for (const part of await splitKitForReturn(sku, Number(line.rows[0]?.qty) || 1)) {
+    const existing = await query(`SELECT id FROM return_items WHERE return_authorization_id = $1 AND product_sku = $2`, [ra.id, part.sku]);
+    if (existing.rows[0]) continue;
+    await query(`INSERT INTO return_items (return_authorization_id, product_sku, quantity_requested) VALUES ($1,$2,$3)`, [ra.id, part.sku, part.qty]);
+  }
+  return true;
+}
+
+/**
+ * A request taken off the queue comes off the Returns screen too, but only while the goods have not arrived.
+ * Once the return has been received or inspected, the warehouse owns it and it is left alone.
+ */
+export async function unmirrorRequest(pickListId: string, sku: string): Promise<void> {
+  const key = mirrorKey(pickListId);
+  const found = await query(`SELECT id, desk_status FROM return_authorizations WHERE legacy_key = $1`, [key]);
+  const ra = found.rows[0];
+  if (!ra || ra.desk_status !== 'due_back') return;
+  const skus = (await splitKitForReturn(sku, 1)).map((part) => part.sku);
+  await query(`DELETE FROM return_items WHERE return_authorization_id = $1 AND product_sku = ANY($2::text[]) AND item_condition IS NULL`, [ra.id, skus]);
+  const left = await query(`SELECT COUNT(*)::int AS n FROM return_items WHERE return_authorization_id = $1`, [ra.id]);
+  if (Number(left.rows[0].n) === 0) {
+    await query(
+      `UPDATE return_authorizations SET desk_status = 'closed', status = 'CANCELLED', notes = COALESCE(notes, '') || ' Request taken off the queue.', updated_at = NOW() WHERE id = $1`,
+      [ra.id]
+    );
+  }
+}
+
+const DAMAGE_REASONS: Record<string, string> = {
+  damaged: 'Damaged',
+  faulty: 'Faulty',
+  wrong_item: 'Wrong item',
+  missing_part: 'Missing part',
+};
+
+/**
+ * A part refund for damage, where the customer keeps the goods, has no return behind it but still belongs on the Returns screen,
+ * so damage claims and write-offs are decided in one place. The money has already gone, so the case starts at To decide
+ * and closes once decided. One case per refund, keyed on the refund id.
+ */
+export async function mirrorDamageRefund(refund: { id: string; pick_list_id: string | null; reason: string; amount_gbp: string | number; note?: string | null; return_authorization_id?: string | null }): Promise<boolean> {
+  const label = DAMAGE_REASONS[String(refund.reason)];
+  if (!label || refund.return_authorization_id || !refund.pick_list_id) return false;
+  const order = await query(`SELECT id, medusa_order_id, customer_name, customer_email FROM pick_lists WHERE id = $1`, [refund.pick_list_id]);
+  const pick = order.rows[0];
+  if (!pick || !pick.medusa_order_id) return false;
+  const key = `refund:${refund.id}`;
+  const note = `Part refund of £${Number(refund.amount_gbp).toFixed(2)} for ${label.toLowerCase()}, customer keeps the goods.${refund.note ? ' ' + String(refund.note) : ''}`.slice(0, 1000);
+  const created = await withRmaNumber((rma) => query(
+    `INSERT INTO return_authorizations
+       (rma_number, medusa_order_id, status, redeem_to_warehouse, return_reason, customer_name, customer_email,
+        notes, desk_status, how_back, hold_refund, pick_list_id, sold_stock_hold, legacy_key, refunded_at)
+     VALUES ($1,$2,'REFUNDED', false, $3,$4,$5,$6,'to_decide','kept', false,$7, false,$8, NOW())
+     ON CONFLICT (legacy_key) DO NOTHING
+     RETURNING id`,
+    [rma, pick.medusa_order_id, label, pick.customer_name, pick.customer_email, note, refund.pick_list_id, key]
+  ));
+  if (!created.rows[0]) return false;
+  await query(`UPDATE order_refunds SET return_authorization_id = $2 WHERE id = $1 AND return_authorization_id IS NULL`, [refund.id, created.rows[0].id]);
+  return true;
+}

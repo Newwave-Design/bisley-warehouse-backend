@@ -405,6 +405,24 @@ ALTER TABLE return_items ADD COLUMN IF NOT EXISTS item_scanned BOOLEAN NOT NULL 
 ALTER TABLE return_items ADD COLUMN IF NOT EXISTS bay_scanned VARCHAR(40);
 ALTER TABLE return_items ADD COLUMN IF NOT EXISTS unopened_confirmed BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE return_items ADD COLUMN IF NOT EXISTS stock_scanned_at TIMESTAMP;
+ALTER TABLE return_items ADD COLUMN IF NOT EXISTS decision VARCHAR(40);
+ALTER TABLE return_items ADD COLUMN IF NOT EXISTS decided_at TIMESTAMP;
+ALTER TABLE return_items ADD COLUMN IF NOT EXISTS decided_by VARCHAR(255);
+-- Spares and seconds from returns are held apart from the pick bays, so a damaged unit can never be picked as new.
+CREATE TABLE IF NOT EXISTS return_held_stock (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  return_authorization_id UUID NOT NULL REFERENCES return_authorizations(id) ON DELETE CASCADE,
+  return_item_id UUID REFERENCES return_items(id) ON DELETE SET NULL,
+  product_sku VARCHAR(50) NOT NULL,
+  units INT NOT NULL CHECK (units > 0),
+  kind VARCHAR(20) NOT NULL,
+  created_by VARCHAR(255),
+  created_at TIMESTAMP DEFAULT NOW(),
+  released_at TIMESTAMP
+);
+ALTER TABLE return_held_stock ADD COLUMN IF NOT EXISTS released_by VARCHAR(255);
+ALTER TABLE return_held_stock ADD COLUMN IF NOT EXISTS release_reason VARCHAR(40);
+CREATE INDEX IF NOT EXISTS idx_return_held_stock_open ON return_held_stock (product_sku) WHERE released_at IS NULL;
 CREATE TABLE IF NOT EXISTS return_claims (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   return_authorization_id UUID NOT NULL REFERENCES return_authorizations(id) ON DELETE CASCADE,

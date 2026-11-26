@@ -18,25 +18,15 @@
  */
 
 import express, { Response } from 'express';
-import { query } from '../../db/index.js';
+import { query, getPool } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
-import { syncSkuToMedusa } from '../../lib/medusa-inventory.js';
 import { getLogger } from '../../lib/logger.js';
+import { withRmaNumber } from '../../lib/return-desk-mirror.js';
+import { toUuidOrNull } from './mobile.js';
+import { stockArrived } from './stock-in.js';
 
 const router = express.Router();
 const logger = getLogger('returns');
-
-// Generate RMA number: RMA-YYYYMMDD-XXXX (e.g., RMA-20260916-0001)
-async function generateRmaNumber(): Promise<string> {
-  const today = new Date().toISOString().split('T')[0].replace(/-/g, '');
-  const result = await query(
-    `SELECT COUNT(*) as count FROM return_authorizations 
-     WHERE rma_number LIKE $1`,
-    [`RMA-${today}-%`]
-  );
-  const count = parseInt(result.rows[0].count) + 1;
-  return `RMA-${today}-${String(count).padStart(4, '0')}`;
-}
 
 /**
  * POST /api/returns/authorize
@@ -51,7 +41,7 @@ async function generateRmaNumber(): Promise<string> {
  *   ]
  * }
  */
-router.post('/authorize', authMiddleware, requirePermission('manage_inventory'), async (req: AuthRequest, res: Response) => {
+router.post('/authorize', authMiddleware, requirePermission('manage_orders'), async (req: AuthRequest, res: Response) => {
   try {
     const {
       medusa_order_id,
@@ -68,19 +58,17 @@ router.post('/authorize', authMiddleware, requirePermission('manage_inventory'),
       return res.status(400).json({ error: 'medusa_order_id and items array required' });
     }
 
-    // Generate RMA number
-    const rma_number = await generateRmaNumber();
-
-    // Create return authorization
-    const raResult = await query(
+    // Create the return with the next free number (a clash with another return made at the same moment takes the next one)
+    const raResult = await withRmaNumber((number) => query(
       `INSERT INTO return_authorizations 
        (rma_number, medusa_order_id, medusa_return_id, status, redeem_to_warehouse, return_reason, customer_name, customer_email, notes)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
-      [rma_number, medusa_order_id, medusa_return_id || null, 'AUTHORIZED', redeem_to_warehouse, return_reason || null, customer_name || null, customer_email || null, notes || null]
-    );
+      [number, medusa_order_id, medusa_return_id || null, 'AUTHORIZED', redeem_to_warehouse, return_reason || null, customer_name || null, customer_email || null, notes || null]
+    ));
 
     const ra = raResult.rows[0];
+    const rma_number = ra.rma_number as string;
 
     // Create return items
     const returnItems = [];
@@ -106,7 +94,7 @@ router.post('/authorize', authMiddleware, requirePermission('manage_inventory'),
       items: returnItems
     });
   } catch (err: any) {
-    logger.error('Failed to authorize return:', err);
+    logger.error(`Failed to authorize return: ${err instanceof Error ? err.message : String(err)}`);
     res.status(500).json({ error: 'Failed to authorize return' });
   }
 });
@@ -119,28 +107,31 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { status = 'AUTHORIZED', limit = '50', offset = '0' } = req.query;
 
-    const statusFilter = status === 'ALL' ? '' : `WHERE status = '${status}'`;
+    // The status is a parameter, never part of the SQL text.
+    const wanted = status === 'ALL' ? null : String(status).slice(0, 40);
+    const max = Math.min(200, Math.max(1, parseInt(limit as string) || 50));
+    const skip = Math.max(0, parseInt(offset as string) || 0);
 
     const result = await query(`
       SELECT * FROM return_authorizations
-      ${statusFilter}
+      WHERE ($3::text IS NULL OR status = $3)
       ORDER BY created_at DESC
       LIMIT $1 OFFSET $2
-    `, [parseInt(limit as string), parseInt(offset as string)]);
+    `, [max, skip, wanted]);
 
     const countResult = await query(`
       SELECT COUNT(*) as count FROM return_authorizations
-      ${statusFilter}
-    `);
+      WHERE ($1::text IS NULL OR status = $1)
+    `, [wanted]);
 
     res.json({
       returns: result.rows,
       total: parseInt(countResult.rows[0].count),
-      limit: parseInt(limit as string),
-      offset: parseInt(offset as string)
+      limit: max,
+      offset: skip
     });
   } catch (err: any) {
-    logger.error('Failed to fetch returns:', err);
+    logger.error(`Failed to fetch returns: ${err instanceof Error ? err.message : String(err)}`);
     res.status(500).json({ error: 'Failed to fetch returns' });
   }
 });
@@ -161,7 +152,7 @@ router.get('/:rma_id', authMiddleware, async (req: AuthRequest, res: Response) =
       items: itemsResult.rows
     });
   } catch (err: any) {
-    logger.error('Failed to fetch return:', err);
+    logger.error(`Failed to fetch return: ${err instanceof Error ? err.message : String(err)}`);
     res.status(500).json({ error: 'Failed to fetch return' });
   }
 });
@@ -176,7 +167,7 @@ router.get('/:rma_id', authMiddleware, async (req: AuthRequest, res: Response) =
  *   ]
  * }
  */
-router.post('/:rma_id/receive', authMiddleware, requirePermission('manage_inventory'), async (req: AuthRequest, res: Response) => {
+router.post('/:rma_id/receive', authMiddleware, requirePermission('manage_orders'), async (req: AuthRequest, res: Response) => {
   try {
     const { return_items = [] } = req.body;
 
@@ -212,7 +203,7 @@ router.post('/:rma_id/receive', authMiddleware, requirePermission('manage_invent
       status: 'RECEIVED'
     });
   } catch (err: any) {
-    logger.error('Failed to receive return items:', err);
+    logger.error(`Failed to receive return items: ${err instanceof Error ? err.message : String(err)}`);
     res.status(500).json({ error: 'Failed to receive return items' });
   }
 });
@@ -225,74 +216,70 @@ router.post('/:rma_id/receive', authMiddleware, requirePermission('manage_invent
  *   approval_notes?: "string"
  * }
  */
-router.post('/:rma_id/approve', authMiddleware, requirePermission('manage_inventory'), async (req: AuthRequest, res: Response) => {
+router.post('/:rma_id/approve', authMiddleware, requirePermission('manage_orders'), async (req: AuthRequest, res: Response) => {
+  const client = await getPool().connect();
   try {
-    const { approval_notes } = req.body;
+    const { approval_notes } = req.body || {};
+    // Where each returned item goes: body.bay for all, or body.bays { <return_item_id>: <bay> } per item.
+    const bays: Record<string, string> = req.body?.bays && typeof req.body.bays === 'object' ? req.body.bays : {};
+    const userId = toUuidOrNull(req.user?.id);
 
-    const raResult = await query(`SELECT * FROM return_authorizations WHERE id = $1`, [req.params.rma_id]);
-    if (!raResult.rows[0]) return res.status(404).json({ error: 'Return authorization not found' });
-
+    await client.query('BEGIN');
+    // Lock the return so two approvals cannot both add the stock.
+    const raResult = await client.query(`SELECT * FROM return_authorizations WHERE id = $1 FOR UPDATE`, [req.params.rma_id]);
     const ra = raResult.rows[0];
+    if (!ra) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Return authorization not found' }); }
     if (ra.status !== 'RECEIVED') {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: `Cannot approve return in ${ra.status} status — must be RECEIVED first` });
     }
 
-    // Get all return items
-    const itemsResult = await query(`SELECT * FROM return_items WHERE return_authorization_id = $1`, [req.params.rma_id]);
-
+    const itemsResult = await client.query(`SELECT * FROM return_items WHERE return_authorization_id = $1 ORDER BY created_at, id`, [req.params.rma_id]);
     const affectedSkus = new Set<string>();
 
-    // If redeem_to_warehouse = true, add items back to inventory and track affected SKUs
     if (ra.redeem_to_warehouse) {
+      if (!userId) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'A real user login is required to put stock back' }); }
+      // Check every bay first, so nothing is added if one is missing or wrong.
+      const plan: { item: any; qty: number; locationId: string }[] = [];
       for (const item of itemsResult.rows) {
-        const qty = item.quantity_received || 0;
-
-        if (qty > 0) {
-          // Add stock back to inventory
-          await query(
-            `UPDATE warehouse_inventory
-             SET quantity = quantity + $1, updated_at = NOW()
-             WHERE product_sku = $2`,
-            [qty, item.product_sku]
-          );
-
-          affectedSkus.add(item.product_sku);
-
-          // Mark item as approved
-          await query(
-            `UPDATE return_items SET status = 'APPROVED', approved_at = NOW() WHERE id = $1`,
-            [item.id]
-          );
-        }
+        const qty = Number(item.quantity_received) || 0;
+        if (qty <= 0) continue;
+        const code = String(bays[item.id] || req.body?.bay || '').trim();
+        if (!code) { await client.query('ROLLBACK'); return res.status(400).json({ error: `Say which bay ${item.product_sku} goes back to (bay, or bays by item)` }); }
+        const loc = await client.query(`SELECT id FROM warehouse_locations WHERE location_code = $1`, [code]);
+        if (!loc.rows[0]) { await client.query('ROLLBACK'); return res.status(400).json({ error: `Bay ${code} was not found` }); }
+        plan.push({ item, qty, locationId: loc.rows[0].id });
       }
-
-      // Sync updated available quantities to Medusa
-      for (const sku of affectedSkus) {
-        const row = await query(
-          `SELECT SUM(quantity) as qty, SUM(quantity_reserved) as reserved FROM warehouse_inventory WHERE product_sku = $1`,
-          [sku]
+      for (const { item, qty, locationId } of plan) {
+        // One bay, owned by Ovara (returns are Ovara's), with a movement so it can be traced. Not every bay holding the SKU.
+        await client.query(
+          `INSERT INTO warehouse_inventory (location_id, product_sku, quantity, liability_status, created_at, updated_at)
+           VALUES ($1,$2,$3,'OVARA', NOW(), NOW())
+           ON CONFLICT (location_id, product_sku, COALESCE(colour_code, '')) DO UPDATE SET quantity = warehouse_inventory.quantity + $3, liability_status = 'OVARA', updated_at = NOW()`,
+          [locationId, item.product_sku, qty]
         );
-        const available = Math.max(0, parseInt(row.rows[0]?.qty ?? '0') - parseInt(row.rows[0]?.reserved ?? '0'));
-        await syncSkuToMedusa(sku, available);
+        await client.query(
+          `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, quantity, notes, performed_by)
+           VALUES ('RETURN', $1, $2, $3, $4, $5)`,
+          [locationId, item.product_sku, qty, `Return ${ra.rma_number} approved`, userId]
+        );
+        affectedSkus.add(item.product_sku);
+        await client.query(`UPDATE return_items SET status = 'APPROVED', approved_at = NOW() WHERE id = $1`, [item.id]);
       }
     } else {
-      // Mark items as rejected (not redeemable)
-      for (const item of itemsResult.rows) {
-        await query(
-          `UPDATE return_items SET status = 'REJECTED', approved_at = NOW() WHERE id = $1`,
-          [item.id]
-        );
-      }
+      await client.query(`UPDATE return_items SET status = 'REJECTED', approved_at = NOW() WHERE return_authorization_id = $1`, [req.params.rma_id]);
     }
 
-    // Update return authorization as approved
-    await query(
-      `UPDATE return_authorizations SET status = 'APPROVED', approved_at = NOW(), approved_by = $1 WHERE id = $2`,
-      [req.user?.id || null, req.params.rma_id]
+    await client.query(
+      `UPDATE return_authorizations SET status = 'APPROVED', approved_at = NOW(), approved_by = $1, notes = CASE WHEN $3::text IS NULL THEN notes ELSE CONCAT(COALESCE(notes, ''), E'\\nApproval: ', $3::text) END WHERE id = $2`,
+      [userId, req.params.rma_id, approval_notes || null]
     );
+    await client.query('COMMIT');
+
+    // Returned stock is sellable again: send it to the shop and to any order waiting for it, as stock-in does.
+    if (affectedSkus.size) void stockArrived([...affectedSkus]);
 
     logger.info(`✓ Return approved: ${ra.rma_number} (redeemable: ${ra.redeem_to_warehouse}, synced: ${affectedSkus.size} SKUs)`);
-
     res.json({
       success: true,
       rma_number: ra.rma_number,
@@ -301,8 +288,11 @@ router.post('/:rma_id/approve', authMiddleware, requirePermission('manage_invent
       synced_skus: Array.from(affectedSkus)
     });
   } catch (err: any) {
-    logger.error('Failed to approve return:', err);
-    res.status(500).json({ error: 'Failed to approve return' });
+    await client.query('ROLLBACK').catch(() => undefined);
+    logger.error(`Failed to approve return: ${err instanceof Error ? err.message : String(err)}`);
+    res.status(500).json({ error: 'Failed to approve return. Nothing was changed, so it is safe to try again.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -310,7 +300,7 @@ router.post('/:rma_id/approve', authMiddleware, requirePermission('manage_invent
  * POST /api/returns/:rma_id/reject
  * Reject return (no refund, no inventory adjustment)
  */
-router.post('/:rma_id/reject', authMiddleware, requirePermission('manage_inventory'), async (req: AuthRequest, res: Response) => {
+router.post('/:rma_id/reject', authMiddleware, requirePermission('manage_orders'), async (req: AuthRequest, res: Response) => {
   try {
     const { rejection_reason } = req.body;
 
@@ -318,6 +308,9 @@ router.post('/:rma_id/reject', authMiddleware, requirePermission('manage_invento
     if (!raResult.rows[0]) return res.status(404).json({ error: 'Return authorization not found' });
 
     const ra = raResult.rows[0];
+    if (['APPROVED', 'REFUNDED', 'REJECTED'].includes(ra.status)) {
+      return res.status(400).json({ error: `Cannot reject a return that is already ${ra.status}` });
+    }
 
     // Mark all items as rejected
     await query(
@@ -328,7 +321,7 @@ router.post('/:rma_id/reject', authMiddleware, requirePermission('manage_invento
     // Update return authorization as rejected
     await query(
       `UPDATE return_authorizations 
-       SET status = 'REJECTED', rejected_at = NOW(), notes = CONCAT(notes, '\nRejection: ', $1)
+       SET status = 'REJECTED', rejected_at = NOW(), notes = CONCAT(COALESCE(notes, ''), E'\nRejection: ', $1::text)
        WHERE id = $2`,
       [rejection_reason || 'No reason provided', req.params.rma_id]
     );
@@ -341,7 +334,7 @@ router.post('/:rma_id/reject', authMiddleware, requirePermission('manage_invento
       status: 'REJECTED'
     });
   } catch (err: any) {
-    logger.error('Failed to reject return:', err);
+    logger.error(`Failed to reject return: ${err instanceof Error ? err.message : String(err)}`);
     res.status(500).json({ error: 'Failed to reject return' });
   }
 });

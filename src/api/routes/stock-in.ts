@@ -714,7 +714,7 @@ router.post('/reconcile/:id/resolve', authMiddleware, async (req: AuthRequest, r
 });
 
 /** Stock was added outside a confirm (the desk reconciled a scan): send it to the shop and the orders waiting for it. */
-async function stockArrived(skus: string[]): Promise<void> {
+export async function stockArrived(skus: string[]): Promise<void> {
   try {
     const unique = [...new Set(skus.filter(Boolean))];
     await assignStockedToOlderOrders(unique);

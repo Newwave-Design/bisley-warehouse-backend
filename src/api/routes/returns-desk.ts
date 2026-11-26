@@ -5,23 +5,25 @@
  * A claim pack is a zip the desk can download. Staging does not post it to a live carrier.
  */
 import express, { Response } from 'express';
-import { query } from '../../db/index.js';
-import { authMiddleware, AuthRequest } from '../../middleware/auth.js';
+import { query, getPool } from '../../db/index.js';
+import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { issueRefund, RefundError } from '../../lib/refunds.js';
 import { isStaging } from '../../lib/staging.js';
-import { canScanIntoStock, claimFileName, decisionChangesStock, refundWaitsForInspection, soldStockTreatment, zipStore, RETURN_REASONS } from '../../lib/returns-desk-rules.js';
+import { toUuidOrNull } from './mobile.js';
+import { withRmaNumber } from '../../lib/return-desk-mirror.js';
+import { canScanIntoStock, codeMatchesItem, decisionChangesStock, decisionStockEffect, deskAfterDecisions, ITEM_DECISIONS, nextDeskStatus, refundWaitsForInspection, scanInUnits, soldStockTreatment, unitsToDecide, RETURN_REASONS } from '../../lib/returns-desk-rules.js';
+import { buildClaimPack } from '../../lib/return-claim-pack.js';
+import { splitKitForReturn } from '../../lib/return-kits.js';
+import { stockArrived } from './stock-in.js';
 
 const router = express.Router();
 router.use(authMiddleware);
+// Reading is open to anyone signed in. Starting, receiving, inspecting and scanning stock in need the orders permission
+// (every warehouse user has it). Deciding and refunding are still admin only, checked in the route.
+router.use((req: AuthRequest, res: Response, next) => (req.method === 'GET' || req.method === 'HEAD' ? next() : requirePermission('manage_orders')(req, res, next)));
 
 function admin(req: AuthRequest) {
   return String(req.user?.role || '').toUpperCase() === 'ADMIN' || String(req.user?.role || '').toUpperCase() === 'MANAGER';
-}
-
-async function rmaNumber() {
-  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  const count = await query(`SELECT COUNT(*)::int AS n FROM return_authorizations WHERE rma_number LIKE $1`, [`RMA-${today}-%`]);
-  return `RMA-${today}-${String(Number(count.rows[0].n) + 1).padStart(4, '0')}`;
 }
 
 router.get('/search', async (req: AuthRequest, res: Response) => {
@@ -78,8 +80,7 @@ router.post('/', async (req: AuthRequest, res: Response) => {
   if (!order.rows[0]) return res.status(404).json({ error: 'Order not found' });
   const lost = courier_problem === 'lost';
   const desk = lost ? 'claim' : 'due_back';
-  const number = await rmaNumber();
-  const created = await query(
+  const created = await withRmaNumber((number) => query(
     `INSERT INTO return_authorizations
       (rma_number, medusa_order_id, status, redeem_to_warehouse, return_reason, customer_name, customer_email,
        desk_status, how_back, hold_refund, courier_problem, tracking_number, pick_list_id, sold_stock_hold)
@@ -88,13 +89,17 @@ router.post('/', async (req: AuthRequest, res: Response) => {
     [number, order.rows[0].medusa_order_id, reason, order.rows[0].customer_name, order.rows[0].customer_email,
       desk, how_back, refundWaitsForInspection({ courierProblem: courier_problem, holdRefund: true }),
       courier_problem || null, tracking || null, pick_list_id]
-  );
+  ));
   for (const line of lines) {
-    await query(
-      `INSERT INTO return_items (return_authorization_id, product_sku, quantity_requested, item_condition)
-       VALUES ($1,$2,$3,$4)`,
-      [created.rows[0].id, line.sku, Number(line.qty) || 1, line.condition || null]
-    );
+    // A kit comes back as its parts, so each part is its own line. Parts that are not returning can be taken off afterwards.
+    const parts = await splitKitForReturn(String(line.sku), Number(line.qty) || 1);
+    for (const part of parts) {
+      await query(
+        `INSERT INTO return_items (return_authorization_id, product_sku, quantity_requested, item_condition)
+         VALUES ($1,$2,$3,$4)`,
+        [created.rows[0].id, part.sku, part.qty, parts.length === 1 ? (line.condition || null) : null]
+      );
+    }
   }
   if (lost || ['bisley_claim', 'carrier_claim'].includes(String(reason))) {
     await query(`INSERT INTO return_claims (return_authorization_id, kind, note) VALUES ($1,$2,$3)`, [
@@ -137,70 +142,246 @@ router.get('/photos/:photoId', async (req: AuthRequest, res: Response) => {
   res.end(row.image);
 });
 
+/** Items on a return, in a fixed order, for working out where the whole return sits. */
+async function deskItems(returnId: string) {
+  const rows = await query(`SELECT * FROM return_items WHERE return_authorization_id = $1 ORDER BY created_at, id`, [returnId]);
+  return rows.rows as { item_condition: string | null; quantity_requested: number | null; quantity_received: number | null; stock_scanned_at: unknown }[];
+}
+
+/** The scanned code must be this item's SKU or one of its barcodes. A typed tick is not a scan. */
+async function scannedCodeIsItem(code: unknown, sku: string) {
+  const typed = String(code ?? '').trim();
+  if (!typed) return false;
+  const owners = await query(`SELECT product_sku FROM barcode_mappings WHERE barcode = $1 AND is_active = true`, [typed]);
+  return codeMatchesItem(typed, sku, owners.rows.map((row: { product_sku: string }) => row.product_sku));
+}
+
 router.post('/:id/inspect', async (req: AuthRequest, res: Response) => {
-  const { item_id, condition, item_scanned, bay_scanned, confirm_unopened, photo_note } = req.body || {};
-  const gate = canScanIntoStock({
-    condition: String(condition || ''),
-    itemScanned: !!item_scanned,
-    bayScanned: !!bay_scanned,
-    confirmUnopened: !!confirm_unopened,
-  });
+  const { item_id, condition, item_code, bay_scanned, confirm_unopened, photo_note } = req.body || {};
+  const found = await query(`SELECT * FROM return_items WHERE id = $1 AND return_authorization_id = $2`, [item_id, req.params.id]);
+  const item = found.rows[0];
+  if (!item) return res.status(404).json({ error: 'Item not found' });
+  const cond = String(condition || '');
+  if (!['Unopened', 'Opened', 'Damaged', 'Faulty', 'Wrong item'].includes(cond)) return res.status(400).json({ error: 'Choose the condition of the item' });
+  // The scan is checked here, not taken from the screen: the code has to be this item, and the bay has to exist.
+  const itemOk = cond === 'Unopened' ? await scannedCodeIsItem(item_code, item.product_sku) : false;
+  let bayOk = false;
+  if (cond === 'Unopened' && bay_scanned) {
+    const bay = await query(`SELECT 1 FROM warehouse_locations WHERE location_code = $1`, [String(bay_scanned).trim()]);
+    bayOk = !!bay.rows[0];
+  }
+  const gate = canScanIntoStock({ condition: cond, itemScanned: itemOk, bayScanned: bayOk, confirmUnopened: !!confirm_unopened });
   await query(
     `UPDATE return_items
      SET item_condition = $2, item_scanned = $3, bay_scanned = $4, unopened_confirmed = $5, item_notes = COALESCE($6, item_notes), updated_at = NOW()
      WHERE id = $1 AND return_authorization_id = $7`,
-    [item_id, condition, !!item_scanned, bay_scanned || null, !!confirm_unopened, photo_note || null, req.params.id]
+    [item_id, cond, itemOk, bayOk ? String(bay_scanned).trim() : null, gate.ok, photo_note || null, req.params.id]
   );
-  const next = gate.ok ? 'to_decide' : condition === 'Unopened' ? 'to_inspect' : 'to_decide';
+  const next = nextDeskStatus(await deskItems(req.params.id));
   await query(`UPDATE return_authorizations SET desk_status = $2, status = 'RECEIVED', received_at = COALESCE(received_at, NOW()), updated_at = NOW() WHERE id = $1`, [req.params.id, next]);
-  res.json({ scan_into_stock: gate.ok, reason: 'reason' in gate ? gate.reason : '', decision_changes_stock: decisionChangesStock() });
+  res.json({
+    scan_into_stock: gate.ok,
+    reason: 'reason' in gate ? gate.reason : (cond === 'Unopened' ? '' : 'Not going back into stock'),
+    item_matched: itemOk,
+    bay_found: bayOk,
+    desk_status: next,
+    decision_changes_stock: decisionChangesStock(),
+  });
 });
 
 router.post('/:id/scan-in', async (req: AuthRequest, res: Response) => {
-  const { item_id, bay } = req.body || {};
-  const item = await query(`SELECT * FROM return_items WHERE id = $1 AND return_authorization_id = $2`, [item_id, req.params.id]);
-  const row = item.rows[0];
-  if (!row) return res.status(404).json({ error: 'Item not found' });
-  const gate = canScanIntoStock({
-    condition: row.item_condition,
-    itemScanned: row.item_scanned,
-    bayScanned: !!row.bay_scanned || !!bay,
-    confirmUnopened: row.unopened_confirmed,
-  });
-  if (!gate.ok) return res.status(400).json({ error: gate.reason });
-  const location = await query(`SELECT id FROM warehouse_locations WHERE location_code = $1`, [row.bay_scanned || bay]);
-  if (!location.rows[0]) return res.status(400).json({ error: 'Bay not found' });
-  await query(
-    `INSERT INTO warehouse_inventory (location_id, product_sku, quantity, liability_status, created_at, updated_at)
-     VALUES ($1,$2,1,'OVARA', NOW(), NOW())
-     ON CONFLICT (location_id, product_sku, COALESCE(colour_code, '')) DO UPDATE SET quantity = warehouse_inventory.quantity + 1, liability_status = 'OVARA', updated_at = NOW()`,
-    [location.rows[0].id, row.product_sku]
-  );
-  await query(
-    `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, quantity, notes, performed_by)
-     VALUES ('return_scan', $1, $2, 1, $3, $4)`,
-    [location.rows[0].id, row.product_sku, `Unopened return ${req.params.id}`, req.user?.email || null]
-  );
-  await query(`UPDATE return_items SET stock_scanned_at = NOW(), quantity_received = 1, status = 'APPROVED', updated_at = NOW() WHERE id = $1`, [row.id]);
-  await query(`UPDATE return_authorizations SET redeem_to_warehouse = true, desk_status = 'to_refund', updated_at = NOW() WHERE id = $1`, [req.params.id]);
-  res.json({ stock: '+1', owner: 'Ovara', sold_stock: soldStockTreatment({ reportSent: false, open: false, scannedIn: true }) });
+  const { item_id } = req.body || {};
+  // The movement is recorded against a real user (the column is a user id), as stock-in does.
+  const userId = toUuidOrNull(req.user?.id);
+  if (!userId) return res.status(400).json({ error: 'A real user login is required to put stock back' });
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    // Lock the line so two scans at once cannot both pass the check.
+    const item = await client.query(`SELECT * FROM return_items WHERE id = $1 AND return_authorization_id = $2 FOR UPDATE`, [item_id, req.params.id]);
+    const row = item.rows[0];
+    if (!row) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Item not found' }); }
+    // Only what the inspection verified counts: the item code matched, the bay exists, and it was confirmed unopened.
+    const gate = canScanIntoStock({
+      condition: row.item_condition,
+      itemScanned: row.item_scanned,
+      bayScanned: !!row.bay_scanned,
+      confirmUnopened: row.unopened_confirmed,
+    });
+    if (!gate.ok) { await client.query('ROLLBACK'); return res.status(400).json({ error: gate.reason }); }
+    const units = scanInUnits(row, 1);
+    if (!units.ok) { await client.query('ROLLBACK'); return res.status(409).json({ error: units.reason }); }
+    const location = await client.query(`SELECT id FROM warehouse_locations WHERE location_code = $1`, [String(row.bay_scanned).trim()]);
+    if (!location.rows[0]) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Bay not found' }); }
+    await client.query(
+      `INSERT INTO warehouse_inventory (location_id, product_sku, quantity, liability_status, created_at, updated_at)
+       VALUES ($1,$2,$3,'OVARA', NOW(), NOW())
+       ON CONFLICT (location_id, product_sku, COALESCE(colour_code, '')) DO UPDATE SET quantity = warehouse_inventory.quantity + $3, liability_status = 'OVARA', updated_at = NOW()`,
+      [location.rows[0].id, row.product_sku, units.units]
+    );
+    await client.query(
+      `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, quantity, notes, performed_by)
+       VALUES ('return_scan', $1, $2, $3, $4, $5)`,
+      [location.rows[0].id, row.product_sku, units.units, `Unopened return ${req.params.id}`, userId]
+    );
+    await client.query(
+      `UPDATE return_items
+          SET stock_scanned_at = NOW(), quantity_received = COALESCE(quantity_received, 0) + $2,
+              status = CASE WHEN COALESCE(quantity_received, 0) + $2 >= COALESCE(quantity_requested, 1) THEN 'APPROVED' ELSE status END,
+              updated_at = NOW()
+        WHERE id = $1`,
+      [row.id, units.units]
+    );
+    const all = await client.query(`SELECT * FROM return_items WHERE return_authorization_id = $1 ORDER BY created_at, id`, [req.params.id]);
+    const next = nextDeskStatus(all.rows);
+    await client.query(
+      `UPDATE return_authorizations SET redeem_to_warehouse = true, desk_status = $2, updated_at = NOW() WHERE id = $1`,
+      [req.params.id, next]
+    );
+    await client.query('COMMIT');
+    // Returned stock is sellable again: send it to the shop and to any order waiting for it, as stock-in does.
+    void stockArrived([row.product_sku]);
+    res.json({ stock: '+' + units.units, left_on_line: units.left, desk_status: next, owner: 'Ovara', sold_stock: soldStockTreatment({ reportSent: false, open: false, scannedIn: true }) });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    console.error('Return scan-in failed:', error instanceof Error ? error.message : error);
+    res.status(500).json({ error: 'The item was not scanned into stock. Try again.' });
+  } finally {
+    client.release();
+  }
 });
+
+/** Apply one decision to one line inside the caller's transaction. Returns what it did to stock. */
+async function decideLine(client: import('pg').PoolClient, ra: { id: string }, item: any, decision: string, userId: string | null, email: string | null) {
+  const units = unitsToDecide(item);
+  const effect = decisionStockEffect(decision);
+  if (effect === 'write_off') {
+    // The unit never went back into stock, so nothing leaves a bay: the write-off is recorded so it can be counted.
+    await client.query(
+      `INSERT INTO warehouse_movements (movement_type, location_id, product_sku, quantity, notes, performed_by)
+       VALUES ('RETURN_WRITE_OFF', NULL, $1, $2, $3, $4)`,
+      [item.product_sku, units, `Written off from return ${ra.id}`, userId]
+    );
+  } else if (effect === 'held') {
+    // Spares and seconds are kept apart from the pick bays, so a damaged unit can never be picked for a customer as new.
+    await client.query(
+      `INSERT INTO return_held_stock (return_authorization_id, return_item_id, product_sku, units, kind, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [ra.id, item.id, item.product_sku, units, decision === 'spares' ? 'spares' : 'second', email]
+    );
+  } else {
+    const kind = decision === 'carrier_claim' ? 'carrier' : 'bisley';
+    const have = await client.query(`SELECT 1 FROM return_claims WHERE return_authorization_id = $1 AND kind = $2`, [ra.id, kind]);
+    if (!have.rows[0]) await client.query(`INSERT INTO return_claims (return_authorization_id, kind, note) VALUES ($1,$2,$3)`, [ra.id, kind, decision]);
+  }
+  await client.query(`UPDATE return_items SET decision = $2, decided_at = NOW(), decided_by = $3, updated_at = NOW() WHERE id = $1`, [item.id, decision, email]);
+  return { effect, units };
+}
 
 router.post('/:id/decide', async (req: AuthRequest, res: Response) => {
   if (!admin(req)) return res.status(403).json({ error: 'Admin approves a write-off, claim, or refund' });
   const decision = String(req.body?.decision || '');
-  if (!['write_off', 'bisley_claim', 'carrier_claim', 'spares', 'second'].includes(decision)) {
+  if (!(ITEM_DECISIONS as readonly string[]).includes(decision)) {
     return res.status(400).json({ error: 'Choose write-off, a Bisley claim, a carrier claim, spare parts, or keep as a second' });
   }
-  await query(`UPDATE return_authorizations SET decision = $2, desk_status = $3, redeem_to_warehouse = false, updated_at = NOW() WHERE id = $1`, [
-    req.params.id, decision, decision.endsWith('claim') ? 'claim' : 'to_refund',
-  ]);
-  if (decision.endsWith('claim')) {
-    await query(`INSERT INTO return_claims (return_authorization_id, kind, note) VALUES ($1,$2,$3)`, [
-      req.params.id, decision === 'carrier_claim' ? 'carrier' : 'bisley', decision,
-    ]);
+  const userId = toUuidOrNull(req.user?.id);
+  const email = req.user?.email || null;
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const found = await client.query(`SELECT * FROM return_authorizations WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    const ra = found.rows[0];
+    if (!ra) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Return not found' }); }
+    const all = await client.query(`SELECT * FROM return_items WHERE return_authorization_id = $1 ORDER BY created_at, id FOR UPDATE`, [req.params.id]);
+    const targets = req.body?.item_id ? all.rows.filter((item: any) => item.id === req.body.item_id) : all.rows.filter((item: any) => !item.decision && unitsToDecide(item) > 0);
+    if (req.body?.item_id && !targets.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Item not found' }); }
+    if (targets.some((item: any) => item.decision)) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'That item already has a decision' }); }
+    if (targets.some((item: any) => unitsToDecide(item) <= 0)) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Every unit of that item is already back in stock' }) }
+    if (targets.length && decisionStockEffect(decision) === 'write_off' && !userId) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'A real user login is required to record a write-off' });
+    }
+    let writtenOff = 0;
+    let held = 0;
+    for (const item of targets) {
+      const done = await decideLine(client, ra, item, decision, userId, email);
+      if (done.effect === 'write_off') writtenOff += done.units;
+      if (done.effect === 'held') held += done.units;
+    }
+    let next: string;
+    if (all.rows.length) {
+      const after = await client.query(`SELECT * FROM return_items WHERE return_authorization_id = $1`, [req.params.id]);
+      next = deskAfterDecisions(after.rows, !!ra.refunded_at);
+    } else {
+      // A part refund for damage has no items: the decision is on the return itself.
+      if (decision.endsWith('claim')) {
+        const kind = decision === 'carrier_claim' ? 'carrier' : 'bisley';
+        const have = await client.query(`SELECT 1 FROM return_claims WHERE return_authorization_id = $1 AND kind = $2`, [req.params.id, kind]);
+        if (!have.rows[0]) await client.query(`INSERT INTO return_claims (return_authorization_id, kind, note) VALUES ($1,$2,$3)`, [req.params.id, kind, decision]);
+      }
+      next = decision.endsWith('claim') ? 'claim' : ra.refunded_at ? 'closed' : 'to_refund';
+    }
+    await client.query(`UPDATE return_authorizations SET decision = $2, desk_status = $3, redeem_to_warehouse = $4, updated_at = NOW() WHERE id = $1`, [req.params.id, decision, next, !!ra.redeem_to_warehouse]);
+    await client.query('COMMIT');
+    res.json({
+      decision,
+      desk_status: next,
+      stock_change: writtenOff > 0 || held > 0,
+      written_off_units: writtenOff,
+      held_units: held,
+      sold_stock: soldStockTreatment({ reportSent: false, open: false, scannedIn: false }),
+    });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    console.error('Return decision failed:', error instanceof Error ? error.message : error);
+    res.status(500).json({ error: 'The decision was not saved. Nothing was changed, so it is safe to try again.' });
+  } finally {
+    client.release();
   }
-  res.json({ decision, stock_change: decisionChangesStock(), sold_stock: soldStockTreatment({ reportSent: false, open: false, scannedIn: false }) });
+});
+
+/** Spares and seconds kept apart from the pick bays, with the return they came from. */
+router.get('/held', async (_req: AuthRequest, res: Response) => {
+  const rows = await query(
+    `SELECT h.id, h.product_sku, h.units, h.kind, h.created_at, h.created_by, ra.rma_number, ra.customer_name
+       FROM return_held_stock h JOIN return_authorizations ra ON ra.id = h.return_authorization_id
+      WHERE h.released_at IS NULL ORDER BY h.created_at DESC LIMIT 500`
+  );
+  const totals = await query(`SELECT product_sku, kind, SUM(units)::int AS units FROM return_held_stock WHERE released_at IS NULL GROUP BY 1,2 ORDER BY 1,2`);
+  res.json({ held: rows.rows, totals: totals.rows });
+});
+
+/** A held spare or second leaves the list when it is used, sold or scrapped. Admin only, once, and the reason is kept. */
+router.post('/held/:id/release', async (req: AuthRequest, res: Response) => {
+  if (!admin(req)) return res.status(403).json({ error: 'Admin releases held stock' });
+  const reason = String(req.body?.reason || '');
+  if (!['used', 'sold', 'scrapped'].includes(reason)) return res.status(400).json({ error: 'Say whether it was used, sold or scrapped' });
+  const done = await query(
+    `UPDATE return_held_stock SET released_at = NOW(), released_by = $2, release_reason = $3 WHERE id = $1 AND released_at IS NULL RETURNING id, product_sku, units, kind`,
+    [req.params.id, req.user?.email || null, reason]
+  );
+  if (!done.rows[0]) return res.status(404).json({ error: 'That held stock was not found or has already been released' });
+  res.json({ released: done.rows[0], reason });
+});
+
+/** Take a line off a return, for example the parts of a kit that are not coming back. Only before it has been inspected. */
+router.delete('/:id/items/:itemId', async (req: AuthRequest, res: Response) => {
+  const item = await query(`SELECT * FROM return_items WHERE id = $1 AND return_authorization_id = $2`, [req.params.itemId, req.params.id]);
+  const row = item.rows[0];
+  if (!row) return res.status(404).json({ error: 'Item not found' });
+  if (row.item_condition || Number(row.quantity_received || 0) > 0 || row.decision) {
+    return res.status(409).json({ error: 'That item has already been inspected, so it cannot be taken off' });
+  }
+  await query(`DELETE FROM return_items WHERE id = $1`, [row.id]);
+  const left = await deskItems(req.params.id);
+  if (!left.length) {
+    await query(`UPDATE return_authorizations SET desk_status = 'closed', status = 'CANCELLED', notes = COALESCE(notes, '') || ' Every item was taken off.', updated_at = NOW() WHERE id = $1`, [req.params.id]);
+    return res.json({ left: 0, desk_status: 'closed' });
+  }
+  const current = await query(`SELECT desk_status FROM return_authorizations WHERE id = $1`, [req.params.id]);
+  const status = current.rows[0]?.desk_status === 'due_back' ? 'due_back' : nextDeskStatus(left);
+  await query(`UPDATE return_authorizations SET desk_status = $2, updated_at = NOW() WHERE id = $1`, [req.params.id, status]);
+  res.json({ left: left.length, desk_status: status });
 });
 
 router.post('/:id/refund', async (req: AuthRequest, res: Response) => {
@@ -246,60 +427,32 @@ router.post('/:id/claim-report', async (req: AuthRequest, res: Response) => {
   if (!found.rows[0]) {
     found = await query(`INSERT INTO return_claims (return_authorization_id, kind, note) VALUES ($1,'bisley','Claim pack') RETURNING id`, [req.params.id]);
   }
-  const claim = await query(
-    `SELECT c.*, ra.rma_number, ra.customer_name, ra.return_reason, ra.tracking_number
-     FROM return_claims c JOIN return_authorizations ra ON ra.id = c.return_authorization_id
-     WHERE c.id = $1`,
-    [found.rows[0].id]
-  );
-  const row = claim.rows[0];
-  const kind = row.kind === 'carrier' ? 'carrier' : 'bisley';
-  const name = claimFileName(row.rma_number, kind);
-  const zip = zipStore('claim.txt', [`Return ${row.rma_number}`, row.return_reason || '', row.tracking_number || ''].join('\n'));
-  await query(`UPDATE return_claims SET report_name = $2 WHERE id = $1`, [row.id, name]);
-  const link = `/api/returns/desk/claims/${row.id}/report`;
-  res.json({ file: name, link, bytes: zip.length, delivered: 'link', target: kind === 'carrier' ? 'carrier' : 'Bisley' });
+  const pack = await buildClaimPack(found.rows[0].id);
+  if (!pack) return res.status(404).json({ error: 'Claim not found' });
+  await query(`UPDATE return_claims SET report_name = $2 WHERE id = $1`, [found.rows[0].id, pack.file]);
+  res.json({ file: pack.file, link: `/api/returns/desk/claims/${found.rows[0].id}/report`, bytes: pack.zip.length, photos: pack.photos, photos_left_out: pack.skipped, delivered: 'link', target: pack.kind === 'carrier' ? 'carrier' : 'Bisley' });
 });
 
 router.post('/claims/:id/report', async (req: AuthRequest, res: Response) => {
-  const claim = await query(
-    `SELECT c.*, ra.rma_number, ra.customer_name, ra.return_reason, ra.tracking_number
-     FROM return_claims c JOIN return_authorizations ra ON ra.id = c.return_authorization_id
-     WHERE c.id = $1`,
-    [req.params.id]
-  );
-  const row = claim.rows[0];
-  if (!row) return res.status(404).json({ error: 'Claim not found' });
-  const kind = row.kind === 'carrier' ? 'carrier' : 'bisley';
-  const name = claimFileName(row.rma_number, kind);
-  const body = [`Return ${row.rma_number}`, `Customer ${row.customer_name || ''}`, `Reason ${row.return_reason || ''}`, `Tracking ${row.tracking_number || ''}`, `Kind ${kind}`].join('\n');
-  const zip = zipStore('claim.txt', body);
-  await query(`UPDATE return_claims SET report_name = $2 WHERE id = $1`, [row.id, name]);
-  const target = kind === 'carrier' ? 'DX UAT or the carrier named on the order' : 'Bisley';
-  const link = `/api/returns/desk/claims/${row.id}/report`;
+  const pack = await buildClaimPack(req.params.id);
+  if (!pack) return res.status(404).json({ error: 'Claim not found' });
+  await query(`UPDATE return_claims SET report_name = $2 WHERE id = $1`, [req.params.id, pack.file]);
+  const link = `/api/returns/desk/claims/${req.params.id}/report`;
   if (isStaging()) {
     await query(
       `INSERT INTO wms_error_log (source, message, context, created_at) VALUES ('returns', $1, $2::jsonb, NOW())`,
-      [`Claim pack for ${target} is ready as a link. Staging does not post it to the live carrier or to Bisley.`, JSON.stringify({ claim_id: row.id, link })]
+      [`Claim pack for ${pack.target} is ready as a link. Staging does not post it to the live carrier or to Bisley.`, JSON.stringify({ claim_id: req.params.id, link })]
     ).catch(() => undefined);
   }
-  res.json({ file: name, link, bytes: zip.length, delivered: 'link', target });
+  res.json({ file: pack.file, link, bytes: pack.zip.length, photos: pack.photos, photos_left_out: pack.skipped, delivered: 'link', target: pack.target });
 });
 
 router.get('/claims/:id/report', async (req: AuthRequest, res: Response) => {
-  const claim = await query(
-    `SELECT c.kind, c.report_name, ra.rma_number, ra.customer_name, ra.return_reason, ra.tracking_number
-     FROM return_claims c JOIN return_authorizations ra ON ra.id = c.return_authorization_id WHERE c.id = $1`,
-    [req.params.id]
-  );
-  const row = claim.rows[0];
-  if (!row) return res.status(404).json({ error: 'Claim not found' });
-  const kind = row.kind === 'carrier' ? 'carrier' : 'bisley';
-  const name = row.report_name || claimFileName(row.rma_number, kind);
-  const zip = zipStore('claim.txt', `Return ${row.rma_number}\n${row.return_reason || ''}\n${row.tracking_number || ''}`);
+  const pack = await buildClaimPack(req.params.id);
+  if (!pack) return res.status(404).json({ error: 'Claim not found' });
   res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
-  res.send(zip);
+  res.setHeader('Content-Disposition', `attachment; filename="${pack.file}"`);
+  res.send(pack.zip);
 });
 
 export default router;

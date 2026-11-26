@@ -4,6 +4,7 @@
 import { query } from '../db/index.js';
 import { outcomeChange } from './return-booking-rules.js';
 import { openReturnReplacement, releaseReturnReplacement } from './return-replacement.js';
+import { mirrorRequestToDesk, unmirrorRequest } from './return-desk-mirror.js';
 
 const RETURNABLE = ['DISPATCHED', 'PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED'];
 
@@ -123,6 +124,8 @@ export async function requestReturns(pickListId: string, skus: string[] | null, 
        WHERE return_requests.status = 'requested'`,
       [pickListId, sku, actor.slice(0, 255), choice]
     );
+    // Show it on the Returns screen as well. A failure here must not stop the request.
+    await mirrorRequestToDesk(pickListId, sku).catch((error) => console.error('Return not copied to the Returns screen:', error instanceof Error ? error.message : error));
     if (change.createOrder) await openReturnReplacement(pickListId, sku);
     if (change.releaseOrder) await releaseReturnReplacement(pickListId, sku);
   }
@@ -166,6 +169,9 @@ export async function cancelReturnRequests(pickListId: string, skus: string[]) {
     [pickListId, wanted]
   );
   for (const row of replacing.rows) await releaseReturnReplacement(pickListId, row.sku);
+  for (const sku of wanted) {
+    await unmirrorRequest(pickListId, sku).catch((error) => console.error('Return not taken off the Returns screen:', error instanceof Error ? error.message : error));
+  }
   return listReturnRequests(pickListId);
 }
 
@@ -180,6 +186,8 @@ export async function markReturnRequestsBooked(pickListId: string, sku: string, 
       WHERE pick_list_id = $1 AND sku = $2 AND status = 'requested'`,
     [pickListId, sku, bookingId, choice]
   );
+  // A collection booked straight to the courier has no request behind it. It still belongs on the Returns screen.
+  await mirrorRequestToDesk(pickListId, sku).catch((error) => console.error('Return not copied to the Returns screen:', error instanceof Error ? error.message : error));
 }
 
 const PHOTO_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);

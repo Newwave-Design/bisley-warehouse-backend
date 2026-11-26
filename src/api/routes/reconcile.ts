@@ -69,7 +69,7 @@ router.get('/shelf', authMiddleware, async (req: AuthRequest, res: Response) => 
   }
 });
 
-router.post('/move', authMiddleware, requirePermission('manage_inventory'), async (req: AuthRequest, res: Response) => {
+router.post('/move', authMiddleware, requirePermission('manage_orders'), async (req: AuthRequest, res: Response) => {
   try {
     const locationId = req.body?.location_id ? String(req.body.location_id) : null;
     if (locationId && !UUID.test(locationId)) return res.status(400).json({ error: 'Bad bay id' });
@@ -86,7 +86,7 @@ router.post('/move', authMiddleware, requirePermission('manage_inventory'), asyn
   }
 });
 
-router.post('/undo/:id', authMiddleware, requirePermission('manage_inventory'), async (req: AuthRequest, res: Response) => {
+router.post('/undo/:id', authMiddleware, requirePermission('manage_orders'), async (req: AuthRequest, res: Response) => {
   try {
     if (!UUID.test(req.params.id)) return res.status(400).json({ error: 'Bad id' });
     const out = await undoReconciliation(req.params.id, toUuidOrNull(req.user?.id), req.user?.email ?? null);
@@ -128,7 +128,7 @@ function requirePermissionWhen(when: (req: AuthRequest) => boolean, key: string)
   return (req: AuthRequest, res: Response, next: express.NextFunction) => (when(req) ? check(req, res, next) : next());
 }
 
-router.post('/remap', authMiddleware, requirePermissionWhen((req) => Number(req.body?.move_quantity) > 0, 'manage_inventory'), async (req: AuthRequest, res: Response) => {
+router.post('/remap', authMiddleware, requirePermissionWhen((req) => Number(req.body?.move_quantity) > 0, 'manage_orders'), async (req: AuthRequest, res: Response) => {
   try {
     const moveQuantity = Math.max(0, Math.trunc(Number(req.body?.move_quantity) || 0));
     const out = await remapBarcode({

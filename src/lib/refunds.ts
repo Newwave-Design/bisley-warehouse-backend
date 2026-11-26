@@ -6,6 +6,7 @@
 import { query } from '../db/index.js';
 import { medusaGet, medusaPost } from './medusa-client.js';
 import { rootMedusaOrderId } from './order-values.js';
+import { mirrorDamageRefund } from './return-desk-mirror.js';
 
 export const REFUND_REASONS = ['damaged', 'faulty', 'wrong_item', 'missing_part', 'change_of_mind', 'lost', 'late', 'goodwill', 'other'] as const;
 export type RefundReason = (typeof REFUND_REASONS)[number];
@@ -153,6 +154,8 @@ export async function issueRefund(input: {
       throw new RefundError(502, `The shop did not refund it: ${message}`);
     }
     const done = await query(`UPDATE order_refunds SET status = 'issued', issued_at = NOW() WHERE id = $1 RETURNING *`, [row.id]);
+    // A part refund for damage, with no return behind it, goes on the Returns screen so it can be decided there. It must never undo a paid refund.
+    await mirrorDamageRefund(done.rows[0]).catch((error) => console.error('Damage refund not copied to the Returns screen:', error instanceof Error ? error.message : error));
     return { refund: done.rows[0] as RefundRow, position: await refundPosition(orderId).catch(() => position), repeated: false };
   });
 }
