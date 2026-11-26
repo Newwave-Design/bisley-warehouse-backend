@@ -7,6 +7,7 @@
 import express, { Response } from 'express';
 import { query, getPool } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
+import { getEffectivePermission } from '../../lib/permissions.js';
 import { issueRefund, RefundError } from '../../lib/refunds.js';
 import { isStaging } from '../../lib/staging.js';
 import { toUuidOrNull } from './mobile.js';
@@ -26,8 +27,14 @@ router.use(authMiddleware);
 // (every warehouse user has it). Deciding and refunding are still admin only, checked in the route.
 router.use((req: AuthRequest, res: Response, next) => (req.method === 'GET' || req.method === 'HEAD' ? next() : requirePermission('manage_orders')(req, res, next)));
 
-function admin(req: AuthRequest) {
-  return String(req.user?.role || '').toUpperCase() === 'ADMIN' || String(req.user?.role || '').toUpperCase() === 'MANAGER';
+/**
+ * An admin for returns: the older ADMIN or MANAGER login role, or the system_admin permission from the user's group
+ * (how the Admin group is set up now), the same as the rest of the warehouse.
+ */
+async function admin(req: AuthRequest): Promise<boolean> {
+  const role = String(req.user?.role || '').toUpperCase();
+  if (role === 'ADMIN' || role === 'MANAGER') return true;
+  return getEffectivePermission(req.user?.id, 'system_admin').catch(() => false);
 }
 
 router.get('/search', async (req: AuthRequest, res: Response) => {
@@ -357,7 +364,7 @@ async function decideLine(client: import('pg').PoolClient, ra: { id: string }, i
 }
 
 router.post('/:id/decide', async (req: AuthRequest, res: Response) => {
-  if (!admin(req)) return res.status(403).json({ error: 'Admin approves a write-off, claim, or refund' });
+  if (!(await admin(req))) return res.status(403).json({ error: 'Admin approves a write-off, claim, or refund' });
   const decision = String(req.body?.decision || '');
   if (!(ITEM_DECISIONS as readonly string[]).includes(decision)) {
     return res.status(400).json({ error: 'Choose write-off, a Bisley claim, a carrier claim, spare parts, or keep as a second' });
@@ -431,7 +438,7 @@ router.get('/held', async (_req: AuthRequest, res: Response) => {
 
 /** A held spare or second leaves the list when it is used, sold or scrapped. Admin only, once, and the reason is kept. */
 router.post('/held/:id/release', async (req: AuthRequest, res: Response) => {
-  if (!admin(req)) return res.status(403).json({ error: 'Admin releases held stock' });
+  if (!(await admin(req))) return res.status(403).json({ error: 'Admin releases held stock' });
   const reason = String(req.body?.reason || '');
   if (!['used', 'sold', 'scrapped'].includes(reason)) return res.status(400).json({ error: 'Say whether it was used, sold or scrapped' });
   const done = await query(
@@ -463,7 +470,7 @@ router.delete('/:id/items/:itemId', async (req: AuthRequest, res: Response) => {
 });
 
 router.post('/:id/refund', async (req: AuthRequest, res: Response) => {
-  if (!admin(req)) return res.status(403).json({ error: 'Admin approves a refund' });
+  if (!(await admin(req))) return res.status(403).json({ error: 'Admin approves a refund' });
   const current = await query(`SELECT * FROM return_authorizations WHERE id = $1`, [req.params.id]);
   const row = current.rows[0];
   if (!row) return res.status(404).json({ error: 'Return not found' });
@@ -502,7 +509,7 @@ router.post('/:id/refund', async (req: AuthRequest, res: Response) => {
 
 /** Staff set who is at fault. Admin only, because it decides who the business claims against. */
 router.post('/:id/fault', async (req: AuthRequest, res: Response) => {
-  if (!admin(req)) return res.status(403).json({ error: 'An admin sets who is at fault' });
+  if (!(await admin(req))) return res.status(403).json({ error: 'An admin sets who is at fault' });
   const fault = String(req.body?.fault || '');
   if (!isFault(fault)) return res.status(400).json({ error: 'Choose courier, manufacturing, packing, customer or unknown' });
   const note = String(req.body?.note || '').trim().slice(0, 1000) || null;
@@ -525,7 +532,7 @@ async function casePhotoKinds(returnId: string, pickListId: string | null): Prom
 
 /** Raise a claim against the courier or Bisley at any stage. The fault must be set and match, and the usual photo must be there unless a reason is given. */
 router.post('/:id/claims', async (req: AuthRequest, res: Response) => {
-  if (!admin(req)) return res.status(403).json({ error: 'An admin raises a claim' });
+  if (!(await admin(req))) return res.status(403).json({ error: 'An admin raises a claim' });
   const kind = String(req.body?.kind || '');
   const found = await query(`SELECT id, fault, desk_status, pick_list_id FROM return_authorizations WHERE id = $1`, [req.params.id]);
   const ra = found.rows[0];
@@ -550,7 +557,7 @@ router.post('/:id/claims', async (req: AuthRequest, res: Response) => {
 
 /** Move a claim on: sent, accepted, rejected, paid or withdrawn. */
 router.post('/claims/:id/status', async (req: AuthRequest, res: Response) => {
-  if (!admin(req)) return res.status(403).json({ error: 'An admin updates a claim' });
+  if (!(await admin(req))) return res.status(403).json({ error: 'An admin updates a claim' });
   const status = String(req.body?.status || '');
   if (!isClaimStatus(status)) return res.status(400).json({ error: 'Choose open, sent, accepted, rejected, paid or withdrawn' });
   const note = String(req.body?.note || '').trim().slice(0, 500);
