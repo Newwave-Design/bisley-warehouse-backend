@@ -695,6 +695,14 @@ router.post('/reconcile/:id/resolve', authMiddleware, async (req: AuthRequest, r
         `UPDATE stock_in_reconcile SET status = 'DONE', resolved_sku = $2, resolved_by = $3, resolved_at = NOW() WHERE id = $1`,
         [row.id, finalSku, by],
       );
+      // The scans this line came from are explained now, so the failed-scan list stops showing them as "Not matched".
+      // Only this session's scans of this code, in the same transaction as the stock, so it can never be marked and not done.
+      await client.query(
+        `UPDATE failed_scans SET resolved_at = NOW(), resolution = $3, resolved_sku = $2
+          WHERE source = 'STOCK_IN' AND upper(code) = upper($1) AND resolved_at IS NULL
+            AND ($4::text IS NULL OR session_id = $4::text)`,
+        [row.code, finalSku, finalSku ? 'ASSIGNED' : 'DISCARDED', row.session_id ? String(row.session_id) : null],
+      );
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);
