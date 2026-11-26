@@ -115,7 +115,11 @@ export async function requestReturns(pickListId: string, skus: string[] | null, 
       : current.rows[0] || null;
     const change = outcomeChange(existing, choice);
     if (!change.ok) throw new ReturnRequestError(change.error);
-    if (booked.rows[0]) continue;
+    if (booked.rows[0]) {
+      // Already booked with the courier, so there is nothing to queue. The desk's reason, note and enquiry still go onto the Returns screen.
+      await mirrorRequestToDesk(pickListId, sku, detail).catch((error) => console.error('Return not copied to the Returns screen:', error instanceof Error ? error.message : error));
+      continue;
+    }
     await query(
       `INSERT INTO return_requests (pick_list_id, sku, created_by, outcome)
        VALUES ($1, $2, $3, $4)
@@ -222,6 +226,36 @@ export async function addReturnRequestImage(pickListId: string, sku: string, byt
     [request.id, type, bytes, actor.slice(0, 255)]
   );
   return listReturnRequests(pickListId);
+}
+
+/**
+ * A photo from the customer desk goes onto the order's open return or damage case, whichever the order has.
+ * It carries the desk's picture id, so sending it twice attaches it once. An order with no return or damage case has nowhere to put it.
+ */
+export async function addDeskPhoto(pickListId: string, bytes: Buffer, contentType: string, sourceKey: string, actor: string): Promise<{ attached: boolean; rma: string }> {
+  const type = contentType.toLowerCase().split(';')[0].trim();
+  if (!PHOTO_TYPES.has(type) || !looksLikeImage(bytes, type)) throw new ReturnRequestError('Use a JPEG, PNG, WebP or GIF photo.');
+  if (bytes.length > 8 * 1024 * 1024) throw new ReturnRequestError('That photo must be under 8 MB.');
+  const key = sourceKey.trim().slice(0, 80);
+  if (!key) throw new ReturnRequestError('Send the desk picture id so the photo is only attached once.');
+  const found = await query(
+    `SELECT id, rma_number FROM return_authorizations
+      WHERE pick_list_id = $1
+      ORDER BY (COALESCE(desk_status, 'due_back') <> 'closed') DESC, created_at DESC LIMIT 1`,
+    [pickListId]
+  );
+  const ra = found.rows[0];
+  if (!ra) throw new ReturnRequestError('This order has no return or damage case to attach a photo to.', 404);
+  const count = await query(`SELECT COUNT(*)::int AS n FROM return_desk_photos WHERE return_authorization_id = $1`, [ra.id]);
+  if (Number(count.rows[0]?.n) >= 12) throw new ReturnRequestError('This case already has 12 photos.');
+  const saved = await query(
+    `INSERT INTO return_desk_photos (return_authorization_id, content_type, image, created_by, source_key)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (return_authorization_id, source_key) WHERE source_key IS NOT NULL DO NOTHING
+     RETURNING id`,
+    [ra.id, type, bytes, actor.slice(0, 255), key]
+  );
+  return { attached: !!saved.rows[0], rma: ra.rma_number };
 }
 
 export async function returnRequestImage(id: string) {

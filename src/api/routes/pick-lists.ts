@@ -33,7 +33,7 @@ import { expandKitPicksByList } from '../../lib/pick-list-kits.js';
 import { confirmPartFulfilment, inspectPartFulfilment, PartFulfilError } from '../../lib/part-fulfilment.js';
 import { openPartsSend, PartsSendError } from '../../lib/parts-send.js';
 import { stockReservations, takeReservedItem } from '../../lib/stock-reservations.js';
-import { addReturnRequestImage, cancelReturnRequests, deleteReturnRequestImage, listReturnRequests, requestReturns, returnRequestImage, ReturnRequestError } from '../../lib/return-requests.js';
+import { addDeskPhoto, addReturnRequestImage, cancelReturnRequests, deleteReturnRequestImage, listReturnRequests, requestReturns, returnRequestImage, ReturnRequestError } from '../../lib/return-requests.js';
 import { isWorkingIsoDay } from '../../lib/working-days.js';
 import { loadHoldups } from '../../lib/order-holdup.js';
 import { loadCarrierStatus, loadReturnCollections } from '../../lib/carrier-status.js';
@@ -1269,6 +1269,31 @@ router.post(
     } catch (error) {
       if (error instanceof ReturnRequestError) return res.status(error.status).json({ error: error.message });
       console.error('Adding a return photo failed', error instanceof Error ? error.message : error);
+      return res.status(500).json({ error: 'Could not add that photo.' });
+    }
+  },
+);
+
+/** POST /api/pick-lists/:pickListId/return-photos — a photo from the customer desk for this order's return or damage case. Header X-Photo-Key is the desk's picture id. */
+router.post(
+  '/:pickListId/return-photos',
+  authMiddleware,
+  express.raw({ type: ['image/jpeg', 'image/png', 'image/webp', 'image/gif'], limit: '8mb' }),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const bytes = req.body as Buffer;
+      if (!Buffer.isBuffer(bytes) || !bytes.length) return res.status(400).json({ error: 'Choose a photo to upload.' });
+      const done = await addDeskPhoto(
+        req.params.pickListId,
+        bytes,
+        String(req.headers['content-type'] || ''),
+        String(req.headers['x-photo-key'] || ''),
+        String(req.headers['x-actor'] || '').trim() || req.user?.email || '',
+      );
+      return res.status(done.attached ? 201 : 200).json(done);
+    } catch (error) {
+      if (error instanceof ReturnRequestError) return res.status(error.status).json({ error: error.message });
+      console.error('Adding a desk photo failed', error instanceof Error ? error.message : error);
       return res.status(500).json({ error: 'Could not add that photo.' });
     }
   },

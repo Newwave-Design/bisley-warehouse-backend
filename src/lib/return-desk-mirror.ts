@@ -52,6 +52,8 @@ const DESK_REASON_LABEL: Record<string, string> = {
   change_of_mind: 'Change of mind',
   lost: 'Courier problem',
   late: 'Courier problem',
+  goodwill: 'Goodwill',
+  other: 'Other',
 };
 
 export function deskReasonLabel(reason?: string | null): string | null {

@@ -1687,6 +1687,10 @@ CREATE TABLE IF NOT EXISTS return_desk_photos (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- A photo sent by the customer desk carries the desk's own picture id, so sending it twice attaches it once
+ALTER TABLE return_desk_photos ADD COLUMN IF NOT EXISTS source_key VARCHAR(80);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_return_desk_photos_source ON return_desk_photos (return_authorization_id, source_key) WHERE source_key IS NOT NULL;
+
 -- A week (Friday to Thursday) becomes fixed once locked: its statement lines are copied here and never change
 CREATE TABLE IF NOT EXISTS settlement_weeks (
   week_start DATE PRIMARY KEY,
