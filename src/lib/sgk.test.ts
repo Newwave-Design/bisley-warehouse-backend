@@ -79,3 +79,14 @@ test('a row weighs every carton on it together', () => {
   const rows = sgkRows({ pickListNumber: 'PL-20261001-0161', orderDate: null, customerName: 'A', email: '', phone: '', shippingAddress: {}, driverNotes: '', pieces: [{ itemSku: 'B', title: 'Leg 1', weightKg: '6' }, { itemSku: 'B', title: 'Leg 2', weightKg: '6' }] })
   assert.equal(rows[0].Item_Wgt, '12')
 })
+
+test('sgkItems puts one type of unit on each row, whatever the colour', () => {
+  const items = sgkItems([
+    { itemSku: 'BA3-av1', title: 'BA3 Black' },
+    { itemSku: 'MDHLEG-ba5', title: 'Pair of legs' },
+    { itemSku: 'BA3-bn6', title: 'BA3 Blue' },
+  ])
+  assert.equal(items.length, 2)
+  assert.equal(items[0].qty, 2)
+  assert.equal(items[1].code, 'MDHLEG-ba5')
+})

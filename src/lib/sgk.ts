@@ -99,12 +99,19 @@ export function formatKg(value: number): string {
  * One row per SKU. The weight is the whole row's: every carton on it added together, so four cartons of 5 kg are 20.
  * A row where any carton has no weight has none, rather than a total that is too low.
  */
+export function unitType(sku: string): string {
+  const code = text(sku).toUpperCase();
+  const dash = code.lastIndexOf('-');
+  return dash > 0 ? code.slice(0, dash) : code;
+}
+
 export function sgkItems(pieces: SgkPiece[]): { code: string; desc: string; qty: number; weightKg: string }[] {
   const rows = new Map<string, { code: string; titles: string[]; qty: number; kg: number; unknown: boolean }>();
   for (const piece of pieces) {
     const code = text(piece.itemSku) || text(piece.sku) || text(piece.reference);
     const title = text(piece.title);
-    const key = code || title;
+    // A row is one type of unit, whatever the colour: BA3-av1 and BA3-bn6 share a row (the SKU before the colour code).
+    const key = code ? unitType(code) : title;
     if (!key) continue;
     const kg = Number(text(piece.weightKg));
     const known = Number.isFinite(kg) && kg > 0;
