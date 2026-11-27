@@ -84,6 +84,22 @@ test('dispatch notes confirm the oldest open lines for their SKU, less what is a
   assert.equal(confirmed.get('x'), undefined);
 });
 
+test('dispatch notes confirm trays in single trays, and match Bisley slashes to warehouse dashes', () => {
+  const notes = [{ id: 'n', arrives_on: '2026-12-02', title: '507601', reference: null, lines: [
+    { sku: '225P5-000-001', quantity: 1, received: 0 },
+    { sku: 'PIT522P1-000', quantity: 4, received: 0 },
+    { sku: 'YECB0819-4S-ab9', quantity: 2, received: 0 },
+  ] }];
+  const confirmed = confirmOpenLines([
+    { id: 'tray', sku: '225P5-000', open: 5 },
+    { id: 'single', sku: 'PIT522P5-000', open: 4 },
+    { id: 'cupboard', sku: 'YECB0819/4S-ab9', open: 2 },
+  ], notes);
+  assert.equal(confirmed.get('tray')?.[0].units, 5);
+  assert.equal(confirmed.get('single')?.[0].units, 4);
+  assert.equal(confirmed.get('cupboard')?.[0].units, 2);
+});
+
 test('tray stock-ins are counted in single trays under the 5-pack code', () => {
   assert.deepEqual(receiptInTrays({ sku: '225P5-000', quantity: 2, at: 1 }), { sku: '225P5-000', quantity: 10, at: 1 });
   assert.deepEqual(receiptInTrays({ sku: 'PIT522P1-000', quantity: 2, at: 1 }), { sku: 'PIT522P5-000', quantity: 2, at: 1 });

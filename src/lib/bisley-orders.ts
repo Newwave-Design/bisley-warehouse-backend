@@ -197,7 +197,8 @@ export function arrivalWindow(sentAt: number, sku: string, bookedFor: string | n
 export interface DispatchNoteRef { id: string; arrives_on: string; title: string; reference: string | null; lines: { sku: string; quantity: number; received: number }[] }
 export interface ConfirmedPart { note_id: string; arrives_on: string; title: string; reference: string | null; units: number }
 
-const noteSkuKey = (sku: string) => String(sku || '').trim().toUpperCase().replace(/-001$/, '');
+/** Bisley writes a trailing -001 and slashes (YECB0810/1S); the warehouse codes use neither. */
+const noteSkuKey = (sku: string) => String(sku || '').trim().toUpperCase().replace(/-001$/, '').replace(/\//g, '-');
 
 /**
  * Confirmed deliveries for open order lines. Each open dispatch note's units not yet scanned in are put
@@ -207,11 +208,14 @@ export function confirmOpenLines(open: { id: string; sku: string; open: number }
   const out = new Map<string, ConfirmedPart[]>();
   const left = new Map(open.map((line) => [line.id, line.open]));
   for (const note of [...notes].sort((a, b) => a.arrives_on.localeCompare(b.arrives_on))) {
-    for (const noteLine of note.lines) {
-      let units = Math.max(0, noteLine.quantity - noteLine.received);
+    for (const raw of note.lines) {
+      // Notes count trays as check-in does (5-packs, or singles under P1); order lines count single trays
+      const key = noteSkuKey(raw.sku);
+      const asTrays = receiptInTrays({ sku: key, quantity: Math.max(0, raw.quantity - raw.received), at: 0 });
+      let units = asTrays.quantity;
       for (const line of open) {
         if (units <= 0) break;
-        if (noteSkuKey(line.sku) !== noteSkuKey(noteLine.sku)) continue;
+        if (noteSkuKey(line.sku) !== noteSkuKey(asTrays.sku)) continue;
         const take = Math.min(units, left.get(line.id) ?? 0);
         if (take <= 0) continue;
         left.set(line.id, (left.get(line.id) ?? 0) - take);
