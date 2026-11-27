@@ -35,6 +35,20 @@ function refFor(sent: string, cutOff: string | null): string {
   return `Weekly reorder sent ${sent.slice(0, 10)}${cutOff ? ` (${cutOff.replace(/\s+/g, ' ').slice(0, 120)})` : ''}`;
 }
 
+/**
+ * A workbook sent within five minutes of one already recorded is the same email: reuse that record's ref so
+ * recording it again (from the file, or by the bot) replaces its lines instead of counting the order twice.
+ */
+async function existingRefNear(sent: string): Promise<string | null> {
+  await ensureBisleyOrders();
+  const found = await query(
+    `SELECT ref FROM bisley_order_sheets WHERE sent_at BETWEEN $1::timestamptz - INTERVAL '5 minutes' AND $1::timestamptz + INTERVAL '5 minutes'
+      ORDER BY ABS(EXTRACT(EPOCH FROM (sent_at - $1::timestamptz))) LIMIT 1`,
+    [sent],
+  );
+  return found.rows[0]?.ref ?? null;
+}
+
 function cleanLines(raw: unknown): SheetLine[] | string {
   if (!Array.isArray(raw) || !raw.length) return 'Send at least one line';
   if (raw.length > 2000) return 'Too many lines';
@@ -72,7 +86,7 @@ router.post('/upload', express.raw({ type: () => true, limit: '10mb' }), async (
       return res.status(400).json({ error: 'That file could not be read as a spreadsheet' });
     }
     if (!parsed.lines.length) return res.status(400).json({ error: 'No order or bonded lines found. The sheets need a SKU column and a Reorder qty or Qty sold column.' });
-    const ref = header(req, 'x-ref') || refFor(sent, parsed.cut_off);
+    const ref = header(req, 'x-ref') || (await existingRefNear(sent)) || refFor(sent, parsed.cut_off);
     const saved = await saveSheet({
       ref,
       sent_at: sent,
@@ -98,7 +112,7 @@ router.post('/sheets', async (req: AuthRequest, res: Response) => {
     const booked = req.body?.booked_for ? String(req.body.booked_for) : null;
     if (booked && !DATE.test(booked)) return res.status(400).json({ error: 'booked_for must be YYYY-MM-DD' });
     const cutOff = req.body?.cut_off ? String(req.body.cut_off).slice(0, 200) : null;
-    const ref = String(req.body?.ref || '').trim().slice(0, 200) || refFor(sent, cutOff);
+    const ref = String(req.body?.ref || '').trim().slice(0, 200) || (await existingRefNear(sent)) || refFor(sent, cutOff);
     const saved = await saveSheet({
       ref,
       sent_at: sent,
