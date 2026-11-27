@@ -16,6 +16,8 @@ export interface BoxDemand {
   started: boolean;
   /** Force-added: served before every other order, started or not. */
   forced?: boolean;
+  /** Every item on the order has its stock held, so a box lets it be picked now. */
+  stockReady?: boolean;
 }
 
 export interface PlannedBoxHold {
@@ -26,7 +28,10 @@ export interface PlannedBoxHold {
 
 const STARTED = new Set(['IN_PROGRESS', 'PICKED', 'PACKING', 'PACKED', 'LABEL_PRINTED']);
 
-/** Oldest order takes the boxes that are on the shelf. A started order is served before one still waiting. */
+/**
+ * Forced orders first, then orders being picked, then orders whose stock is held (they can go now), then the rest.
+ * Within each, the oldest order takes the boxes that are on the shelf.
+ */
 export function planBoxHolds(lines: BoxDemand[], onHand: Map<string, number>): PlannedBoxHold[] {
   const free = new Map<string, number>();
   for (const [id, qty] of onHand) free.set(id, Math.max(0, qty));
@@ -44,14 +49,19 @@ export function planBoxHolds(lines: BoxDemand[], onHand: Map<string, number>): P
     return holds;
   };
 
+  // A box goes first to an order that can be picked now (its stock is held), then by age; a box on an order still
+  // waiting for stock would sit on the shelf while a ready order waits for it
+  const waiting = lines.filter((line) => !line.forced && !line.started);
   return [
     ...grant(lines.filter((line) => line.forced)),
     ...grant(lines.filter((line) => !line.forced && line.started)),
-    ...grant(lines.filter((line) => !line.forced && !line.started)),
+    ...grant(waiting.filter((line) => line.stockReady)),
+    ...grant(waiting.filter((line) => !line.stockReady)),
   ];
 }
 
-const DEMAND = `
+/** Every open paid order line as the component SKUs and units it needs (kits and plinths resolved). */
+const DEMAND_PARTS = `
   WITH units AS (
     SELECT pli.id AS item_id, pl.pick_list_number, pli.line_number, pl.status, (pli.forced_at IS NOT NULL) AS forced,
            CASE WHEN COALESCE(pl.is_return, false) THEN pl.created_at
@@ -112,6 +122,9 @@ const DEMAND = `
         AND jsonb_array_length(u.kit_components) > 0
       )
   )
+`;
+
+const DEMAND = `${DEMAND_PARTS}
   SELECT p.item_id, p.pick_list_number, p.line_number, p.status, p.ordered_at, bool_or(p.forced) AS forced,
          box.packaging_item_id, ROUND(SUM(p.qty * box.per))::int AS qty
   FROM parts p
@@ -132,6 +145,20 @@ const DEMAND = `
   GROUP BY p.item_id, p.pick_list_number, p.line_number, p.status, p.ordered_at, box.packaging_item_id
 `;
 
+/**
+ * Orders whose every part is covered by the stock holds (computed just before the box holds). A tray held as a
+ * pack rather than singles can read as not covered; that order then simply waits its turn by age, as before.
+ */
+const STOCK_READY = `${DEMAND_PARTS}
+  SELECT p.pick_list_number, bool_and(COALESCE(h.qty, 0) >= p.qty) AS ready
+  FROM parts p
+  LEFT JOIN (
+    SELECT pick_list_item_id, upper(sku) AS sku, SUM(qty) AS qty FROM order_stock_holds GROUP BY 1, 2
+  ) h ON h.pick_list_item_id = p.item_id AND h.sku = p.sku
+  WHERE COALESCE(p.sku, '') <> '' AND p.sku NOT LIKE '%SAMPLE%'
+  GROUP BY p.pick_list_number
+`;
+
 async function ensureBoxHoldTable(): Promise<void> {
   await query(`
     CREATE TABLE IF NOT EXISTS order_box_holds (
@@ -147,7 +174,14 @@ async function ensureBoxHoldTable(): Promise<void> {
 export async function computeBoxHolds(): Promise<void> {
   await ensureForcedColumns();
   await ensureBoxHoldTable();
-  const demand = await query(DEMAND);
+  const [demand, readiness] = await Promise.all([
+    query(DEMAND),
+    query(STOCK_READY).catch((err) => {
+      console.error('[box-holds] stock readiness not read; boxes go oldest first', err instanceof Error ? err.message : err);
+      return { rows: [] as { pick_list_number: string; ready: boolean }[] };
+    }),
+  ]);
+  const ready = new Set(readiness.rows.filter((row: { ready: boolean }) => row.ready).map((row: { pick_list_number: string }) => row.pick_list_number));
   const lines: BoxDemand[] = demand.rows
     .filter((row: { qty?: number }) => Number(row.qty) > 0)
     .map((row: any) => ({
@@ -159,6 +193,7 @@ export async function computeBoxHolds(): Promise<void> {
       required: Number(row.qty) || 0,
       started: STARTED.has(String(row.status || '')),
       forced: Boolean(row.forced),
+      stockReady: ready.has(row.pick_list_number || ''),
     }));
 
   const boxIds = [...new Set(lines.map((line) => line.boxId))];

@@ -66,3 +66,29 @@ test('a forced line gets the box before a started order', () => {
   ], new Map([['box', 1]]))
   assert.deepEqual(holds, [{ itemId: 'forced', boxId: 'box', qty: 1 }])
 })
+
+test('a box goes to an order whose stock is held before an older order still waiting for stock', () => {
+  const holds = planBoxHolds(
+    [
+      line({ itemId: 'older-no-stock', boxId: 'box-4', orderedAt: 1, stockReady: false }),
+      line({ itemId: 'newer-ready', boxId: 'box-4', orderedAt: 2, stockReady: true }),
+      line({ itemId: 'newest-ready', boxId: 'box-4', orderedAt: 3, stockReady: true }),
+    ],
+    new Map([['box-4', 2]]),
+  )
+  const qty = (itemId: string) => holds.find((hold) => hold.itemId === itemId)?.qty ?? 0
+  assert.equal(qty('newer-ready'), 1)
+  assert.equal(qty('newest-ready'), 1)
+  assert.equal(qty('older-no-stock'), 0)
+})
+
+test('an order being picked still keeps its box ahead of a ready order', () => {
+  const holds = planBoxHolds(
+    [
+      line({ itemId: 'ready', boxId: 'box-4', orderedAt: 1, stockReady: true }),
+      line({ itemId: 'picking', boxId: 'box-4', orderedAt: 2, started: true }),
+    ],
+    new Map([['box-4', 1]]),
+  )
+  assert.equal(holds.find((hold) => hold.itemId === 'picking')?.qty, 1)
+})
