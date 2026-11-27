@@ -12,7 +12,8 @@ import { actorName, shipBookedPickList } from '../../lib/pick-list-events.js';
 import { fulfillPickListInMedusa } from '../../lib/medusa-fulfillment.js';
 import { takeStockForBookedCollection } from '../../lib/collection-stock.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
-import { sgkCartonLabels } from '../../lib/sgk-label.js';
+import { packagingText, sgkCartonLabels, type CartonPackaging } from '../../lib/sgk-label.js';
+import { attachPackaging } from '../../lib/pick-list-packaging.js';
 import { SGK_COLUMNS, sgkCsv, sgkItems, sgkRows, shopOrderNumber, sgkOrderNo, type SgkPiece, type SgkRow } from '../../lib/sgk.js';
 
 const router = express.Router();
@@ -198,6 +199,10 @@ export async function sgkLabelsForBooking(bookingId: string): Promise<{ tracking
   const address = group.address as Record<string, string>;
   const person = `${address.first_name || ''} ${address.last_name || ''}`.trim() || group.customerName;
   const lines = [address.company && address.company !== person ? address.company : '', address.address_1, address.address_2, [address.city, address.province].filter(Boolean).join(', ')].filter(Boolean);
+  // The box or sleeve each carton's product is packed in, from the packaging records
+  const skus = group.pieces.map((piece) => String(piece.itemSku || piece.sku || '').trim());
+  const packed = (await attachPackaging([skus.filter(Boolean).map((sku) => ({ sku, quantity_required: 1 }))]).catch(() => [[]]))[0] as { sku: string; packaging?: CartonPackaging }[];
+  const packBySku = new Map(packed.map((row) => [row.sku.toUpperCase(), packagingText(row.packaging)]));
   const jobs = sgkCartonLabels({
     orderNo: group.orderNo,
     shopNumber: group.orderNumber,
@@ -205,7 +210,7 @@ export async function sgkLabelsForBooking(bookingId: string): Promise<{ tracking
     lines,
     postcode: group.postcode,
     driverNotes: group.driverNotes,
-    cartons: group.pieces.map((piece) => ({ title: String(piece.title || ''), sku: String(piece.itemSku || piece.sku || '') })),
+    cartons: group.pieces.map((piece, index) => ({ title: String(piece.title || ''), sku: skus[index], pack: packBySku.get(skus[index].toUpperCase()) || '' })),
   });
   return jobs.map((job, index) => ({ trackingNumber: `${group.orderNo}-${index + 1}`, format: 'ZPL', content: Buffer.from(job, 'latin1').toString('base64') }));
 }

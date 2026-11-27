@@ -16,8 +16,38 @@ export interface SgkLabelInput {
   lines: string[];
   postcode: string;
   driverNotes?: string;
-  /** One entry per carton, in label order. */
-  cartons: { title: string; sku?: string }[];
+  /** One entry per carton, in label order. pack is the box or sleeve it goes in (see packagingText). */
+  cartons: { title: string; sku?: string; pack?: string }[];
+}
+
+/** What a product's packaging record says, as the packer reads it. Shape of pick-list-packaging's `packaging`. */
+export interface CartonPackaging {
+  method?: string | null;
+  items?: { code?: string | null; name?: string | null; item_type?: string | null; qty?: number | null }[];
+}
+
+const METHOD_WORDS: Record<string, string> = {
+  own_box: 'Own box',
+  pack_to_fit: 'Pack to fit',
+  pallet_wrap: 'Pallet wrap',
+};
+
+/**
+ * The box, or the sleeve and tray, a carton is packed in: "Box BOX-8", "Sleeve SL-29 + Tray TR-29", "Own box".
+ * Edge guards, tape and other consumables are left off. Empty when nothing is recorded.
+ */
+export function packagingText(packaging: CartonPackaging | null | undefined): string {
+  if (!packaging) return '';
+  const parts: string[] = [];
+  for (const type of ['box', 'sleeve', 'tray']) {
+    const codes = [...new Set((packaging.items || [])
+      .filter((item) => String(item.item_type || '').toLowerCase() === type)
+      .map((item) => String(item.code || item.name || '').trim())
+      .filter(Boolean))];
+    if (codes.length) parts.push(`${type[0].toUpperCase()}${type.slice(1)} ${codes.join(', ')}`);
+  }
+  if (parts.length) return parts.join(' + ');
+  return METHOD_WORDS[String(packaging.method || '')] || '';
 }
 
 function zpl(value: string): string {
@@ -61,11 +91,13 @@ export function sgkCartonLabel(input: SgkLabelInput, index: number): string {
   }
   cmds.push(`^FO30,${y + 6}^A0N,80,80^FD${clip(input.postcode, 10)}^FS`);
   const what = [carton.sku, carton.title].filter(Boolean).join('  ');
-  if (what) {
-    cmds.push('^FO20,1090^GB772,3,3^FS');
-    cmds.push(`^FO30,1102^A0N,34,34^FD${clip(what, 54)}^FS`);
+  if (what || carton.pack) {
+    cmds.push('^FO20,1040^GB772,3,3^FS');
+    if (what) cmds.push(`^FO30,1052^A0N,34,34^FD${clip(what, 54)}^FS`);
+    // The box or sleeve this carton goes in, bold, so the packer can check it at a glance
+    if (carton.pack) cmds.push(`^FO30,1094^A0N,44,44^FDPACK: ${clip(carton.pack, 36)}^FS`);
   }
-  if (input.driverNotes) cmds.push(`^FO30,1150^A0N,32,32^FDNOTE: ${clip(input.driverNotes, 48)}^FS`);
+  if (input.driverNotes) cmds.push(`^FO30,1152^A0N,32,32^FDNOTE: ${clip(input.driverNotes, 48)}^FS`);
   cmds.push('^XZ');
   return `${cmds.join('\n')}\n`;
 }
