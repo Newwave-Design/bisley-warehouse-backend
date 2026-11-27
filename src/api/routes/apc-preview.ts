@@ -23,6 +23,7 @@ import { isPaid } from '../../lib/payment-status.js';
 import { isWorkingDay, isWorkingIsoDay } from '../../lib/working-days.js';
 import { sgkOrderNo } from '../../lib/sgk.js';
 import { sgkLabelsForBooking } from './sgk.js';
+import { isWhiteGlove, WHITE_GLOVE_MESSAGE } from '../../lib/delivery-services.js';
 
 function randomBatch(): string {
   return Math.random().toString(16).slice(2, 10).padEnd(8, '0');
@@ -256,6 +257,9 @@ router.post('/quote', authMiddleware, async (req: AuthRequest, res: Response) =>
   const askedCourier = text(req.body?.courier).trim().toUpperCase();
   let courier: 'APC' | 'DX' | 'RM' | 'SGK' = askedCourier === 'DX' ? 'DX' : askedCourier === 'RM' ? 'RM' : askedCourier === 'SGK' ? 'SGK' : 'APC';
   if (returning && /^[0-9a-f-]{36}$/i.test(pickListId)) courier = await deliveredCourier(pickListId);
+  if (!returning && courier !== 'SGK' && /^[0-9a-f-]{36}$/i.test(pickListId) && (await isWhiteGlove(pickListId))) {
+    return res.status(409).json({ error: WHITE_GLOVE_MESSAGE });
+  }
   if (process.env.WAREHOUSE_ENV === 'staging' && courier !== 'DX') {
     return res.status(409).json({ error: 'Staging can book DX on the UAT service only.' });
   }
@@ -783,6 +787,9 @@ router.post('/book', authMiddleware, async (req: AuthRequest, res: Response) => 
   const askedCourier = text(req.body?.courier).trim().toUpperCase();
   let courier: 'APC' | 'DX' | 'RM' | 'SGK' = askedCourier === 'DX' ? 'DX' : askedCourier === 'RM' ? 'RM' : askedCourier === 'SGK' ? 'SGK' : 'APC';
   if (returning && /^[0-9a-f-]{36}$/i.test(pickListId)) courier = await deliveredCourier(pickListId);
+  if (!returning && courier !== 'SGK' && /^[0-9a-f-]{36}$/i.test(pickListId) && (await isWhiteGlove(pickListId))) {
+    return res.status(409).json({ error: WHITE_GLOVE_MESSAGE });
+  }
   if (process.env.WAREHOUSE_ENV === 'staging' && courier !== 'DX') {
     return res.status(409).json({ error: 'Staging can book DX on the UAT service only.' });
   }

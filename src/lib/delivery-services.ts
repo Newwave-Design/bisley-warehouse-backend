@@ -10,6 +10,7 @@ let ready: Promise<void> | null = null;
 export function ensureDeliveryServiceColumns(): Promise<void> {
   if (!ready) {
     ready = query(`ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS room_of_choice BOOLEAN NOT NULL DEFAULT false`)
+      .then(() => query(`ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS white_glove BOOLEAN NOT NULL DEFAULT false`))
       .then(() => undefined)
       .catch((error) => {
         ready = null;
@@ -18,6 +19,25 @@ export function ensureDeliveryServiceColumns(): Promise<void> {
   }
   return ready;
 }
+
+/** True when the order is tagged white glove, so it can only be booked through SGK. */
+export async function isWhiteGlove(pickListId: string): Promise<boolean> {
+  await ensureDeliveryServiceColumns();
+  const result = await query(`SELECT white_glove FROM pick_lists WHERE id = $1`, [pickListId]);
+  return Boolean(result.rows[0]?.white_glove);
+}
+
+/** Tags the order white glove or removes the tag. Null when the order does not exist. */
+export async function setWhiteGlove(pickListId: string, on: boolean): Promise<boolean | null> {
+  await ensureDeliveryServiceColumns();
+  const result = await query(
+    `UPDATE pick_lists SET white_glove = $2, updated_at = NOW() WHERE id = $1 RETURNING white_glove`,
+    [pickListId, on],
+  );
+  return result.rows[0] ? Boolean(result.rows[0].white_glove) : null;
+}
+
+export const WHITE_GLOVE_MESSAGE = 'This order is tagged white glove, so it can only be booked through SGK.';
 
 /** Turns the room of choice upgrade on or off. Null when the order does not exist. */
 export async function setRoomOfChoice(pickListId: string, on: boolean): Promise<boolean | null> {

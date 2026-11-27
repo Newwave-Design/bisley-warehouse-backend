@@ -1898,6 +1898,8 @@ ALTER TABLE checkin_sessions ADD COLUMN IF NOT EXISTS delivery_note_id UUID REFE
 
 -- Delivery upgraded from hallway to room of choice (set from the customer desk); SGK driver notes say so
 ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS room_of_choice BOOLEAN NOT NULL DEFAULT false;
+-- White glove delivery (set from the customer desk): the order can only be booked through SGK
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS white_glove BOOLEAN NOT NULL DEFAULT false;
 DROP INDEX IF EXISTS one_open_delivery_checkin;
 
 `;
