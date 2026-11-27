@@ -421,7 +421,8 @@ export async function bisleyOrdersOverview() {
     });
   }
   // Confirmed deliveries come only from open dispatch notes; the order dates above are estimates
-  const notes = (await listDeliveryNotes({ includeClosed: false })) as DispatchNoteRef[];
+  // Only deliveries still to come: a past note left open (not fully scanned or not closed off) has arrived, it is not a confirmation of more stock
+  const notes = ((await listDeliveryNotes({ includeClosed: false })) as DispatchNoteRef[]).filter((note) => note.arrives_on >= today);
   const oldestFirst = [...incoming].sort((a, b) => new Date(a.sent_at).getTime() - new Date(b.sent_at).getTime());
   const confirmedBy = confirmOpenLines(oldestFirst.map((row) => ({ id: row.line_id, sku: row.sku, open: row.open })), notes);
   const withConfirmed = incoming.map((row) => {
