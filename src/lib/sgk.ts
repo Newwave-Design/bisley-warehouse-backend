@@ -131,12 +131,26 @@ export function sgkItems(pieces: SgkPiece[]): { code: string; desc: string; qty:
 }
 
 /** Said to the SGK driver on every row, ahead of anything written for that order. */
-export const SGK_DRIVER_NOTES = 'Hallway delivery, room of choice, take packaging away, packaging inspection';
+export const SGK_DRIVER_NOTES = 'Hallway delivery';
 
-/** Driver notes for an order: the standard instruction, then the order's own note on one line. */
-export function sgkDriverNotes(own: unknown): string {
+/** Extra delivery services an order can be tagged with. None are tagged yet, so every order is a hallway delivery. */
+export interface SgkServices {
+  roomOfChoice?: boolean;
+  takePackagingAway?: boolean;
+  packagingInspection?: boolean;
+}
+
+/**
+ * Driver notes for an order: "Hallway delivery" by default, or room of choice when tagged, plus taking the
+ * packaging away and a packaging inspection when tagged; then the order's own note, on one line.
+ */
+export function sgkDriverNotes(own: unknown, services: SgkServices = {}): string {
+  const parts = [services.roomOfChoice ? 'Room of choice' : SGK_DRIVER_NOTES];
+  if (services.takePackagingAway) parts.push('take packaging away');
+  if (services.packagingInspection) parts.push('packaging inspection');
+  const standard = parts.join(', ');
   const note = text(own).replace(/\s*[\r\n]+\s*/g, ' ');
-  return note ? `${SGK_DRIVER_NOTES}. ${note}` : SGK_DRIVER_NOTES;
+  return note ? `${standard}. ${note}` : standard;
 }
 
 /** Order_Date is the day the list goes to SGK (the export day), not the day the customer ordered. */
