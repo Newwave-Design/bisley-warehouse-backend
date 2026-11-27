@@ -53,8 +53,8 @@ test('a workbook gives both sheets and the cut-off', () => {
   assert.deepEqual(parsed.lines.map((l) => [l.kind, l.sku, l.quantity]), [['order', 'FLDL04-cj4', 1], ['bonded', 'H296NL-ag8', 3]]);
 });
 
-test('receipts fill the oldest open line sent before the stock came in', () => {
-  const day = (d: number) => Date.UTC(2026, 10, d);
+test('receipts fill the oldest open line sent at least two weeks before the stock came in', () => {
+  const day = (d: number) => Date.UTC(2026, 9, d); // October; day 32 = 1 Nov
   const received = matchReceipts(
     [
       { id: 'a', sku: 'H296NL-bc6', quantity: 5, sent_at: day(9) },
@@ -62,9 +62,10 @@ test('receipts fill the oldest open line sent before the stock came in', () => {
       { id: 'c', sku: 'MDHP-bc6', quantity: 5, sent_at: day(17) },
     ],
     [
-      { sku: 'H296NL-bc6', quantity: 4, at: day(10) },
-      { sku: 'MDHP-bc6', quantity: 3, at: day(12) }, // before its sheet was sent: not this order
-      { sku: 'H296NL-bc6', quantity: 3, at: day(24) },
+      { sku: 'H296NL-bc6', quantity: 6, at: day(13) }, // 4 days after sheet a: other stock (bonded delivery), not this order
+      { sku: 'H296NL-bc6', quantity: 4, at: day(24) },
+      { sku: 'MDHP-bc6', quantity: 3, at: day(25) }, // 8 days after its sheet: too soon to be this order
+      { sku: 'H296NL-bc6', quantity: 3, at: day(48) },
     ],
   );
   assert.equal(received.get('a'), 5);

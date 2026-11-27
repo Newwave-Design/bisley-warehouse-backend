@@ -122,9 +122,16 @@ export interface OrderLineRef { id: string; sku: string; quantity: number; sent_
 export interface Receipt { sku: string; quantity: number; at: number }
 
 /**
+ * Bisley cannot turn an order round in under two weeks (the quickest seen, trays on 507216, took 18 days),
+ * so stock that comes in sooner after a sheet was sent belongs to something else, such as the bonded
+ * starting stock delivered in October, and is not counted against that sheet.
+ */
+export const MIN_LEAD_DAYS = 14;
+
+/**
  * Units received against each order line. Per SKU, each receipt fills the oldest open line that was sent
- * on or before the day it came in. A receipt that matches no open line is ignored (it was for an order
- * this record does not hold).
+ * at least MIN_LEAD_DAYS before it came in. A receipt that matches no open line is ignored (it was for an
+ * order this record does not hold).
  */
 export function matchReceipts(lines: OrderLineRef[], receipts: Receipt[]): Map<string, number> {
   const received = new Map<string, number>();
@@ -139,7 +146,7 @@ export function matchReceipts(lines: OrderLineRef[], receipts: Receipt[]): Map<s
     let left = receipt.quantity;
     for (const line of bySku.get(receipt.sku.toLowerCase()) ?? []) {
       if (left <= 0) break;
-      if (line.sent_at > receipt.at) break;
+      if (line.sent_at + MIN_LEAD_DAYS * DAY_MS > receipt.at) break;
       const open = line.quantity - (received.get(line.id) ?? 0);
       if (open <= 0) continue;
       const take = Math.min(open, left);
@@ -324,9 +331,11 @@ export async function bisleyOrdersOverview() {
   const first = sheets.length ? new Date(sheets[0].sent_at).getTime() : Date.now();
   const receiptsRes = orderLines.length
     ? await query(
-      `SELECT product_sku AS sku, quantity::int AS quantity, created_at FROM warehouse_movements
-        WHERE movement_type = 'RECEIVE' AND quantity > 0 AND created_at >= $1`,
-      [new Date(first - DAY_MS)],
+      // Bin-to-bin moves are logged as RECEIVE with a "Moved from" note; they are not deliveries
+      `SELECT product_sku AS sku, quantity::int AS quantity, COALESCE(movement_date, created_at) AS created_at FROM warehouse_movements
+        WHERE movement_type = 'RECEIVE' AND quantity > 0 AND COALESCE(movement_date, created_at) >= $1
+          AND COALESCE(notes, '') NOT ILIKE 'Moved from%'`,
+      [new Date(first + MIN_LEAD_DAYS * DAY_MS - DAY_MS)],
     )
     : { rows: [] };
   const received = matchReceipts(
