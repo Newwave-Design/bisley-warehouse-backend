@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import XLSX from 'xlsx';
-import { arrivalWindow, kindForSheet, matchReceipts, parseSheetRows, parseWorkbook, stillBonded, weekStarting } from './bisley-orders.ts';
+import { arrivalWindow, kindForSheet, matchReceipts, parseSheetRows, parseWorkbook, receiptInTrays, stillBonded, weekStarting } from './bisley-orders.ts';
 
 test('sheet names map to order and bonded lines', () => {
   assert.equal(kindForSheet('1 – New orders'), 'order');
@@ -71,6 +71,12 @@ test('receipts fill the oldest open line sent at least two weeks before the stoc
   assert.equal(received.get('a'), 5);
   assert.equal(received.get('b'), 1);
   assert.equal(received.get('c'), 0);
+});
+
+test('tray stock-ins are counted in single trays under the 5-pack code', () => {
+  assert.deepEqual(receiptInTrays({ sku: '225P5-000', quantity: 2, at: 1 }), { sku: '225P5-000', quantity: 10, at: 1 });
+  assert.deepEqual(receiptInTrays({ sku: 'PIT522P1-000', quantity: 2, at: 1 }), { sku: 'PIT522P5-000', quantity: 2, at: 1 });
+  assert.deepEqual(receiptInTrays({ sku: 'H296NL-bc6', quantity: 2, at: 1 }), { sku: 'H296NL-bc6', quantity: 2, at: 1 });
 });
 
 test('arrival is the booked date, or the send date plus the palette lead time', () => {

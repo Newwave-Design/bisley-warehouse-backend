@@ -129,6 +129,17 @@ export interface Receipt { sku: string; quantity: number; at: number }
 export const MIN_LEAD_DAYS = 14;
 
 /**
+ * The order sheets count insert trays one by one under the 5-pack code (225P5-000 x 25 = five packs).
+ * Stock-in books a 5-pack code in packs and single trays under the P1 code, so receipts are turned into
+ * single trays under the 5-pack code before matching.
+ */
+export function receiptInTrays(receipt: Receipt): Receipt {
+  if (/P5-000$/i.test(receipt.sku)) return { ...receipt, quantity: receipt.quantity * 5 };
+  if (/^PIT\d+P1-000$/i.test(receipt.sku)) return { ...receipt, sku: receipt.sku.replace(/P1-000$/i, 'P5-000') };
+  return receipt;
+}
+
+/**
  * Units received against each order line. Per SKU, each receipt fills the oldest open line that was sent
  * at least MIN_LEAD_DAYS before it came in. A receipt that matches no open line is ignored (it was for an
  * order this record does not hold).
@@ -340,7 +351,7 @@ export async function bisleyOrdersOverview() {
     : { rows: [] };
   const received = matchReceipts(
     orderLines.map((l) => ({ id: l.id, sku: l.sku, quantity: l.quantity, sent_at: new Date(sheetById.get(l.sheet_id)!.sent_at).getTime() })),
-    receiptsRes.rows.map((r: { sku: string; quantity: number; created_at: Date }) => ({ sku: r.sku, quantity: Number(r.quantity), at: new Date(r.created_at).getTime() })),
+    receiptsRes.rows.map((r: { sku: string; quantity: number; created_at: Date }) => receiptInTrays({ sku: r.sku, quantity: Number(r.quantity), at: new Date(r.created_at).getTime() })),
   );
 
   const today = isoDay(Date.now());
