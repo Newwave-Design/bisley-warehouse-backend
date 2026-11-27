@@ -317,7 +317,8 @@ router.patch('/products/:id', requirePermission('manage_settings'), async (req: 
     body.updated_at = new Date();
     const { sets, values, next } = setClause(body);
     const result = await query(
-      `UPDATE packaging_product_specs SET ${sets.join(', ')} WHERE id = $${next} OR product_code = $${next} RETURNING *`,
+      // id is a uuid and product_code is text: compare as text so either can be given
+      `UPDATE packaging_product_specs SET ${sets.join(', ')} WHERE id::text = $${next}::text OR product_code = $${next}::text RETURNING *`,
       [...values, req.params.id]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'Not found' });
