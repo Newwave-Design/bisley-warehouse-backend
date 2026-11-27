@@ -14,7 +14,8 @@ import { takeStockForBookedCollection } from '../../lib/collection-stock.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
 import { packagingText, packToUse, sgkCartonLabels, type CartonPackaging, type PackOption } from '../../lib/sgk-label.js';
 import { attachPackaging } from '../../lib/pick-list-packaging.js';
-import { SGK_COLUMNS, sgkCsv, sgkItems, sgkRows, shopOrderNumber, sgkOrderNo, type SgkPiece, type SgkRow } from '../../lib/sgk.js';
+import { SGK_COLUMNS, sgkCsv, sgkDriverNotes, sgkItems, sgkRows, shopOrderNumber, sgkOrderNo, type SgkPiece, type SgkRow } from '../../lib/sgk.js';
+import { ensureDeliveryServiceColumns } from '../../lib/delivery-services.js';
 
 const router = express.Router();
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -37,6 +38,7 @@ type Consignment = {
   address: Record<string, unknown>;
   postcode: string;
   driverNotes: string;
+  roomOfChoice: boolean;
   bookingIds: string[];
   pieces: SgkPiece[];
   items: { code: string; desc: string; qty: number; weightKg: string; thumbnail?: string | null }[];
@@ -47,6 +49,7 @@ type Consignment = {
 
 /** Every SGK booking that is not cancelled, one consignment per order and sent state. */
 async function loadConsignments(filter: { view?: string; pickListIds?: string[] } = {}): Promise<Consignment[]> {
+  await ensureDeliveryServiceColumns();
   const params: unknown[] = [];
   const where = [`cb.courier = 'SGK'`, `cb.status <> 'cancelled'`, `COALESCE(cb.direction, 'outbound') <> 'return'`];
   if (filter.view === 'sent') where.push('cb.sent_at IS NOT NULL');
@@ -57,7 +60,7 @@ async function loadConsignments(filter: { view?: string; pickListIds?: string[] 
   }
   const result = await query(
     `SELECT cb.id, cb.pick_list_id, cb.apc_order_number AS batch, cb.pieces, cb.driver_notes, cb.created_at, cb.sent_at, cb.collection_date,
-            pl.pick_list_number, pl.customer_name, pl.customer_email, pl.shipping_address,
+            pl.pick_list_number, pl.customer_name, pl.customer_email, pl.shipping_address, COALESCE(pl.room_of_choice, false) AS room_of_choice,
             COALESCE((SELECT parent.created_at FROM pick_lists parent WHERE parent.id = pl.parent_pick_list_id), pl.created_at) AS order_date
        FROM collection_bookings cb
        JOIN pick_lists pl ON pl.id = cb.pick_list_id
@@ -85,6 +88,7 @@ async function loadConsignments(filter: { view?: string; pickListIds?: string[] 
         address,
         postcode: String(address.postal_code || '').toUpperCase(),
         driverNotes: '',
+        roomOfChoice: Boolean(row.room_of_choice),
         bookingIds: [],
         pieces: [],
         items: [],
@@ -248,7 +252,8 @@ export async function sgkLabelsForBooking(bookingId: string): Promise<{ tracking
     name: person,
     lines,
     postcode: group.postcode,
-    driverNotes: group.driverNotes,
+    // The delivery service the driver needs (hallway, or room of choice when upgraded), then any note for the order
+    driverNotes: sgkDriverNotes(group.driverNotes, { roomOfChoice: group.roomOfChoice }),
     cartons: group.pieces.map((piece, index) => ({ title: String(piece.title || ''), sku: skus[index], pack: packBySku.get(skus[index].toUpperCase()) || '' })),
   });
   return jobs.map((job, index) => ({ trackingNumber: `${group.orderNo}-${index + 1}`, format: 'ZPL', content: Buffer.from(job, 'latin1').toString('base64') }));
@@ -263,6 +268,7 @@ function exportRows(consignments: Consignment[]): SgkRow[] {
     phone: consignment.phone,
     shippingAddress: consignment.address,
     driverNotes: consignment.driverNotes,
+    roomOfChoice: consignment.roomOfChoice,
     pieces: consignment.pieces,
   }));
 }

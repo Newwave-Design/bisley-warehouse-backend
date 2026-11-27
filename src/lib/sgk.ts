@@ -42,6 +42,8 @@ export interface SgkConsignment {
   phone: string;
   shippingAddress: Record<string, unknown> | null;
   driverNotes: string;
+  /** Upgraded from hallway to room of choice on the customer desk. */
+  roomOfChoice?: boolean;
   orderType?: 'delivery' | 'pick up';
   pieces: SgkPiece[];
 }
@@ -178,7 +180,7 @@ export function sgkRows(consignment: SgkConsignment, exportedAt: Date = new Date
     Contact_Tel_Mob: phones.mobile,
     Contact_Email: text(consignment.email) || text(address.email),
     Order_Notes: '',
-    Driver_Notes: sgkDriverNotes(consignment.driverNotes),
+    Driver_Notes: sgkDriverNotes(consignment.driverNotes, { roomOfChoice: !!consignment.roomOfChoice }),
     Service_Lv: '',
     Assy_Time: '',
     Unload_Time: '',

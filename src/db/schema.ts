@@ -1895,6 +1895,9 @@ CREATE TABLE IF NOT EXISTS delivery_note_lines (
 );
 
 ALTER TABLE checkin_sessions ADD COLUMN IF NOT EXISTS delivery_note_id UUID REFERENCES delivery_notes(id);
+
+-- Delivery upgraded from hallway to room of choice (set from the customer desk); SGK driver notes say so
+ALTER TABLE pick_lists ADD COLUMN IF NOT EXISTS room_of_choice BOOLEAN NOT NULL DEFAULT false;
 DROP INDEX IF EXISTS one_open_delivery_checkin;
 
 `;

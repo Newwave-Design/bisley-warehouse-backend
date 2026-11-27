@@ -103,3 +103,8 @@ test('driver notes: hallway by default, the tagged services when an order has th
   assert.equal(sgkDriverNotes('', { roomOfChoice: true, takePackagingAway: true, packagingInspection: true }), 'Room of choice, take packaging away, packaging inspection')
   assert.equal(sgkDriverNotes('Gate code 1234', { takePackagingAway: true }), 'Hallway delivery, take packaging away. Gate code 1234')
 })
+
+test('an order upgraded to room of choice says so on every row', () => {
+  const rows = sgkRows({ pickListNumber: 'PL-20261001-0161', orderDate: null, customerName: 'A', email: '', phone: '', shippingAddress: {}, driverNotes: 'Ring first', roomOfChoice: true, pieces: [{ itemSku: 'A', title: 'Desk' }] })
+  assert.equal(rows[0].Driver_Notes, 'Room of choice. Ring first')
+})

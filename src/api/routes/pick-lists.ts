@@ -41,6 +41,7 @@ import { loadCarrierStatus, loadReturnCollections } from '../../lib/carrier-stat
 import { AddressError, cleanAddressPatch, describeAddressChange } from '../../lib/delivery-address.js';
 import { forceAdd, forcePlan, ForceAddError, undoForceAdd, undoForcePlan } from '../../lib/force-add.js';
 import { issueRefund, listRefunds, refundPosition, RefundError, REFUND_REASONS } from '../../lib/refunds.js';
+import { ensureDeliveryServiceColumns, setRoomOfChoice } from '../../lib/delivery-services.js';
 
 const router = express.Router();
 
@@ -256,6 +257,7 @@ async function getPickListStockStatus(pickListId: string) {
  */
 router.get('/', authMiddleware, async (req: Request, res: Response) => {
   try {
+    await ensureDeliveryServiceColumns();
     const lite = String(req.query.lite) === '1';
     const { status = 'UNFULFILLED', is_archived = 'false', limit = '50', offset = '0', search, sku, sort } = req.query;
 
@@ -335,6 +337,7 @@ router.get('/', authMiddleware, async (req: Request, res: Response) => {
          pl.archived_at,
          pl.deferred_at,
          pl.planned_at,
+         pl.room_of_choice,
          to_char(pl.named_delivery_on, 'YYYY-MM-DD') AS named_delivery_on,
          pl.payment_status,
          pl.purchase_order_number,
@@ -871,6 +874,27 @@ router.post('/bulk-status', authMiddleware, async (req: AuthRequest, res: Respon
  * PATCH /api/pick-lists/:pickListId/status
  * Body: { status: string }
  */
+/**
+ * PATCH /api/pick-lists/:pickListId/room-of-choice
+ * Body: { on: boolean }. Upgrades the delivery from hallway to room of choice, or back.
+ */
+router.patch('/:pickListId/room-of-choice', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    if (typeof req.body?.on !== 'boolean') return res.status(400).json({ error: 'Send on: true or false' })
+    const saved = await setRoomOfChoice(req.params.pickListId, req.body.on)
+    if (saved === null) return res.status(404).json({ error: 'Pick list not found' })
+    await recordPickListEvents({
+      ids: [req.params.pickListId],
+      actor: String(req.headers['x-actor'] || '').trim().slice(0, 120) || actorName(req.user),
+      action: 'room-of-choice',
+      summary: saved ? 'Upgraded to room of choice delivery' : 'Back to hallway delivery',
+    })
+    return res.json({ room_of_choice: saved })
+  } catch (error: any) {
+    return res.status(500).json({ error: 'Failed to save the delivery upgrade', details: error.message })
+  }
+})
+
 /**
  * PATCH /api/pick-lists/:pickListId/named-delivery
  * Body: { date: 'YYYY-MM-DD' | null }
