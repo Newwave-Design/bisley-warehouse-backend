@@ -50,6 +50,25 @@ export function packagingText(packaging: CartonPackaging | null | undefined): st
   return METHOD_WORDS[String(packaging.method || '')] || '';
 }
 
+/** One way a product can be packed, with shelf stock for each item. */
+export interface PackOption {
+  rank: number;
+  method?: string | null;
+  items: { code?: string | null; name?: string | null; item_type?: string | null; stock_on_hand?: number | null }[];
+}
+
+/**
+ * The option the packer should use: the first choice when its box, sleeve and tray are on the shelf, otherwise the
+ * first option that is. A box and a sleeve with tray are interchangeable. Falls back to the first choice when none is.
+ */
+export function packToUse(options: PackOption[]): PackOption | null {
+  const sorted = [...options].sort((a, b) => a.rank - b.rank);
+  const inStock = (option: PackOption) => option.items
+    .filter((item) => ['box', 'sleeve', 'tray'].includes(String(item.item_type || '').toLowerCase()))
+    .every((item) => item.stock_on_hand == null || Number(item.stock_on_hand) > 0);
+  return sorted.find(inStock) || sorted[0] || null;
+}
+
 function zpl(value: string): string {
   return String(value ?? '').replace(/\s+/g, ' ').replace(/[\^~\\]/g, ' ').trim();
 }

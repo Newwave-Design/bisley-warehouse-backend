@@ -12,7 +12,7 @@ import { actorName, shipBookedPickList } from '../../lib/pick-list-events.js';
 import { fulfillPickListInMedusa } from '../../lib/medusa-fulfillment.js';
 import { takeStockForBookedCollection } from '../../lib/collection-stock.js';
 import { shipCollectionsDueToday } from '../../lib/ship-todays-collections.js';
-import { packagingText, sgkCartonLabels, type CartonPackaging } from '../../lib/sgk-label.js';
+import { packagingText, packToUse, sgkCartonLabels, type CartonPackaging, type PackOption } from '../../lib/sgk-label.js';
 import { attachPackaging } from '../../lib/pick-list-packaging.js';
 import { SGK_COLUMNS, sgkCsv, sgkItems, sgkRows, shopOrderNumber, sgkOrderNo, type SgkPiece, type SgkRow } from '../../lib/sgk.js';
 
@@ -189,6 +189,43 @@ function sgkPiecesWithTitles(pieces: SgkPiece[], titles: Map<string, string>, pi
   });
 }
 
+/**
+ * For each SKU, the packaging to write on its label: every active option for the SKU (or its longest matching product
+ * code), with shelf stock, then the first one that is all in stock. Products with only a method (own box) use that.
+ */
+async function packagingInStock(skus: string[]): Promise<Map<string, string>> {
+  const wanted = [...new Set(skus.filter(Boolean).map((sku) => sku.toUpperCase()))];
+  const out = new Map<string, string>();
+  if (!wanted.length) return out;
+  const rows = (await query(
+    `SELECT upper(b.sku) AS sku, upper(b.product_code) AS product_code, b.option_rank AS rank, b.method,
+            COALESCE(json_agg(json_build_object('code', i.code, 'name', i.name, 'item_type', i.item_type, 'stock_on_hand', i.stock_on_hand))
+              FILTER (WHERE i.id IS NOT NULL), '[]') AS items
+       FROM packaging_boms b
+       LEFT JOIN packaging_bom_lines l ON l.bom_id = b.id
+       LEFT JOIN packaging_items i ON i.id = l.packaging_item_id
+      WHERE b.is_active
+      GROUP BY b.id`,
+  )).rows as { sku: string | null; product_code: string | null; rank: number; method: string | null; items: PackOption['items'] }[];
+  const methods = (await query(`SELECT upper(product_code) AS code, method FROM packaging_product_specs WHERE is_active`)).rows as { code: string; method: string }[];
+  for (const sku of wanted) {
+    let options = rows.filter((row) => row.sku === sku);
+    if (!options.length) {
+      const codes = rows.filter((row) => !row.sku && row.product_code && (sku === row.product_code || sku.startsWith(`${row.product_code}-`)));
+      const longest = Math.max(0, ...codes.map((row) => (row.product_code || '').length));
+      options = codes.filter((row) => (row.product_code || '').length === longest);
+    }
+    const chosen = packToUse(options.map((row) => ({ rank: Number(row.rank) || 1, method: row.method, items: row.items })));
+    let text = chosen ? packagingText(chosen) : '';
+    if (!text) {
+      const spec = methods.filter((row) => sku === row.code || sku.startsWith(`${row.code}-`)).sort((a, b) => b.code.length - a.code.length)[0];
+      text = packagingText({ method: spec?.method || null, items: [] });
+    }
+    out.set(sku, text);
+  }
+  return out;
+}
+
 /** One ZPL label per carton for the order this booking belongs to: order number, customer, address and 1/N. */
 export async function sgkLabelsForBooking(bookingId: string): Promise<{ trackingNumber: string; format: string; content: string }[]> {
   const found = await query(`SELECT pick_list_id FROM collection_bookings WHERE id = $1 AND courier = 'SGK' AND status <> 'cancelled'`, [bookingId]);
@@ -199,10 +236,12 @@ export async function sgkLabelsForBooking(bookingId: string): Promise<{ tracking
   const address = group.address as Record<string, string>;
   const person = `${address.first_name || ''} ${address.last_name || ''}`.trim() || group.customerName;
   const lines = [address.company && address.company !== person ? address.company : '', address.address_1, address.address_2, [address.city, address.province].filter(Boolean).join(', ')].filter(Boolean);
-  // The box or sleeve each carton's product is packed in, from the packaging records
+  // The box, or sleeve and tray, each carton's product goes in: the first choice, or the option on the shelf when it is out
   const skus = group.pieces.map((piece) => String(piece.itemSku || piece.sku || '').trim());
-  const packed = (await attachPackaging([skus.filter(Boolean).map((sku) => ({ sku, quantity_required: 1 }))]).catch(() => [[]]))[0] as { sku: string; packaging?: CartonPackaging }[];
-  const packBySku = new Map(packed.map((row) => [row.sku.toUpperCase(), packagingText(row.packaging)]));
+  const packBySku = await packagingInStock(skus).catch(async () => {
+    const packed = (await attachPackaging([skus.filter(Boolean).map((sku) => ({ sku, quantity_required: 1 }))]).catch(() => [[]]))[0] as { sku: string; packaging?: CartonPackaging }[];
+    return new Map(packed.map((row) => [row.sku.toUpperCase(), packagingText(row.packaging)]));
+  });
   const jobs = sgkCartonLabels({
     orderNo: group.orderNo,
     shopNumber: group.orderNumber,

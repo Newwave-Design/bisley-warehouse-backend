@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { packagingText, sgkCartonLabels } from './sgk-label.js'
+import { packagingText, packToUse, sgkCartonLabels } from './sgk-label.js'
 
 test('one label per carton, numbered 1/N to N/N, with order number, customer and address', () => {
   const labels = sgkCartonLabels({
@@ -31,4 +31,14 @@ test('each carton label says the box or sleeve it is packed in', () => {
   })
   assert.ok(boxed.includes('^FDPACK: Box BOX-8^FS'))
   assert.ok(!none.includes('PACK:'))
+})
+
+test('the label names the packaging on the shelf: the box, or the sleeve and tray when the box is out', () => {
+  const box = { rank: 1, method: 'box', items: [{ code: 'BOX-22', item_type: 'box', stock_on_hand: -23 }] }
+  const sleeve = { rank: 2, method: 'sleeve_tray', items: [{ code: 'VBD-1,140', item_type: 'edge_guard', stock_on_hand: 0 }, { code: 'SLV-5', item_type: 'sleeve', stock_on_hand: 28 }, { code: 'TRA-5', item_type: 'tray', stock_on_hand: 50 }] }
+  assert.equal(packagingText(packToUse([sleeve, box])), 'Sleeve SLV-5 + Tray TRA-5')
+  assert.equal(packagingText(packToUse([{ ...box, items: [{ code: 'BOX-22', item_type: 'box', stock_on_hand: 4 }] }, sleeve])), 'Box BOX-22')
+  // nothing on the shelf: the first choice
+  assert.equal(packagingText(packToUse([box, { ...sleeve, items: [{ code: 'SLV-5', item_type: 'sleeve', stock_on_hand: 0 }] }])), 'Box BOX-22')
+  assert.equal(packToUse([]), null)
 })
