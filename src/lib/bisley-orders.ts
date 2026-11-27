@@ -17,6 +17,7 @@
  */
 import XLSX from 'xlsx';
 import { getPool, query } from '../db/index.js';
+import { listDeliveryNotes } from './delivery-notes.js';
 import { backorderWeeks, PALETTE_1_WEEKS } from './delivery-due.js';
 import { ensureBondedStock } from './bonded-stock.js';
 
@@ -168,17 +169,22 @@ export function matchReceipts(lines: OrderLineRef[], receipts: Receipt[]): Map<s
   return received;
 }
 
+/**
+ * An estimate only. A confirmed delivery is a dispatch note (delivery_notes), which the overview shows
+ * beside the estimate and never mixes into it.
+ */
 export interface ArrivalWindow {
-  basis: 'booked' | 'palette_1' | 'palette_2';
+  /** bisley_date: the date Bisley gave on the acknowledgement or a booking; palette_1/2: send date + lead time */
+  basis: 'bisley_date' | 'palette_1' | 'palette_2';
   earliest: string;
   latest: string;
 }
 
 const isoDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
-/** When an order line should arrive: Bisley's booked date when there is one, otherwise send date + palette lead time. */
+/** Estimated arrival: the date Bisley gave when there is one, otherwise send date + palette lead time. */
 export function arrivalWindow(sentAt: number, sku: string, bookedFor: string | null): ArrivalWindow {
-  if (bookedFor) return { basis: 'booked', earliest: bookedFor, latest: bookedFor };
+  if (bookedFor) return { basis: 'bisley_date', earliest: bookedFor, latest: bookedFor };
   const weeks = backorderWeeks(sku);
   const day = Date.UTC(new Date(sentAt).getUTCFullYear(), new Date(sentAt).getUTCMonth(), new Date(sentAt).getUTCDate());
   return {
@@ -186,6 +192,35 @@ export function arrivalWindow(sentAt: number, sku: string, bookedFor: string | n
     earliest: isoDay(day + weeks.min * 7 * DAY_MS),
     latest: isoDay(day + weeks.max * 7 * DAY_MS),
   };
+}
+
+export interface DispatchNoteRef { id: string; arrives_on: string; title: string; reference: string | null; lines: { sku: string; quantity: number; received: number }[] }
+export interface ConfirmedPart { note_id: string; arrives_on: string; title: string; reference: string | null; units: number }
+
+const noteSkuKey = (sku: string) => String(sku || '').trim().toUpperCase().replace(/-001$/, '');
+
+/**
+ * Confirmed deliveries for open order lines. Each open dispatch note's units not yet scanned in are put
+ * against the oldest open line for that SKU, earliest note first. Lines are given oldest first.
+ */
+export function confirmOpenLines(open: { id: string; sku: string; open: number }[], notes: DispatchNoteRef[]): Map<string, ConfirmedPart[]> {
+  const out = new Map<string, ConfirmedPart[]>();
+  const left = new Map(open.map((line) => [line.id, line.open]));
+  for (const note of [...notes].sort((a, b) => a.arrives_on.localeCompare(b.arrives_on))) {
+    for (const noteLine of note.lines) {
+      let units = Math.max(0, noteLine.quantity - noteLine.received);
+      for (const line of open) {
+        if (units <= 0) break;
+        if (noteSkuKey(line.sku) !== noteSkuKey(noteLine.sku)) continue;
+        const take = Math.min(units, left.get(line.id) ?? 0);
+        if (take <= 0) continue;
+        left.set(line.id, (left.get(line.id) ?? 0) - take);
+        units -= take;
+        out.set(line.id, [...(out.get(line.id) ?? []), { note_id: note.id, arrives_on: note.arrives_on, title: note.title, reference: note.reference, units: take }]);
+      }
+    }
+  }
+  return out;
 }
 
 /** Monday of the week holding this YYYY-MM-DD date. */
@@ -385,18 +420,41 @@ export async function bisleyOrdersOverview() {
       note: line.note,
     });
   }
-  incoming.sort((a, b) => a.earliest.localeCompare(b.earliest) || a.sku.localeCompare(b.sku));
+  // Confirmed deliveries come only from open dispatch notes; the order dates above are estimates
+  const notes = (await listDeliveryNotes({ includeClosed: false })) as DispatchNoteRef[];
+  const oldestFirst = [...incoming].sort((a, b) => new Date(a.sent_at).getTime() - new Date(b.sent_at).getTime());
+  const confirmedBy = confirmOpenLines(oldestFirst.map((row) => ({ id: row.line_id, sku: row.sku, open: row.open })), notes);
+  const withConfirmed = incoming.map((row) => {
+    const confirmed = confirmedBy.get(row.line_id) ?? [];
+    const confirmedUnits = confirmed.reduce((total, part) => total + part.units, 0);
+    return { ...row, estimate: true as const, confirmed, confirmed_units: confirmedUnits, estimated_units: row.open - confirmedUnits };
+  });
+  withConfirmed.sort((a, b) => a.earliest.localeCompare(b.earliest) || a.sku.localeCompare(b.sku));
 
-  const weeks = new Map<string, { week: string; units: number; value_gbp: number; lines: number; overdue_units: number; booked_units: number }>();
-  for (const row of incoming) {
-    const week = row.overdue ? 'overdue' : weekStarting(row.earliest < today ? today : row.earliest);
-    const bucket = weeks.get(week) ?? { week, units: 0, value_gbp: 0, lines: 0, overdue_units: 0, booked_units: 0 };
-    bucket.units += row.open;
-    bucket.value_gbp += row.value_gbp ?? 0;
-    bucket.lines += 1;
-    if (row.overdue) bucket.overdue_units += row.open;
-    if (row.basis === 'booked') bucket.booked_units += row.open;
+  type Bucket = { week: string; units: number; value_gbp: number; lines: number; overdue_units: number; estimated_units: number; confirmed_units: number; bisley_date_units: number };
+  const weeks = new Map<string, Bucket>();
+  const bucketFor = (week: string) => {
+    const bucket = weeks.get(week) ?? { week, units: 0, value_gbp: 0, lines: 0, overdue_units: 0, estimated_units: 0, confirmed_units: 0, bisley_date_units: 0 };
     weeks.set(week, bucket);
+    return bucket;
+  };
+  for (const row of withConfirmed) {
+    const unitValue = row.value_gbp === null ? 0 : row.value_gbp / row.open;
+    // Confirmed units sit in the week of their dispatch note
+    for (const part of row.confirmed) {
+      const bucket = bucketFor(weekStarting(part.arrives_on < today ? today : part.arrives_on));
+      bucket.units += part.units;
+      bucket.confirmed_units += part.units;
+      bucket.value_gbp += unitValue * part.units;
+    }
+    if (row.estimated_units <= 0) continue;
+    const bucket = bucketFor(row.overdue ? 'overdue' : weekStarting(row.earliest < today ? today : row.earliest));
+    bucket.units += row.estimated_units;
+    bucket.estimated_units += row.estimated_units;
+    bucket.value_gbp += unitValue * row.estimated_units;
+    bucket.lines += 1;
+    if (row.overdue) bucket.overdue_units += row.estimated_units;
+    if (row.basis === 'bisley_date') bucket.bisley_date_units += row.estimated_units;
   }
   const timeline = [...weeks.values()]
     .map((w) => ({ ...w, value_gbp: Math.round(w.value_gbp * 100) / 100 }))
@@ -466,9 +524,19 @@ export async function bisleyOrdersOverview() {
   return {
     generated_at: new Date().toISOString(),
     lead_times: { palette_1: '4-6 weeks', palette_2: '6-8 weeks' },
+    dates: 'Order dates are estimates (send date + palette lead time, or the date Bisley gave). Confirmed deliveries are dispatch notes only.',
     sheets: sheetRows,
-    incoming,
+    incoming: withConfirmed,
     timeline,
+    confirmed_deliveries: notes.map((note) => ({
+      id: note.id,
+      arrives_on: note.arrives_on,
+      title: note.title,
+      reference: note.reference,
+      units: note.lines.reduce((total, line) => total + line.quantity, 0),
+      still_to_scan: note.lines.reduce((total, line) => total + Math.max(0, line.quantity - line.received), 0),
+      on_orders: withConfirmed.reduce((total, row) => total + row.confirmed.filter((part) => part.note_id === note.id).reduce((t, part) => t + part.units, 0), 0),
+    })),
     bonded: {
       rows: bonded,
       not_bonded: notBonded,

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import XLSX from 'xlsx';
-import { arrivalWindow, kindForSheet, matchReceipts, parseSheetRows, parseWorkbook, receiptInTrays, stillBonded, weekStarting } from './bisley-orders.ts';
+import { arrivalWindow, confirmOpenLines, kindForSheet, matchReceipts, parseSheetRows, parseWorkbook, receiptInTrays, stillBonded, weekStarting } from './bisley-orders.ts';
 
 test('sheet names map to order and bonded lines', () => {
   assert.equal(kindForSheet('1 – New orders'), 'order');
@@ -73,6 +73,17 @@ test('receipts fill the oldest open line sent at least two weeks before the stoc
   assert.equal(received.get('c'), 0);
 });
 
+test('dispatch notes confirm the oldest open lines for their SKU, less what is already scanned', () => {
+  const notes = [
+    { id: 'n2', arrives_on: '2026-12-09', title: 'Later', reference: null, lines: [{ sku: 'H296NL-BC6-001', quantity: 4, received: 0 }] },
+    { id: 'n1', arrives_on: '2026-12-02', title: '507601', reference: 'NEW34909', lines: [{ sku: 'H296NL-BC6', quantity: 3, received: 1 }] },
+  ];
+  const confirmed = confirmOpenLines([{ id: 'old', sku: 'H296NL-bc6', open: 3 }, { id: 'new', sku: 'H296NL-bc6', open: 5 }, { id: 'x', sku: 'MDHP-bc6', open: 2 }], notes);
+  assert.deepEqual(confirmed.get('old')?.map((p) => [p.note_id, p.units]), [['n1', 2], ['n2', 1]]);
+  assert.deepEqual(confirmed.get('new')?.map((p) => [p.note_id, p.units]), [['n2', 3]]);
+  assert.equal(confirmed.get('x'), undefined);
+});
+
 test('tray stock-ins are counted in single trays under the 5-pack code', () => {
   assert.deepEqual(receiptInTrays({ sku: '225P5-000', quantity: 2, at: 1 }), { sku: '225P5-000', quantity: 10, at: 1 });
   assert.deepEqual(receiptInTrays({ sku: 'PIT522P1-000', quantity: 2, at: 1 }), { sku: 'PIT522P5-000', quantity: 2, at: 1 });
@@ -83,7 +94,7 @@ test('arrival is the booked date, or the send date plus the palette lead time', 
   const sent = Date.UTC(2026, 10, 23, 21, 11);
   assert.deepEqual(arrivalWindow(sent, 'H296NL-bc6', null), { basis: 'palette_1', earliest: '2026-12-21', latest: '2027-01-04' });
   assert.deepEqual(arrivalWindow(sent, 'H296NL-cj4', null), { basis: 'palette_2', earliest: '2027-01-04', latest: '2027-01-18' });
-  assert.deepEqual(arrivalWindow(sent, 'H296NL-cj4', '2026-12-02'), { basis: 'booked', earliest: '2026-12-02', latest: '2026-12-02' });
+  assert.deepEqual(arrivalWindow(sent, 'H296NL-cj4', '2026-12-02'), { basis: 'bisley_date', earliest: '2026-12-02', latest: '2026-12-02' });
 });
 
 test('weeks start on Monday', () => {
