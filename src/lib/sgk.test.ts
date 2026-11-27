@@ -48,7 +48,8 @@ test('rows repeat the order and leave order notes blank', () => {
   assert.equal(rows[0].Retailer, 'OVARA000000000001')
   assert.equal(rows[0].Order_Type, 'delivery')
   assert.equal(rows[0].Order_Notes, '')
-  assert.equal(rows[0].Driver_Notes, 'Leave in the shed, 2nd floor')
+  assert.equal(rows[0].Driver_Notes, 'Hallway delivery, room of choice, take packaging away, packaging inspection. Leave in the shed, 2nd floor')
+  assert.equal(rows[1].Driver_Notes, rows[0].Driver_Notes)
   assert.equal(rows[0].Del_Addr_1, 'Jones Ltd')
   assert.equal(rows[0].Del_Addr_2, '1 High St')
   assert.equal(rows[0].Del_Addr_3, 'Flat 2')
@@ -63,7 +64,7 @@ test('csv has the template header, quotes commas and keeps leading zeros', () =>
   const lines = csv.replace(/^\uFEFF/, '').split('\r\n')
   assert.equal(lines[0], SGK_COLUMNS.join(','))
   assert.ok(lines[1].includes('"A, B"'))
-  assert.ok(lines[1].includes('"say ""hi"""'))
+  assert.ok(lines[1].includes('"Hallway delivery, room of choice, take packaging away, packaging inspection. say ""hi"""'))
   assert.ok(lines[1].includes(',07700900123,'))
 })
 
@@ -89,4 +90,10 @@ test('sgkItems puts one type of unit on each row, whatever the colour', () => {
   assert.equal(items.length, 2)
   assert.equal(items[0].qty, 2)
   assert.equal(items[1].code, 'MDHLEG-ba5')
+})
+
+test('every row is dated the export day and carries the standard driver notes', () => {
+  const rows = sgkRows({ pickListNumber: 'PL-20261001-0161', orderDate: '2026-10-01T10:00:00Z', customerName: 'A', email: '', phone: '', shippingAddress: {}, driverNotes: '', pieces: [{ itemSku: 'A', title: 'Desk' }, { itemSku: 'B', title: 'Leg' }] }, new Date('2026-11-27T15:00:00Z'))
+  assert.deepEqual(rows.map((row) => row.Order_Date), ['27/11/2026', '27/11/2026'])
+  assert.deepEqual(rows.map((row) => row.Driver_Notes), Array(2).fill('Hallway delivery, room of choice, take packaging away, packaging inspection'))
 })

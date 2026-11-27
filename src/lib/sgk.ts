@@ -130,7 +130,17 @@ export function sgkItems(pieces: SgkPiece[]): { code: string; desc: string; qty:
   });
 }
 
-export function sgkRows(consignment: SgkConsignment): SgkRow[] {
+/** Said to the SGK driver on every row, ahead of anything written for that order. */
+export const SGK_DRIVER_NOTES = 'Hallway delivery, room of choice, take packaging away, packaging inspection';
+
+/** Driver notes for an order: the standard instruction, then the order's own note on one line. */
+export function sgkDriverNotes(own: unknown): string {
+  const note = text(own).replace(/\s*[\r\n]+\s*/g, ' ');
+  return note ? `${SGK_DRIVER_NOTES}. ${note}` : SGK_DRIVER_NOTES;
+}
+
+/** Order_Date is the day the list goes to SGK (the export day), not the day the customer ordered. */
+export function sgkRows(consignment: SgkConsignment, exportedAt: Date = new Date()): SgkRow[] {
   const address = (consignment.shippingAddress || {}) as Record<string, unknown>;
   const person = text(`${text(address.first_name)} ${text(address.last_name)}`) || text(consignment.customerName);
   const company = text(address.company);
@@ -140,7 +150,7 @@ export function sgkRows(consignment: SgkConsignment): SgkRow[] {
   const base: SgkRow = {
     Order_No: sgkOrderNo(consignment.pickListNumber),
     Cust_Ord_No: '',
-    Order_Date: sgkDate(consignment.orderDate),
+    Order_Date: sgkDate(exportedAt),
     Retailer: SGK_RETAILER,
     Order_Type: consignment.orderType || 'delivery',
     Del_Name: person,
@@ -154,7 +164,7 @@ export function sgkRows(consignment: SgkConsignment): SgkRow[] {
     Contact_Tel_Mob: phones.mobile,
     Contact_Email: text(consignment.email) || text(address.email),
     Order_Notes: '',
-    Driver_Notes: text(consignment.driverNotes).replace(/\s*[\r\n]+\s*/g, ' '),
+    Driver_Notes: sgkDriverNotes(consignment.driverNotes),
     Service_Lv: '',
     Assy_Time: '',
     Unload_Time: '',
