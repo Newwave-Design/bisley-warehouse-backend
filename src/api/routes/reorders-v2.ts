@@ -20,6 +20,8 @@ import { query } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { buildLines, type ReorderLine } from './supplier-reorders.js';
 import { orderedCover, orderedQuantity, volumeFilerSku } from '../../lib/ovara-orders.js';
+import { ensureBondedStock } from '../../lib/bonded-stock.js';
+import { ensureBisleyOrders, PAID_OFF_SQL } from '../../lib/bisley-orders.js';
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -46,18 +48,13 @@ async function loadState() {
     query(`SELECT sku, trigger_quantity FROM reorder_v2_sku_flags WHERE trigger_quantity IS NOT NULL`),
     query(`SELECT product_sku, COALESCE(SUM(quantity), 0)::int AS qty FROM warehouse_inventory GROUP BY product_sku`),
     query(`SELECT variant_sku, MAX(unit_cost_gbp)::float AS unit_cost_gbp FROM wms_products WHERE unit_cost_gbp IS NOT NULL GROUP BY variant_sku`),
-    query(`
-      SELECT DISTINCT soi.product_sku
-      FROM supplier_order_items soi
-      JOIN supplier_orders so ON so.id = soi.supplier_order_id
-      WHERE so.order_number IN ('OV010-504108', 'OV010-504206')
-        AND EXISTS (
-          SELECT 1 FROM warehouse_inventory wi
-          WHERE wi.product_sku = soi.product_sku
-          GROUP BY wi.product_sku
-          HAVING SUM(wi.quantity) > 0
-        )
-    `),
+    // Bonded = still has bonded units: starting units less units paid off on the weekly bonded sheets.
+    Promise.all([ensureBondedStock(), ensureBisleyOrders()]).then(() => query(`
+      SELECT b.product_sku
+      FROM bonded_stock b
+      LEFT JOIN (${PAID_OFF_SQL}) paid ON paid.sku = LOWER(b.product_sku)
+      WHERE b.units > COALESCE(paid.paid, 0)
+    `)),
     query(`SELECT LOWER(sku) AS sku, (quantity + extra)::int AS qty FROM reorder_v2_ordered`),
     query(`SELECT pick_list_item_id, LOWER(sku) AS sku, units FROM reorder_v2_sale_covers`),
   ]);

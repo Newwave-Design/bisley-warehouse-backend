@@ -8,6 +8,7 @@ import express, { Response } from 'express';
 import { query } from '../../db/index.js';
 import { authMiddleware, requirePermission, AuthRequest } from '../../middleware/auth.js';
 import { bondableUnits, ensureBondedStock } from '../../lib/bonded-stock.js';
+import { ensureBisleyOrders, PAID_OFF_SQL } from '../../lib/bisley-orders.js';
 import { createNotificationOnce } from '../../lib/notifications.js';
 import { getOrderValues } from '../../lib/order-values.js';
 import { COLOUR_NAMES, extractColourCode, sampleColourLabel } from '../../lib/colour-names.js';
@@ -397,7 +398,7 @@ function round2(n: number): number {
  * Daily net sales (ex VAT) against the £90k/month target. Defaults to the current calendar month (London).
  */
 router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => {
-  await ensureBondedStock().catch((error) => console.warn('[reports/sales] bonded list not ready:', error instanceof Error ? error.message : error));
+  await Promise.all([ensureBondedStock(), ensureBisleyOrders()]).catch((error) => console.warn('[reports/sales] bonded list not ready:', error instanceof Error ? error.message : error));
   try {
     const fallback = currentMonthRange();
     const from = (req.query.from as string) || fallback.from;
@@ -566,9 +567,9 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
         console.warn('[reports/sales] conversion query failed:', err instanceof Error ? err.message : err);
         return { rows: [{ sample_customers: '0', converted: '0' }] };
       }),
-      // Bonded stock only: the units on the bonded list (the two starting orders), counted up to what is on the shelf,
-      // × net cost (wms_products.unit_cost_gbp), not the shop price. Everything bought since is left out.
-      // Kits have no bin of their own, so this is physical stock only.
+      // Bonded stock only: the units on the bonded list (the two starting orders) less the units paid off on the weekly
+      // bonded sheets (bisley_order_lines kind 'bonded'), × net cost (wms_products.unit_cost_gbp), not the shop price.
+      // It does not depend on the shelf: a bonded unit sold and reordered, or still on its way, is still bonded.
       // Some bays are labelled with the Medusa SKU while the cost sits on the supplier code;
       // sku_mappings bridges those.
       query(
@@ -577,11 +578,9 @@ router.get('/sales', authMiddleware, async (req: AuthRequest, res: Response) => 
            COALESCE(SUM(s.qty), 0)::int AS units,
            COALESCE(SUM(s.qty) FILTER (WHERE p.unit_cost_gbp IS NULL AND m.unit_cost_gbp IS NULL), 0)::int AS uncosted_units
          FROM (
-           SELECT wi.product_sku, LEAST(SUM(wi.quantity), MAX(b.units))::numeric AS qty
-           FROM warehouse_inventory wi
-           JOIN bonded_stock b ON b.product_sku = wi.product_sku
-           WHERE wi.quantity > 0
-           GROUP BY wi.product_sku
+           SELECT b.product_sku, GREATEST(b.units - COALESCE(paid.paid, 0), 0)::numeric AS qty
+           FROM bonded_stock b
+           LEFT JOIN (${PAID_OFF_SQL}) paid ON paid.sku = LOWER(b.product_sku)
          ) s
          LEFT JOIN (
            SELECT variant_sku, MAX(unit_cost_gbp) AS unit_cost_gbp
@@ -744,12 +743,14 @@ router.get('/inventory-value', authMiddleware, async (req: AuthRequest, res: Res
  */
 router.get('/bonded-stock', authMiddleware, async (_req: AuthRequest, res: Response) => {
   try {
-    await ensureBondedStock();
+    await Promise.all([ensureBondedStock(), ensureBisleyOrders()]);
     const result = await query(
       `SELECT b.product_sku AS sku, b.units AS listed, COALESCE(s.onhand, 0)::int AS on_hand,
-              LEAST(b.units, COALESCE(s.onhand, 0))::int AS bonded_units,
+              LEAST(b.units, COALESCE(paid.paid, 0))::int AS paid_off,
+              GREATEST(b.units - COALESCE(paid.paid, 0), 0)::int AS bonded_units,
               COALESCE(p.unit_cost_gbp, 0)::float8 AS unit_cost_gbp, b.source
          FROM bonded_stock b
+         LEFT JOIN (${PAID_OFF_SQL}) paid ON paid.sku = LOWER(b.product_sku)
          LEFT JOIN (SELECT product_sku, SUM(quantity)::int AS onhand FROM warehouse_inventory WHERE quantity > 0 GROUP BY product_sku) s
                 ON s.product_sku = b.product_sku
          LEFT JOIN (SELECT variant_sku, MAX(unit_cost_gbp) AS unit_cost_gbp FROM wms_products GROUP BY variant_sku) p
